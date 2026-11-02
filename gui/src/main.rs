@@ -20,17 +20,19 @@ use model::{IndexInfo, State};
 enum UiMsg {
     State(State),
     IndexReady { index: IndexInfo, index_json_path: PathBuf },
-    Player(player::PlayerMsg),
     RpcError(String),
     DetectionEvent(Value),
     DetectionFinished { code: i32 },
-    Status(String),
+    IndexJobStarted(u64),
+    IndexJobFailed(String),
 }
 
 struct App {
     rpc: Arc<rpc::Rpc>,
     msg_tx: Sender<UiMsg>,
     msg_rx: std::sync::mpsc::Receiver<UiMsg>,
+    /// 工作线程用它在消息送达后请求重绘；egui 空闲时不会自轮询。
+    wake: player::Waker,
     state: State,
     index: Option<IndexInfo>,
     index_json_path: Option<PathBuf>,
@@ -45,6 +47,8 @@ struct App {
     detection: Option<detect::Detection>,
     detection_out: Option<PathBuf>,
     detection_cpu_retried: bool,
+    index_job: Option<u64>,
+    index_busy: bool,
     repo_root: PathBuf,
     ffmpeg: PathBuf,
     python: PathBuf,
@@ -65,11 +69,13 @@ impl App {
         let rpc_handle = rpc::Rpc::spawn(&python, &repo_root)
             .map_err(|e| format!("边车启动失败: {e}（venv 依赖装了吗？）"))?;
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
-        let _ = &cc.egui_ctx;
+        let ctx = cc.egui_ctx.clone();
+        let wake: player::Waker = Arc::new(move || ctx.request_repaint());
         Ok(App {
             rpc: Arc::new(rpc_handle),
             msg_tx,
             msg_rx,
+            wake,
             state: State::default(),
             index: None,
             index_json_path: None,
@@ -84,6 +90,8 @@ impl App {
             detection: None,
             detection_out: None,
             detection_cpu_retried: false,
+            index_job: None,
+            index_busy: false,
             repo_root,
             ffmpeg,
             python,
@@ -93,51 +101,83 @@ impl App {
 
     // -- 异步动作 ------------------------------------------------------------
 
+    /// 结果不是 State 的调用（如 job.cancel）：只关心错误，成功静默。
+    fn call_quiet(&self, method: &str, params: Value) {
+        let method = method.to_string();
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        std::thread::spawn(move || {
+            if let Err(error) = rpc.call(&method, params) {
+                let _ = tx.send(UiMsg::RpcError(error));
+            }
+            wake();
+        });
+    }
+
     fn call(&self, method: &str, params: Value) {
         let method = method.to_string();
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
-        std::thread::spawn(move || match rpc.call(&method, params) {
-            Ok(Value::Null) => {}
-            Ok(result) => {
-                if let Ok(state) = serde_json::from_value::<State>(result) {
-                    let _ = tx.send(UiMsg::State(state));
-                }
-            }
-            Err(error) => {
-                let _ = tx.send(UiMsg::RpcError(error));
-            }
-        });
-    }
-
-    fn open_video(&mut self, video: PathBuf) {
-        let rpc = Arc::clone(&self.rpc);
-        let tx = self.msg_tx.clone();
-        self.status = "建立帧索引…（首次全量解码，耐心等待）".into();
-        self.player = None;
+        let wake = Arc::clone(&self.wake);
         std::thread::spawn(move || {
-            let result = rpc.call("index.build", json!({"video_path": video.to_string_lossy()}));
-            match result {
-                Ok(value) => {
-                    if let Err(error) = finish_index(Arc::clone(&rpc), tx.clone(), value.get("index").cloned().unwrap_or(Value::Null), None) {
-                        let _ = tx.send(UiMsg::RpcError(error));
+            match rpc.call(&method, params) {
+                Ok(Value::Null) => {}
+                Ok(result) => {
+                    if let Ok(state) = serde_json::from_value::<State>(result) {
+                        let _ = tx.send(UiMsg::State(state));
                     }
                 }
                 Err(error) => {
                     let _ = tx.send(UiMsg::RpcError(error));
                 }
             }
+            // 结果送达后必须唤醒 UI，否则界面停在旧状态。
+            wake();
+        });
+    }
+
+    fn open_video(&mut self, video: PathBuf) {
+        if self.index_busy {
+            self.status = "索引任务进行中，先取消再打开新视频".into();
+            return;
+        }
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        self.status = "建立帧索引…（首次全量解码，耐心等待）".into();
+        self.player = None;
+        self.index_busy = true;
+        std::thread::spawn(move || {
+            // 走 job 通道：可取消、可显示进度，sidecar 也不会被阻塞。
+            let reply = rpc.call("job.start", json!({
+                "method": "index.build",
+                "params": {"video_path": video.to_string_lossy()},
+            }));
+            match reply {
+                Ok(value) => {
+                    if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
+                        let _ = tx.send(UiMsg::IndexJobStarted(job_id));
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(UiMsg::IndexJobFailed(error));
+                }
+            }
+            wake();
         });
     }
 
     fn open_project(&mut self, path: PathBuf) {
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
         self.status = "打开项目…".into();
         self.player = None;
         std::thread::spawn(move || {
             if let Err(error) = rpc.call("project.open", json!({"path": path.to_string_lossy()})) {
                 let _ = tx.send(UiMsg::RpcError(error));
+                wake();
                 return;
             }
             match rpc.call("index.get", json!({})) {
@@ -153,6 +193,7 @@ impl App {
                     let _ = tx.send(UiMsg::RpcError(error));
                 }
             }
+            wake();
         });
     }
 
@@ -180,6 +221,7 @@ impl App {
         let repo_root = self.repo_root.clone();
         let weights = detect::model_path(&self.repo_root);
         let tx_events = self.msg_tx.clone();
+        let wake_events = Arc::clone(&self.wake);
         self.status = "切镜检测启动…".into();
         self.detection_out = Some(out_dir.clone());
         match detect::Detection::spawn(
@@ -191,6 +233,7 @@ impl App {
             force_cpu,
             move |event| {
                 let _ = tx_events.send(UiMsg::DetectionEvent(event));
+                wake_events();
             },
         ) {
             Ok(job) => self.detection = Some(job),
@@ -232,6 +275,7 @@ impl App {
                             self.ffmpeg.clone(),
                             PathBuf::from(video),
                             index.clone(),
+                            Arc::clone(&self.wake),
                         );
                         handle.show(0);
                         self.player = Some(handle);
@@ -242,10 +286,15 @@ impl App {
                     self.index = Some(index);
                     self.index_json_path = Some(index_json_path);
                 }
-                UiMsg::Player(message) => self.on_player_msg(message),
+                UiMsg::IndexJobStarted(job_id) => self.index_job = Some(job_id),
+                UiMsg::IndexJobFailed(error) => {
+                    self.index_busy = false;
+                    self.status = format!("⚠ {error}");
+                }
                 UiMsg::RpcError(error) => self.status = format!("⚠ {error}"),
                 UiMsg::DetectionEvent(event) => self.on_detection_event(event),
-                UiMsg::DetectionFinished { code } => {                    self.detection = None;
+                UiMsg::DetectionFinished { code } => {
+                    self.detection = None;
                     if code == 0 {
                         self.status = "检测完成，写入镜头…".into();
                         if let Some(out_dir) = self.detection_out.clone() {
@@ -254,6 +303,8 @@ impl App {
                                 json!({"result_dir": out_dir.to_string_lossy()}),
                             );
                         }
+                    } else if code == 2 {
+                        self.status = "检测已取消".into();
                     } else if code == 3 && !self.detection_cpu_retried {
                         // 协议约定：GPU 失败后在纯 CPU 进程重试一次。
                         self.detection_cpu_retried = true;
@@ -263,7 +314,69 @@ impl App {
                         self.status = format!("检测失败（退出码 {code}）");
                     }
                 }
-                UiMsg::Status(text) => self.status = text,
+            }
+        }
+        // 播放器帧消息走独立通道（不在 UiMsg 里）：先收全，再逐个处理避免借用冲突。
+        let mut player_messages = Vec::new();
+        if let Some(player) = &self.player {
+            while let Ok(message) = player.msgs.try_recv() {
+                player_messages.push(message);
+            }
+        }
+        for message in player_messages {
+            self.on_player_msg(message);
+        }
+        // 边车进度事件（同步 handler 的 emit 与 job 事件都在这里落地）。
+        for event in self.rpc.drain_events() {
+            let topic = event
+                .get("topic")
+                .or_else(|| event.get("job"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let phase = event.get("phase").and_then(Value::as_str).unwrap_or("progress");
+            let job_id = event.get("job_id").and_then(Value::as_u64);
+            match (topic, phase) {
+                ("index", "progress") => {
+                    if let Some(done) = event.get("done").and_then(Value::as_u64) {
+                        let time_s = event.get("time_s").and_then(Value::as_f64).unwrap_or(0.0);
+                        self.status = format!("建立帧索引… 已解码 {done} 帧（视频时间 {time_s:.0}s）");
+                    }
+                }
+                ("index.build", "done") if job_id == self.index_job || self.index_busy => {
+                    self.index_busy = false;
+                    self.index_job = None;
+                    let index_value = event
+                        .pointer("/result/index")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let rpc = Arc::clone(&self.rpc);
+                    let tx = self.msg_tx.clone();
+                    let wake = Arc::clone(&self.wake);
+                    self.status = "索引完成，装配项目…".into();
+                    std::thread::spawn(move || {
+                        // finish_index 内部会再发 RPC（project.new / state），不能在 UI 线程跑。
+                        if let Err(error) = finish_index(rpc, tx.clone(), index_value, None) {
+                            let _ = tx.send(UiMsg::IndexJobFailed(error));
+                        }
+                        wake();
+                    });
+                }
+                ("index.build", "error") => {
+                    self.index_busy = false;
+                    self.index_job = None;
+                    let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
+                    let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+                    self.status = if kind.contains("Cancelled") {
+                        "索引已取消".into()
+                    } else {
+                        format!("索引失败: {message}")
+                    };
+                }
+                (_, "error") => {
+                    let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
+                    self.status = format!("后台任务失败: {message}");
+                }
+                _ => {}
             }
         }
         // 纹理上传必须在 UI 线程（需要 egui Context）
@@ -348,7 +461,7 @@ impl App {
 
 // -- 索引就绪的公共收尾 --------------------------------------------------------
 
-/// existing_project = Some(()) 表示项目已在边车中打开，只装配播放器。
+/// 在后台线程完成索引收尾；所有发出的消息由调用方负责唤醒 UI（palyer::Waker）。
 fn finish_index(
     rpc: Arc<rpc::Rpc>,
     tx: Sender<UiMsg>,
@@ -380,6 +493,9 @@ fn finish_index(
     Ok(())
 }
 
+/// 生成唯一的输出目录**路径**（不创建目录）。
+/// worker 的结果目录必须由它独占创建（核心 `save_result(exist_ok=False)` 不变式），
+/// GUI 预创建会让检测在保存阶段必然 WinError 183。
 fn unique_dir(prefix: &str) -> Option<PathBuf> {
     use std::sync::atomic::AtomicU64;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -389,7 +505,7 @@ fn unique_dir(prefix: &str) -> Option<PathBuf> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
         let ticket = COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir = base.join(format!("{prefix}-{stamp}-{ticket}"));
-        if std::fs::create_dir(&dir).is_ok() {
+        if !dir.exists() {
             return Some(dir);
         }
     }
@@ -437,7 +553,8 @@ impl eframe::App for App {
 impl App {
     fn topbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("打开视频").clicked() {
+            let idle = !self.index_busy;
+            if ui.add_enabled(idle, egui::Button::new("打开视频")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("视频", &["mkv", "mp4", "avi", "mov", "webm", "ts", "m2ts", "flv"])
                     .pick_file()
@@ -445,7 +562,7 @@ impl App {
                     self.open_video(path);
                 }
             }
-            if ui.button("打开项目").clicked() {
+            if ui.add_enabled(!self.index_busy, egui::Button::new("打开项目")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("CadensView 项目", &["shotlab"])
                     .pick_file()
@@ -454,21 +571,31 @@ impl App {
                 }
             }
             ui.separator();
-            if ui.button("保存").clicked() {
+            if ui.add_enabled(!self.index_busy, egui::Button::new("保存")).clicked() {
                 self.save_project(false);
             }
-            if ui.button("另存为").clicked() {
+            if ui.add_enabled(!self.index_busy, egui::Button::new("另存为")).clicked() {
                 self.save_project(true);
             }
             ui.separator();
-            let ready = self.index.is_some();
-            if ui.add_enabled(ready, egui::Button::new("检测切镜")).clicked() {
-                self.detection_cpu_retried = false;
-                self.run_detection(false);
+            if self.index_busy {
+                if ui.button("取消索引").clicked() {
+                    if let Some(job_id) = self.index_job {
+                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
+                    }
+                }
+                ui.spinner();
+                ui.label("索引进行中…");
+            } else {
+                let ready = self.index.is_some() && self.detection.is_none() && self.state.pending_start.is_some();
+                if ui.add_enabled(ready, egui::Button::new("检测切镜")).clicked() {
+                    self.detection_cpu_retried = false;
+                    self.run_detection(false);
+                }
             }
             if self.detection.is_some() && ui.button("取消检测").clicked() {
                 if let Some(job) = &self.detection {
-                    job.cancel.store(true, Ordering::SeqCst);
+                    job.cancel();
                 }
             }
             ui.separator();
@@ -478,7 +605,7 @@ impl App {
             if ui.add_enabled(self.state.can_redo, egui::Button::new("↷ 重做")).clicked() {
                 self.call("edit.redo", json!({}));
             }
-            if self.state.pending_start.is_some() {
+            if self.state.pending_start.is_some() && self.index.is_some() {
                 ui.colored_label(egui::Color32::GRAY, "（有待分析尾段：先跑检测）");
             }
         });

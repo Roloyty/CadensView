@@ -43,8 +43,11 @@ pub struct PlayerHandle {
     pub msgs: std::sync::mpsc::Receiver<PlayerMsg>,
 }
 
+/// 帧/状态送达后唤醒 UI 线程（egui 空闲时不会自轮询，必须显式请求重绘）。
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 impl PlayerHandle {
-    pub fn spawn(ffmpeg: PathBuf, video: PathBuf, index: IndexInfo) -> PlayerHandle {
+    pub fn spawn(ffmpeg: PathBuf, video: PathBuf, index: IndexInfo, wake: Waker) -> PlayerHandle {
         let (tx, rx) = std::sync::mpsc::channel::<PlayerMsg>();
         let inner = Arc::new(Inner {
             cmd: Mutex::new(None),
@@ -52,7 +55,7 @@ impl PlayerHandle {
             pub_frame: Arc::new(AtomicU64::new(0)),
         });
         let worker = Arc::clone(&inner);
-        thread::spawn(move || worker_loop(worker, ffmpeg, video, index, tx));
+        thread::spawn(move || worker_loop(worker, ffmpeg, video, index, Out { tx, wake }));
         PlayerHandle { inner, msgs: rx }
     }
 
@@ -75,10 +78,6 @@ impl PlayerHandle {
     pub fn frame(&self) -> u64 {
         self.inner.pub_frame.load(Ordering::SeqCst)
     }
-
-    fn has_pending(&self) -> bool {
-        self.inner.cmd.lock().unwrap().is_some()
-    }
 }
 
 impl Drop for PlayerHandle {
@@ -87,7 +86,7 @@ impl Drop for PlayerHandle {
     }
 }
 
-fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexInfo, tx: std::sync::mpsc::Sender<PlayerMsg>) {
+fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexInfo, out: Out) {
     let mut stream: Option<Stream> = None;
     loop {
         // 命令到达时立刻打断当前流；否则继续泵流或小睡。
@@ -109,10 +108,10 @@ fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexI
                     Ok((width, height, rgba)) => {
                         let frame = frame.min(index.frames().saturating_sub(1));
                         inner.pub_frame.store(frame, Ordering::SeqCst);
-                        let _ = tx.send(PlayerMsg::Frame { frame, width, height, rgba });
+                        out.send(PlayerMsg::Frame { frame, width, height, rgba });
                     }
                     Err(error) => {
-                        let _ = tx.send(PlayerMsg::Failed(error));
+                        out.send(PlayerMsg::Failed(error));
                     }
                 },
                 PlayerCmd::Play(from) => {
@@ -129,7 +128,7 @@ fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexI
                             });
                         }
                         Err(error) => {
-                            let _ = tx.send(PlayerMsg::Failed(error.to_string()));
+                            out.send(PlayerMsg::Failed(error.to_string()));
                         }
                     }
                 }
@@ -140,10 +139,10 @@ fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexI
 
         match stream.as_mut() {
             Some(state) => {
-                if !pump_frame(state, &index, &inner, &tx) {
+                if !pump_frame(state, &index, &inner, &out) {
                     stream = None;
                     inner.playing.store(false, Ordering::SeqCst);
-                    let _ = tx.send(PlayerMsg::Ended);
+                    out.send(PlayerMsg::Ended);
                 }
             }
             None => thread::sleep(Duration::from_millis(10)),
@@ -151,11 +150,25 @@ fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexI
     }
 }
 
+/// 发消息并唤醒 UI：egui 空闲时不轮询，缺了唤醒帧会"停在旧画面"。
+struct Out {
+    tx: std::sync::mpsc::Sender<PlayerMsg>,
+    wake: Waker,
+}
+
+impl Out {
+    fn send(&self, message: PlayerMsg) -> bool {
+        let ok = self.tx.send(message).is_ok();
+        (self.wake)();
+        ok
+    }
+}
+
 /// 读一帧、按 pts 节流后发出。false = 流结束或出错。
-fn pump_frame(state: &mut Stream, index: &IndexInfo, inner: &Inner, tx: &std::sync::mpsc::Sender<PlayerMsg>) -> bool {
+fn pump_frame(state: &mut Stream, index: &IndexInfo, inner: &Inner, out: &Out) -> bool {
     let (width, height) = index.size();
     if width == 0 || height == 0 {
-        let _ = tx.send(PlayerMsg::Failed("索引缺少画面尺寸".into()));
+        out.send(PlayerMsg::Failed("索引缺少画面尺寸".into()));
         return false;
     }
     let mut rgba = vec![0u8; width * height * 4];
@@ -180,7 +193,7 @@ fn pump_frame(state: &mut Stream, index: &IndexInfo, inner: &Inner, tx: &std::sy
     let frame = state.next_frame;
     state.next_frame += 1;
     inner.pub_frame.store(frame, Ordering::SeqCst);
-    tx.send(PlayerMsg::Frame { frame, width, height, rgba }).is_ok()
+    out.send(PlayerMsg::Frame { frame, width, height, rgba })
 }
 
 fn spawn_stream(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, from: u64) -> std::io::Result<Child> {
@@ -266,5 +279,58 @@ impl PlaybackMarker {
 impl Drop for PlaybackMarker {
     fn drop(&mut self) {
         self.set(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 需要合成视频夹具；未设置环境变量时跳过（见 tests/make_fixture.py）。
+    #[test]
+    fn capture_is_frame_accurate_and_stream_aligns() {
+        let (Ok(video), Ok(index_json), Ok(ffmpeg)) = (
+            std::env::var("CV_TEST_VIDEO"),
+            std::env::var("CV_TEST_INDEX"),
+            std::env::var("CV_TEST_FFMPEG"),
+        ) else {
+            eprintln!("skipped: set CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG to run");
+            return;
+        };
+        let index: crate::model::IndexInfo =
+            serde_json::from_str(&std::fs::read_to_string(index_json).unwrap()).unwrap();
+        let video = PathBuf::from(video);
+        let ffmpeg = PathBuf::from(ffmpeg);
+
+        // 合成夹具：帧 0-23 红、24-47 蓝。色彩经 yuv 往返有偏差（夹具元数据不自洽），
+        // 断言按色系而非精确 RGB；23/24 是帧号精度的最紧边界。
+        fn family(rgba: &[u8], w: usize, h: usize) -> [u8; 3] {
+            let center = ((h / 2) * w + w / 2) * 4;
+            [rgba[center], rgba[center + 1], rgba[center + 2]]
+        }
+        fn assert_red(got: [u8; 3], context: &str) {
+            assert!(got[0] > 200 && got[2] < 80, "{context}: 应为红色系，实得 {got:?}");
+        }
+        fn assert_blue(got: [u8; 3], context: &str) {
+            assert!(got[2] > 200 && got[0] < 80, "{context}: 应为蓝色系，实得 {got:?}");
+        }
+
+        for (frame, red) in [(0u64, true), (23, true), (24, false), (30, false), (47, false)] {
+            let (w, h, rgba) = capture_one(&ffmpeg, &video, &index, frame).expect("capture");
+            let got = family(&rgba, w, h);
+            if red { assert_red(got, &format!("单帧 {frame}")); } else { assert_blue(got, &format!("单帧 {frame}")); }
+        }
+
+        // 流式播放：从帧 22 起连续读 4 帧，应跨过 23/24 边界：红红蓝蓝
+        let mut stream = spawn_stream(&ffmpeg, &video, &index, 22).expect("stream");
+        let (w, h) = index.size();
+        for (step, red) in [(0u64, true), (1, true), (2, false), (3, false)] {
+            let mut rgba = vec![0u8; w * h * 4];
+            assert!(read_exact_or_eof(stream.stdout.as_mut().unwrap(), &mut rgba), "流结束过早");
+            let got = family(&rgba, w, h);
+            let frame = 22 + step;
+            if red { assert_red(got, &format!("流式帧 {frame}")); } else { assert_blue(got, &format!("流式帧 {frame}")); }
+        }
+        let _ = stream.kill();
     }
 }

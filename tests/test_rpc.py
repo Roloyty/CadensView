@@ -4,7 +4,10 @@ from fractions import Fraction
 import io
 import json
 from pathlib import Path
+import queue
 from tempfile import TemporaryDirectory
+import threading
+import time
 import unittest
 
 import av
@@ -34,8 +37,12 @@ def video(path, frames=48):
 
 def fake_index(path, frames=10):
     stat = Path(path).stat()
+    # 与真实 build_index 的 metadata 契约保持一致（ProjectStore.create 依赖这些键）。
+    metadata = {"container": "matroska", "codec": "ffv1", "width": 96, "height": 54,
+                "pixel_format": "yuv444p", "average_rate": "24/1",
+                "duration_us": frames * 41666, "audio_tracks": 0, "subtitle_tracks": 0}
     return FrameIndex(str(path), stat.st_size, stat.st_mtime_ns, "1/24", list(range(frames)), [1] * frames,
-                      [0], True, {"duration_us": frames * 41666}, 0.0)
+                      [0], True, metadata, 0.0)
 
 
 def exchange(lines, session=None):
@@ -164,3 +171,190 @@ def selftest():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegressionTests(unittest.TestCase):
+    """对抗式审查发现的问题：逐条固化，防回归。"""
+
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.video_path = video(Path(self.directory.name) / "clip.mkv")
+
+    def test_select_does_not_mark_dirty(self):
+        session = Session()
+        session.index = fake_index(self.video_path)
+        session.new_project()
+        session.dirty = False
+        state = session.select(frame=3)
+        self.assertFalse(state["dirty"], "移动光标不应标记未保存")
+
+    def test_stats_cache_invalidated_by_edits(self):
+        session = Session()
+        session.index = fake_index(self.video_path)
+        session.new_project()
+        session.apply_detection(json_free_result(self.directory.name))
+        session.stats = {"stale": True}
+        session._edit("拆分", mutate=lambda: session.project.split(4))
+        self.assertIsNone(session.stats, "编辑后统计缓存必须失效")
+
+    def test_build_index_releases_previous_store(self):
+        """换片重建索引必须释放旧项目文件句柄（Windows 下不释放会锁文件）。"""
+        session = Session()
+        session.index = fake_index(self.video_path)
+        session.new_project()
+        project_path = Path(self.directory.name) / "keep.shotlab"
+        session.save_as(str(project_path))
+        # 重建索引（模拟"打开视频"换片）
+        session.index = fake_index(self.video_path)
+        session.close_project()
+        project_path.unlink()  # 未释放句柄时 Windows 会抛 PermissionError
+        self.assertFalse(project_path.exists())
+
+    def test_save_as_switches_to_new_file(self):
+        """另存为在已有项目文件时也必须工作（走 backup 副本路径）。"""
+        session = Session()
+        session.index = fake_index(self.video_path)
+        session.new_project()
+        first = Path(self.directory.name) / "first.shotlab"
+        session.save_as(str(first))
+        second = Path(self.directory.name) / "second.shotlab"
+        state = session.save_as(str(second))
+        self.assertTrue(second.exists())
+        self.assertEqual(state["project_path"], str(second.resolve()))
+        # 再保存应写入新文件
+        session.select(frame=2)
+        session.dirty = True
+        session.save()
+        session.close_project()
+        reopened = Session()
+        reopened.open_project(str(second))
+        self.assertEqual(reopened.project.current_frame, 2)
+        reopened.close_project()
+
+
+class JobProtocolTests(unittest.TestCase):
+    """job.start / job.cancel：进度事件、忙等保护、取消。"""
+
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.video_path = video(Path(self.directory.name) / "clip.mkv")
+        self.sink = EventSink()
+        self.stdin = LineIn()
+        self.thread = threading.Thread(
+            target=serve, args=(self.stdin, self.sink, Session()), daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.stdin.close()
+        self.thread.join(timeout=5)
+
+    def request(self, id, method, params=None):
+        self.stdin.put(json.dumps({"id": id, "method": method, "params": params or {}}))
+        reply = self.sink.wait_for(lambda lines: next(
+            (l for l in lines if l.get("id") == id), None))
+        return reply
+
+    def test_index_build_job_progress_done_and_busy_gate(self):
+        # 进度事件每 240 帧发一次，用小视频测不出来，这里用长视频。
+        long_video = video(Path(self.directory.name) / "long.mkv", frames=2400)
+        reply = self.request(1, "job.start", {
+            "method": "index.build",
+            "params": {"video_path": str(long_video)}})
+        self.assertTrue(reply["ok"], reply)
+        job_id = reply["result"]["job_id"]
+        # 索引进行中：状态查询放行（BUSY_ALLOWED），编辑操作被拒。
+        state_reply = self.request(2, "project.state")
+        self.assertTrue(state_reply["ok"], "忙时读状态必须放行")
+        done = self.sink.wait_for(lambda lines: next(
+            (l for l in lines if l.get("job_id") == job_id and l.get("phase") == "done"), None),
+            timeout=120)
+        self.assertEqual(done["topic"], "index.build")
+        self.assertTrue(done["result"]["index"]["complete"])
+        progress = [l for l in self.sink.lines() if l.get("job_id") == job_id and l.get("phase") == "progress"]
+        self.assertTrue(progress, "index.build 必须发出进度事件（对抗式审查修复点）")
+        self.assertEqual(progress[0]["topic"], "index")
+
+    def test_job_cancel_stops_index_build(self):
+        # 大一点的视频保证来得及取消
+        long_video = video(Path(self.directory.name) / "long.mkv", frames=2400)
+        reply = self.request(1, "job.start", {
+            "method": "index.build",
+            "params": {"video_path": str(long_video)}})
+        job_id = reply["result"]["job_id"]
+        self.request(2, "job.cancel", {"job_id": job_id})
+        outcome = self.sink.wait_for(lambda lines: next(
+            (l for l in lines if l.get("job_id") == job_id and l.get("phase") in ("done", "error")), None),
+            timeout=60)
+        self.assertEqual(outcome["phase"], "error")
+        self.assertIn("cancel", outcome["message"].lower())
+        # 取消后会话不再忙
+        reply = self.request(3, "project.state")
+        self.assertTrue(reply["ok"])
+
+
+class EventSink:
+    """捕获 serve() 输出的行并支持等待条件。"""
+
+    def __init__(self):
+        self._lines = []
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+
+    def reconfigure(self, **kwargs):
+        pass
+
+    def write(self, text):
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            with self._cond:
+                self._lines.append(json.loads(line))
+                self._cond.notify_all()
+
+    def flush(self):
+        pass
+
+    def lines(self):
+        with self._lock:
+            return list(self._lines)
+
+    def wait_for(self, predicate, timeout=10):
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while True:
+                found = predicate(list(self._lines))
+                if found:
+                    return found
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(f"等待超时；已收到 {self._lines}")
+                self._cond.wait(remaining)
+
+
+class LineIn:
+    """阻塞式行输入，模拟 GUI 的 stdin 管道。"""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def reconfigure(self, **kwargs):
+        pass
+
+    def put(self, line):
+        self._queue.put(line)
+
+    def close(self):
+        self._queue.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self._queue.get(timeout=60)
+        if item is None:
+            raise StopIteration
+        return item
