@@ -32,6 +32,7 @@ enum UiMsg {
     AnalysisJobStarted(u64),
     AnalysisDone(Value),
     AnalysisFailed(String),
+    ScaleJobStarted(u64),
     Thumb(thumb::ThumbOutcome),
     AbCaptured { slot: usize, frame: u64, width: usize, height: usize, rgba: Vec<u8> },
     ExportSaved(String),
@@ -61,6 +62,7 @@ struct App {
     note_draft: String,
     note_shot: String,
     note_dirty: bool,
+    tag_input: String,
     ui_frame: u64,
     detection: Option<detect::Detection>,
     detection_out: Option<PathBuf>,
@@ -82,6 +84,7 @@ struct App {
     palette_loading: bool,
     barcode: Vec<BarcodeSample>,
     analysis_job: Option<u64>,
+    scale_job: Option<u64>,
     // -- 缩略图 --------------------------------------------------------------
     thumb_tx: Option<Sender<thumb::ThumbRequest>>,
     thumbs: HashMap<String, TextureHandle>,
@@ -131,6 +134,7 @@ impl App {
             note_draft: String::new(),
             note_shot: String::new(),
             note_dirty: false,
+            tag_input: String::new(),
             ui_frame: 0,
             detection: None,
             detection_out: None,
@@ -150,6 +154,7 @@ impl App {
             palette_loading: false,
             barcode: Vec::new(),
             analysis_job: None,
+            scale_job: None,
             thumb_tx: None,
             thumbs: HashMap::new(),
             thumb_pending: HashSet::new(),
@@ -394,6 +399,7 @@ impl App {
                     self.palette_loading = false;
                 }
                 UiMsg::AnalysisJobStarted(job_id) => self.analysis_job = Some(job_id),
+                UiMsg::ScaleJobStarted(job_id) => self.scale_job = Some(job_id),
                 UiMsg::AnalysisDone(value) => {
                     self.analysis_job = None;
                     let samples: Vec<BarcodeSample> = value
@@ -549,6 +555,30 @@ impl App {
                     let _ = self.msg_tx.send(UiMsg::AnalysisFailed(
                         if kind.contains("Cancelled") { "已取消".into() } else { message.into() },
                     ));
+                }
+                ("scale", "progress") => {
+                    if let (Some(done), Some(total)) = (
+                        event.get("done").and_then(Value::as_u64),
+                        event.get("total").and_then(Value::as_u64),
+                    ) {
+                        self.status = format!("景别识别… {done}/{total}");
+                    }
+                }
+                ("scale.run", "done") if job_id == self.scale_job || self.scale_job.is_some() => {
+                    self.scale_job = None;
+                    self.status = "景别识别完成".into();
+                    // scale.run 返回的 state 含 scale 字段；直接拉一次最新状态。
+                    self.call("project.state", json!({}));
+                }
+                ("scale.run", "error") => {
+                    self.scale_job = None;
+                    let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
+                    let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+                    self.status = if kind.contains("Cancelled") {
+                        "景别识别已取消".into()
+                    } else {
+                        format!("景别识别: {message}")
+                    };
                 }
                 (_, "error") => {
                     let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
@@ -835,6 +865,24 @@ impl App {
                     job.cancel();
                 }
             }
+            // 景别识别（走边车 job，可取消）
+            {
+                let scale_ready = self.index.is_some() && self.state.completed_count > 0
+                    && self.scale_job.is_none() && !self.index_busy;
+                if self.scale_job.is_some() {
+                    ui.spinner();
+                    if ui.button("取消景别").clicked() {
+                        if let Some(job_id) = self.scale_job {
+                            self.call_quiet("job.cancel", json!({"job_id": job_id}));
+                        }
+                    }
+                } else if ui
+                    .add_enabled(scale_ready, egui::Button::new("🎯 景别识别"))
+                    .clicked()
+                {
+                    self.run_scale();
+                }
+            }
             ui.separator();
             if ui.add_enabled(self.state.can_undo, egui::Button::new("↶ 撤销")).clicked() {
                 self.call("edit.undo", json!({}));
@@ -898,11 +946,15 @@ impl App {
                         }
                         // 文本
                         ui.vertical(|ui| {
+                            let scale_text = shot.scale.as_ref()
+                                .map(|s| format!(" [{}]", s.label_zh))
+                                .unwrap_or_default();
                             let label = format!(
-                                "#{} {}帧·{:.2}s{}",
+                                "#{} {}帧·{:.2}s{}{}",
                                 shot.number + 1,
                                 shot.end - shot.start,
                                 shot.duration_s,
+                                scale_text,
                                 if shot.pending { " ·待分析" } else { "" },
                             );
                             let text = if shot.pending {
@@ -916,6 +968,18 @@ impl App {
                             }
                             if !shot.note.is_empty() {
                                 ui.small(egui::RichText::new(truncate(&shot.note, 40)).weak());
+                            }
+                            if !shot.tags.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    for tag in &shot.tags {
+                                        ui.label(
+                                            egui::RichText::new(format!(" [{tag}]"))
+                                                .small()
+                                                .color(egui::Color32::from_rgb(100, 160, 255)),
+                                        );
+                                    }
+                                });
                             }
                         });
                     });
@@ -1239,6 +1303,29 @@ impl App {
         wake();
     }
 
+    fn run_scale(&mut self) {
+        if self.scale_job.is_some() || self.index_busy {
+            return;
+        }
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        self.status = "景别识别启动…".into();
+        std::thread::spawn(move || {
+            match rpc.call("job.start", json!({"method": "scale.run", "params": {}})) {
+                Ok(value) => {
+                    if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
+                        let _ = tx.send(UiMsg::ScaleJobStarted(job_id));
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(UiMsg::RpcError(error));
+                }
+            }
+            wake();
+        });
+    }
+
     fn run_analysis(&mut self) {
         if self.analysis_job.is_some() || self.index_busy {
             return;
@@ -1290,6 +1377,46 @@ impl App {
                 if response.response.lost_focus() && self.note_dirty {
                     self.commit_note();
                 }
+                // -- 标签区 -----------------------------------------------------
+                ui.add_space(4.0);
+                ui.strong("标签");
+                ui.horizontal_wrapped(|ui| {
+                    let mut remove = None;
+                    for tag in &shot.tags {
+                        let chip = egui::Button::new(format!("✕ {tag}"))
+                            .small()
+                            .fill(egui::Color32::from_rgb(60, 80, 120));
+                        if ui.add(chip).clicked() {
+                            remove = Some(tag.clone());
+                        }
+                    }
+                    if let Some(tag) = remove {
+                        let mut tags: Vec<String> = shot.tags.clone();
+                        tags.retain(|t| t != &tag);
+                        self.call("tags.set", json!({"shot_id": shot.id, "tags": tags}));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.tag_input)
+                            .hint_text("新标签…")
+                            .desired_width(120.0),
+                    );
+                    let submit = response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("＋").clicked() || submit {
+                        let tag = self.tag_input.trim().to_string();
+                        if !tag.is_empty() {
+                            let mut tags = shot.tags.clone();
+                            if !tags.contains(&tag) {
+                                tags.push(tag);
+                                tags.sort();
+                                self.call("tags.set", json!({"shot_id": shot.id, "tags": tags}));
+                            }
+                        }
+                        self.tag_input.clear();
+                    }
+                });
                 ui.separator();
                 let current = self.player.as_ref().map(|p| p.frame()).unwrap_or(self.ui_frame);
                 let in_shot = current >= shot.start && current < shot.end;
@@ -1394,11 +1521,28 @@ impl App {
             if ui.button("📷 截帧 PNG").clicked() {
                 self.export_frame();
             }
+            let has_selection = self
+                .state
+                .shots
+                .iter()
+                .any(|s| s.id == self.state.selected_id && !s.pending);
+            if ui
+                .add_enabled(has_selection, egui::Button::new("🎬 镜头 GIF"))
+                .clicked()
+            {
+                self.export_gif();
+            }
             if ui
                 .add_enabled(self.state.completed_count > 0, egui::Button::new("📋 镜头 CSV"))
                 .clicked()
             {
                 self.export_shots_csv();
+            }
+            if ui
+                .add_enabled(self.state.completed_count > 0, egui::Button::new("🖼 分析长图"))
+                .clicked()
+            {
+                self.export_contact_sheet();
             }
         });
         // A/B 帧信息行
@@ -1541,6 +1685,88 @@ impl App {
             return;
         };
         self.call_quiet_result("export.shots_csv", json!({"path": path.to_string_lossy()}));
+    }
+
+    /// 选中镜头导出为高质量 GIF（ffmpeg palettegen/paletteuse 双通道）。
+    fn export_gif(&mut self) {
+        let Some(shot) = self
+            .state
+            .shots
+            .iter()
+            .find(|s| s.id == self.state.selected_id && !s.pending)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(video) = self.state.video_path.clone() else { return };
+        let stem = Path::new(&video).file_stem().map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shot".into());
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("GIF 动图", &["gif"])
+            .set_file_name(format!("{stem}-镜头{}.gif", shot.number + 1))
+            .save_file()
+        else {
+            return;
+        };
+        let rpc = Arc::clone(&self.rpc);
+        let ffmpeg = self.ffmpeg.clone();
+        let video_path = PathBuf::from(video);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        self.status = format!("导出镜头 #{} GIF…", shot.number + 1);
+        std::thread::spawn(move || {
+            // 1) 从边车拿精确时间范围（帧号→秒）
+            let range = rpc.call("export.gif_range", json!({
+                "start_frame": shot.start, "end_frame": shot.end}));
+            let (start_s, duration_s) = match range {
+                Ok(v) => (
+                    v.get("start_s").and_then(Value::as_f64).unwrap_or(0.0),
+                    v.get("duration_s").and_then(Value::as_f64).unwrap_or(1.0).max(0.1),
+                ),
+                Err(error) => {
+                    let _ = tx.send(UiMsg::RpcError(error));
+                    wake();
+                    return;
+                }
+            };
+            // 2) ffmpeg palettegen + paletteuse（高质量调色板 GIF）
+            let output = std::process::Command::new(&ffmpeg)
+                .arg("-nostdin").arg("-loglevel").arg("error")
+                .arg("-ss").arg(format!("{start_s:.6}"))
+                .arg("-t").arg(format!("{duration_s:.6}"))
+                .arg("-i").arg(&video_path)
+                .args(["-vf",
+                    "fps=12,scale=480:-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=3",
+                    "-loop", "0"])
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .output();
+            let message = match output {
+                Ok(out) if out.status.success() && path.exists() => {
+                    let size_kb = path.metadata().map(|m| m.len() / 1024).unwrap_or(0);
+                    UiMsg::ExportSaved(format!("{} ({size_kb}KB)", path.to_string_lossy()))
+                }
+                Ok(out) => UiMsg::RpcError(format!(
+                    "GIF 导出失败: {}",
+                    String::from_utf8_lossy(&out.stderr).chars().take(300).collect::<String>())),
+                Err(error) => UiMsg::RpcError(format!("ffmpeg 启动失败: {error}")),
+            };
+            let _ = tx.send(message);
+            wake();
+        });
+    }
+
+    /// 全镜头网格长图（contact sheet）。
+    fn export_contact_sheet(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG 图片", &["png"])
+            .set_file_name("镜头分析长图.png")
+            .save_file()
+        else {
+            return;
+        };
+        self.status = "生成分析长图…".into();
+        self.call_quiet_result("export.contact_sheet", json!({"path": path.to_string_lossy()}));
     }
 
     fn call_quiet_result(&self, method: &str, params: Value) {

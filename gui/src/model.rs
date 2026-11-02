@@ -29,6 +29,16 @@ pub struct ShotRow {
     pub note: String,
     pub pending: bool,
     pub duration_s: f64,
+    pub tags: Vec<String>,
+    pub scale: Option<ScaleInfo>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct ScaleInfo {
+    pub label: String,
+    pub label_zh: String,
+    pub confidence: Option<f64>,
 }
 
 /// Python `FrameIndex.__dict__` 中 GUI 需要的字段。

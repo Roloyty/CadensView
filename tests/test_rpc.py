@@ -380,3 +380,66 @@ class ExportTests(unittest.TestCase):
         text = content.decode("utf-8-sig")
         self.assertIn("镜头编号", text)
         self.assertIn("时长(秒)", text)
+
+
+class P2FeatureTests(unittest.TestCase):
+    """P2：标签、景别、长图。"""
+
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.video_path = video(Path(self.directory.name) / "clip.mkv")
+
+    def _session_with_shots(self):
+        from shotlab.rpc import Session
+        session = Session()
+        session.build_index(str(self.video_path))
+        session.new_project()
+        session.project.extend_analysis([24], complete=True)
+        return session
+
+    def test_tags_crud_and_vocab(self):
+        from shotlab.rpc import Session, METHODS
+        session = self._session_with_shots()
+        shot_id = session.project.shots[0].id
+        # set
+        state = METHODS["tags.set"](session, {"shot_id": shot_id, "tags": ["对话", "夜景"]}, None)
+        self.assertEqual(set(state["shots"][0]["tags"]), {"对话", "夜景"})
+        # vocab
+        vocab = METHODS["tags.vocab"](session, {}, None)
+        self.assertEqual(set(vocab["vocabulary"]), {"对话", "夜景"})
+        # remove
+        state = METHODS["tags.remove"](session, {"shot_id": shot_id, "tag": "夜景"}, None)
+        self.assertEqual(state["shots"][0]["tags"], ["对话"])
+
+    def test_tags_persist_through_save(self):
+        from shotlab.rpc import Session, METHODS
+        session = self._session_with_shots()
+        shot_id = session.project.shots[0].id
+        METHODS["tags.set"](session, {"shot_id": shot_id, "tags": ["标签A"]}, None)
+        proj = Path(self.directory.name) / "tags.shotlab"
+        session.save_as(str(proj))
+        session.close_project()
+        reopened = Session()
+        reopened.open_project(str(proj))
+        self.assertEqual(reopened.state()["shots"][0]["tags"], ["标签A"])
+        reopened.close_project()
+
+    def test_contact_sheet(self):
+        from shotlab.rpc import Session, METHODS
+        session = self._session_with_shots()
+        out = Path(self.directory.name) / "sheet.png"
+        result = METHODS["export.contact_sheet"](session, {"path": str(out)}, None)
+        self.assertTrue(out.exists())
+        self.assertGreater(out.stat().st_size, 100)
+        self.assertGreaterEqual(result["written"], 1)
+
+    def test_scale_classifies(self):
+        from shotlab.rpc import Session, METHODS
+        session = self._session_with_shots()
+        result = session.scale_run()
+        scales = result["scales"]
+        self.assertEqual(len(scales), len(session.project.shots))
+        for info in scales.values():
+            self.assertIn(info["label"], ("CS", "ECS", "FS", "LS", "MS"))
+            self.assertGreater(info["confidence"], 0.0)

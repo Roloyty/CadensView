@@ -13,6 +13,8 @@ import sys
 import threading
 from pathlib import Path
 
+import numpy as np
+
 from .domain import Project, Shot
 from .history import History
 from .storage import ProjectStore
@@ -36,6 +38,8 @@ class Session:
         self.dirty = False
         self.stats = None  # 最近一次 shot_statistics 结果缓存
         self.busy = None   # 正在运行的后台任务名（index.build / analysis.run）
+        self.shot_tags = {}  # {shot_id: [tag1, tag2, ...]}（存 settings，零迁移）
+        self.scale_labels = {}  # {shot_id: {label, label_zh, confidence}}（存 settings）
 
     def start_busy(self, name):
         if self.busy:
@@ -69,7 +73,9 @@ class Session:
                     duration_s = 0.0
                 shots.append({"id": shot.id, "number": number, "start": start, "end": end,
                               "note": shot.note, "pending": number >= completed,
-                              "duration_s": round(duration_s, 4)})
+                              "duration_s": round(duration_s, 4),
+                              "tags": self.shot_tags.get(shot.id, []),
+                              "scale": self.scale_labels.get(shot.id)})
         return {
             "video_path": self.video_path,
             "project_path": self.project_path,
@@ -114,6 +120,33 @@ class Session:
         self.stats = shot_statistics(context)
         return dict(result, shot_statistics=self.stats)
 
+    def scale_run(self, cancel=None, progress=None):
+        """逐镜头景别识别；仅由后台任务线程调用。"""
+        from concurrent.futures import CancelledError
+        from .scale import classify_shot_middle, LABELS_ZH
+        if self.project is None or self.index is None:
+            raise ValueError("先打开视频并建立索引")
+        rows = [s for s in self.state()["shots"] if not s["pending"]]
+        if not rows:
+            raise ValueError("没有已完成镜头")
+        results = {}
+        for i, shot in enumerate(rows):
+            if cancel is not None and cancel.is_set():
+                raise CancelledError("景别识别已取消")
+            label, confidence = classify_shot_middle(self.index, shot["start"], shot["end"])
+            results[shot["id"]] = {
+                "label": label,
+                "label_zh": LABELS_ZH.get(label, label),
+                "confidence": round(confidence, 3),
+                "start": shot["start"], "end": shot["end"],
+            }
+            if progress is not None:
+                progress(i + 1, len(rows))
+        # 持久化：镜头边界变了自动失效（key 含 start/end）
+        self.scale_labels = {k: v for k, v in results.items()}
+        self.dirty = True
+        return {"scales": results}
+
     def new_project(self):
         if self.index is None:
             raise ValueError("先建立视频索引")
@@ -143,6 +176,8 @@ class Session:
         self.project_path = str(store.path)
         self.history = History()
         self.stats = None
+        self.shot_tags = settings.get('shot_tags', {})
+        self.scale_labels = settings.get('scale_labels', {})
         self.dirty = False
         return self.state()
 
@@ -152,6 +187,9 @@ class Session:
         target = Path(path).resolve()
         if self.project_path is not None and target == Path(self.project_path):
             return self.save()
+        # 标签/景别入 settings（save 与 save_as 共用同一条持久化通道）
+        self.settings['shot_tags'] = self.shot_tags
+        self.settings['scale_labels'] = self.scale_labels
         if self.store is not None:
             # 另存为：把当前内存态写进新副本，并把会话切换到新文件。
             if target.exists():
@@ -170,6 +208,8 @@ class Session:
     def save(self):
         if self.store is None:
             raise ValueError("项目尚未保存过文件")
+        self.settings['shot_tags'] = self.shot_tags
+        self.settings['scale_labels'] = self.scale_labels
         self.store.save(self.project, self.settings)
         self.dirty = False
         return self.state()
@@ -377,19 +417,137 @@ def _export_shots_csv(session, params, emit=None):
     rows = session.state()["shots"]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["镜头编号", "起始帧", "结束帧(不含)", "时长(秒)", "景别", "备注"])
+        writer.writerow(["镜头编号", "起始帧", "结束帧(不含)", "时长(秒)", "标签", "备注"])
         for shot in rows:
             writer.writerow([shot["number"] + 1, shot["start"], shot["end"],
                              f"{shot['duration_s']:.3f}",
-                             session.labels.get(shot["id"], {}).get("scale", "") if hasattr(session, "labels") else "",
+                             "; ".join(shot.get("tags", [])),
                              shot["note"]])
     return {"written": len(rows), "path": str(path.resolve())}
+
+
+@method("tags.set")
+def _tags_set(session, params, emit=None):
+    """替换镜头的全部标签。"""
+    shot_id = params["shot_id"]
+    tags = [t.strip() for t in params.get("tags", []) if t.strip()]
+    session.project.row(shot_id)  # 校验镜头存在
+    if tags:
+        session.shot_tags[shot_id] = sorted(set(tags))
+    else:
+        session.shot_tags.pop(shot_id, None)
+    session.dirty = True
+    return session.state()
+
+
+@method("tags.remove")
+def _tags_remove(session, params, emit=None):
+    """移除镜头的一个标签。"""
+    shot_id, tag = params["shot_id"], params["tag"]
+    tags = session.shot_tags.get(shot_id, [])
+    if tag in tags:
+        tags = [t for t in tags if t != tag]
+        if tags:
+            session.shot_tags[shot_id] = tags
+        else:
+            session.shot_tags.pop(shot_id, None)
+        session.dirty = True
+    return session.state()
+
+
+@method("tags.vocab")
+def _tags_vocab(session, params, emit=None):
+    """全部标签词表（自动汇总）。"""
+    vocab = set()
+    for tags in session.shot_tags.values():
+        vocab.update(tags)
+    return {"vocabulary": sorted(vocab)}
+
+
+@method("export.contact_sheet")
+def _export_contact_sheet(session, params, emit=None):
+    """镜头网格长图 PNG（Pillow 渲染编号+时长）。"""
+    if session.project is None or session.index is None:
+        raise ValueError("先打开视频并建立索引")
+    from PIL import Image, ImageDraw, ImageFont
+    from t0.media import FrameReader
+
+    path = Path(params["path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = int(params.get("columns", 5))
+    thumb_w = int(params.get("thumb_width", 160))
+
+    rows_data = [s for s in session.state()["shots"] if not s["pending"]]
+    if not rows_data:
+        raise ValueError("没有已完成镜头")
+
+    reader = FrameReader(session.index)
+    try:
+        cell_h = 0
+        thumbs = []
+        for shot in rows_data:
+            mid = min((shot["start"] + shot["end"]) // 2, len(session.index.pts) - 1)
+            frame = reader.read(mid)
+            arr = frame.to_ndarray(format="rgb24")
+            h, w = arr.shape[:2]
+            tw = thumb_w
+            th = int(h * tw / w)
+            if th == 0:
+                continue
+            # 最近邻缩放
+            ys = (np.arange(th) * h // th).clip(0, h - 1)
+            xs = (np.arange(tw) * w // tw).clip(0, w - 1)
+            thumbs.append((arr[ys][:, xs], shot))
+            cell_h = max(cell_h, th)
+    finally:
+        reader.close()
+
+    import math
+    total_rows = math.ceil(len(thumbs) / cols)
+    label_h = 18
+    sheet_w = cols * (thumb_w + 4) + 4
+    sheet_h = total_rows * (cell_h + label_h + 4) + 4
+
+    img = Image.new("RGB", (sheet_w, sheet_h), (24, 24, 28))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("C:/Windows/Fonts/segoeui.ttf", 11)
+    except OSError:
+        font = ImageFont.load_default()
+
+    for i, (thumb_arr, shot) in enumerate(thumbs):
+        row, col = divmod(i, cols)
+        x = col * (thumb_w + 4) + 4
+        y = row * (cell_h + label_h + 4) + 4
+        img.paste(Image.fromarray(thumb_arr), (x, y))
+        label = f"#{shot['number']+1}  {shot['duration_s']:.1f}s"
+        if shot.get("tags"):
+            label += "  " + " ".join(shot["tags"])
+        draw.text((x + 1, y + cell_h + 1), label, fill=(200, 200, 200), font=font)
+
+    img.save(str(path), "PNG")
+    return {"written": len(thumbs), "path": str(path.resolve())}
+
+
+@method("export.gif_range")
+def _export_gif_range(session, params, emit=None):
+    """计算 GIF 导出所需的精确时间范围（帧号→秒）。"""
+    if session.index is None:
+        raise ValueError("先建立索引")
+    start_frame = int(params["start_frame"])
+    end_frame = int(params["end_frame"])
+    start_frame = max(0, min(start_frame, len(session.index.pts) - 1))
+    end_frame = max(start_frame + 1, min(end_frame, len(session.index.pts)))
+    index = session.index
+    start_s = float(index.pts[start_frame] * index.tb)
+    end_s = float(index.pts[end_frame - 1] * index.tb) + float(index.durations[end_frame - 1] * index.tb)
+    return {"start_s": start_s, "duration_s": end_s - start_s, "frame_count": end_frame - start_frame}
 
 
 # -- protocol loop ----------------------------------------------------------
 
 # 允许以后台任务方式运行的方法（长耗时、可取消）。
-JOB_METHODS = {"index.build", "analysis.run"}
+JOB_METHODS = {"index.build", "analysis.run", "scale.run"}
 
 
 def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
@@ -421,6 +579,10 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
                 result = session.analysis_run(
                     cancel=cancel,
                     progress=lambda done, total: emit("analysis", done=done, total=total))
+            elif name == "scale.run":
+                result = session.scale_run(
+                    cancel=cancel,
+                    progress=lambda done, total: emit("scale", done=done, total=total))
             else:
                 raise ValueError(f"不支持的任务: {name}")
         except Exception as error:
