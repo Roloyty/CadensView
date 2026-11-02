@@ -366,6 +366,26 @@ def _analysis_run(session, params, emit=None):
         progress=(lambda done, total: emit("analysis", done=done, total=total)) if emit else None)
 
 
+@method("export.shots_csv")
+def _export_shots_csv(session, params, emit=None):
+    """镜头汇总 CSV（utf-8-sig，Excel 直接打开中文不乱码）。"""
+    import csv
+    if session.project is None or session.index is None:
+        raise ValueError("先打开视频并建立索引")
+    path = Path(params["path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = session.state()["shots"]
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["镜头编号", "起始帧", "结束帧(不含)", "时长(秒)", "景别", "备注"])
+        for shot in rows:
+            writer.writerow([shot["number"] + 1, shot["start"], shot["end"],
+                             f"{shot['duration_s']:.3f}",
+                             session.labels.get(shot["id"], {}).get("scale", "") if hasattr(session, "labels") else "",
+                             shot["note"]])
+    return {"written": len(rows), "path": str(path.resolve())}
+
+
 # -- protocol loop ----------------------------------------------------------
 
 # 允许以后台任务方式运行的方法（长耗时、可取消）。

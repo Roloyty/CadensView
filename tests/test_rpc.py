@@ -358,3 +358,25 @@ class LineIn:
         if item is None:
             raise StopIteration
         return item
+
+
+class ExportTests(unittest.TestCase):
+    """export.shots_csv：中文字段名 + utf-8-sig 编码。"""
+
+    def test_csv_export_with_chinese_headers(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        source = video(Path(directory.name) / "clip.mkv")
+        from shotlab.rpc import Session, METHODS
+        session = Session()
+        session.build_index(str(source))
+        session.new_project()
+        result = METHODS["export.shots_csv"](session, {"path": str(Path(directory.name) / "out.csv")}, None)
+        out = Path(directory.name) / "out.csv"
+        self.assertTrue(out.exists())
+        self.assertEqual(result["written"], len(session.project.shots))
+        content = out.read_bytes()
+        self.assertTrue(content.startswith(b'\xef\xbb\xbf'), "CSV 需要 utf-8-sig BOM（Excel 兼容）")
+        text = content.decode("utf-8-sig")
+        self.assertIn("镜头编号", text)
+        self.assertIn("时长(秒)", text)

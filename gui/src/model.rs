@@ -36,6 +36,8 @@ pub struct ShotRow {
 #[serde(default)]
 pub struct IndexInfo {
     pub path: String,
+    pub size: i64,
+    pub mtime_ns: i64,
     pub pts: Vec<i64>,
     pub durations: Vec<i64>,
     pub time_base: String,
@@ -77,6 +79,116 @@ impl IndexInfo {
             self.metadata.width.unwrap_or(0) as usize,
             self.metadata.height.unwrap_or(0) as usize,
         )
+    }
+
+    /// 缩略图等磁盘缓存的稳定键：同一文件的指纹。
+    pub fn cache_stem(&self) -> String {
+        format!("{}-{}-{}", self.size, self.mtime_ns, self.pts.len())
+    }
+}
+
+// -- 统计（stats.run 的结果视图） -------------------------------------------
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct StatsData {
+    pub overview: StatsOverview,
+    pub distribution: StatsDistribution,
+    pub editing: StatsEditing,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct StatsOverview {
+    pub shot_count: Option<u64>,
+    pub scope_duration_s: Option<f64>,
+    pub asl_s: Option<f64>,
+    pub msl_s: Option<f64>,
+    pub stddev_s: Option<f64>,
+    pub cv: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct StatsDistribution {
+    pub duration_histogram: Vec<HistBin>,
+    pub percentiles_s: StatsPercentiles,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct StatsPercentiles {
+    pub p10: Option<f64>,
+    pub p25: Option<f64>,
+    pub p75: Option<f64>,
+    pub p90: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct HistBin {
+    pub start_s: f64,
+    pub end_s: f64,
+    pub count: u64,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct StatsEditing {
+    pub cut_density_series: Vec<DensityPoint>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct DensityPoint {
+    pub video_time_s: f64,
+    pub cuts_per_minute: Option<f64>,
+}
+
+// -- 色彩（palette.get / analysis.run 的结果视图） ---------------------------
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct PaletteInfo {
+    pub colors: Vec<PaletteColor>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct PaletteColor {
+    pub hex: String,
+    pub srgb: Option<[u8; 3]>,
+    pub pixel_share: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct BarcodeSample {
+    pub video_time_s: f64,
+    pub end_time_s: f64,
+    pub srgb: Option<[u8; 3]>,
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn stats_parse_minimal_payload() {
+        let payload = serde_json::json!({
+            "overview": {"shot_count": 3, "asl_s": 20.0},
+            "distribution": {"duration_histogram": [
+                {"start_s": 0.0, "end_s": 2.0, "count": 2, "duration_s": 5.0, "count_share": 0.5}
+            ], "percentiles_s": {"p10": 1.0}},
+            "editing": {"cut_density_series": [
+                {"video_time_s": 0.0, "cuts_per_minute": 3.0}
+            ]}
+        });
+        let stats: StatsData = serde_json::from_value(payload).unwrap();
+        assert_eq!(stats.overview.shot_count, Some(3));
+        assert_eq!(stats.distribution.duration_histogram.len(), 1);
+        assert_eq!(stats.distribution.duration_histogram[0].count, 2);
+        assert_eq!(stats.editing.cut_density_series.len(), 1);
     }
 }
 

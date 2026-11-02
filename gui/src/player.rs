@@ -210,6 +210,11 @@ fn spawn_stream(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, from: u64)
         .spawn()
 }
 
+/// 线程友好的单帧采集（自带 index 拷贝，给 A/B 对照等离屏使用）。
+pub fn capture_frame(ffmpeg: &PathBuf, video: &PathBuf, index: IndexInfo, frame: u64) -> Result<(usize, usize, Vec<u8>), String> {
+    capture_one(ffmpeg, video, &index, frame)
+}
+
 fn capture_one(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, frame: u64) -> Result<(usize, usize, Vec<u8>), String> {
     let seconds = index.seconds(frame);
     let (width, height) = index.size();
@@ -230,6 +235,36 @@ fn capture_one(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, frame: u64)
         return Err(format!("ffmpeg 未返回完整帧 ({} < {})", output.stdout.len(), expected));
     }
     Ok((width, height, output.stdout[..expected].to_vec()))
+}
+
+/// 小尺寸单帧采集（rgb24）：缩略图与景别预处理复用。
+pub fn capture_small(ffmpeg: &PathBuf, video: &PathBuf, seconds: f64, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let scale = format!("scale={width}:{height}");
+    let output = Command::new(ffmpeg)
+        .arg("-nostdin")
+        .arg("-loglevel").arg("error")
+        .arg("-ss").arg(format!("{seconds:.6}"))
+        .arg("-i").arg(video)
+        .args(["-map", "0:v:0", "-an", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .arg("-vf").arg(&scale)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg 启动失败: {e}"))?;
+    let expected = (width as usize) * (height as usize) * 3;
+    if output.stdout.len() < expected {
+        return Err(format!("缩略图帧不完整 ({} < {})", output.stdout.len(), expected));
+    }
+    Ok(output.stdout[..expected].to_vec())
+}
+
+/// rgb24 → rgba（简单通道扩展，小图无所谓性能）。
+pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+    for pixel in rgb.chunks_exact(3) {
+        rgba.extend_from_slice(pixel);
+        rgba.push(255);
+    }
+    rgba
 }
 
 fn read_exact_or_eof(stdout: &mut impl Read, buffer: &mut [u8]) -> bool {
