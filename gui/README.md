@@ -60,9 +60,34 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 - 加 RPC 能力：`shotlab/rpc.py` 里 `@method("...")` 注册，Rust 侧 `self.call(...)` 调用。
 - 改业务规则：直接改 `shotlab/domain.py` 等原模块，`pytest tests/` 守着不变式；GUI 无需改。
 
-## 已知限制（P0 范围）
+## 功能总览（P0–P2 全部完成）
+
+| 模块 | 功能 |
+|---|---|
+| 播放 | 连续播放/暂停、逐帧步进、滑块跳转（PTS 精确）、A/B 对照（并排+叠加混合） |
+| 检测 | TransNetV2 切镜（GPU DirectML/CPU 自适应、可取消、进度、失败自动 CPU 重试） |
+| 编辑 | 拆分/合并/移边界、笔记、撤销重做、保存/另存为（SQLite，官方 exe 兼容） |
+| 缩略图 | 镜头列表行内缩略图（串行 worker+磁盘缓存+虚拟滚动） |
+| 统计 | ASL/MSL/σ/CV/百分位、时长直方图、切镜密度曲线（编辑后自动失效重算） |
+| 色彩 | 镜头五主色调色板、全片秒级色带（可取消的后台分析） |
+| 景别 | MobileNetV3 ONNX 五类识别（特写/大特写/全景/远景/中景），列表徽章显示 |
+| 标签 | 镜头标签 chips（Enter 添加、点击删除），随项目持久化，CSV 含标签列 |
+| 导出 | 当前帧 PNG、镜头 GIF（palettegen 高质量）、镜头 CSV、全片分析长图 |
+
+## 测试
+
+```powershell
+# Python 侧（含 job 协议/回归/景别/标签/导出组）
+..\.venv\Scripts\python -m pytest tests\ -q
+
+# Rust 侧（含播放帧精度夹具测试，需先生成夹具）
+..\.venv\Scripts\python ..	ests\make_fixture.py %TEMP%\cv-fixture
+cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
+```
+
+## 已知限制
 
 - 无音频、无字幕（分析模式静音播放）
-- 无缩略图条、无 A/B 对照、无统计/色彩面板、无景别识别——按计划 P1/P2 迭代
 - 逐帧取帧走 ffmpeg 单次启动，约 50–150ms/次；连续播放不受影响
-- `.shotlab` 项目与官方 exe 兼容（仍为 v1 schema）
+- 景别模型在真人电影数据（MovieShots）上训练，动画泛化未验证，置信度仅供参考
+- `.shotlab` 项目格式与官方 exe 兼容（v1 schema + settings 扩展字段）
