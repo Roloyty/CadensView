@@ -5,6 +5,7 @@ mod detect;
 mod model;
 mod player;
 mod rpc;
+mod theme;
 mod thumb;
 
 use eframe::egui;
@@ -104,7 +105,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
-        install_cjk_fonts(&cc.egui_ctx);
+        theme::install(&cc.egui_ctx);
         let repo_root = find_repo_root();
         let python = rpc::python_path(&repo_root);
         if !python.exists() {
@@ -747,40 +748,8 @@ fn unique_dir(prefix: &str) -> Option<PathBuf> {
     None
 }
 
-/// egui 默认字体不含 CJK 字形；不装中文字体所有中文界面都是豆腐块。
-/// 从系统字体目录加载（优先等线/微软雅黑的 ttc，退到黑体 ttf），注册为后备字体。
-fn install_cjk_fonts(ctx: &egui::Context) {
-    let candidates = [
-        "C:/Windows/Fonts/Deng.ttf",       // 等线（Win10+ 默认，ttf 稳）
-        "C:/Windows/Fonts/simhei.ttf",     // 黑体
-        "C:/Windows/Fonts/msyh.ttc",       // 微软雅黑（ttc，ab_glyph 可能不支持，放最后）
-    ];
-    let mut bytes = None;
-    for path in candidates {
-        if let Ok(data) = std::fs::read(path) {
-            bytes = Some(data);
-            break;
-        }
-    }
-    let Some(bytes) = bytes else {
-        eprintln!("警告：未找到系统中文字体，界面中文将显示为方块");
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "system-cjk".into(),
-        egui::FontData::from_owned(bytes).into(),
-    );
-    // 追加为后备：拉丁字符仍用默认字体，缺字落到 CJK。
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        if let Some(list) = fonts.families.get_mut(&family) {
-            list.push("system-cjk".into());
-        }
-    }
-    ctx.set_fonts(fonts);
-}
-
-fn find_repo_root() -> PathBuf {    if let Ok(root) = std::env::var("CADENSVIEW_ROOT") {
+fn find_repo_root() -> PathBuf {
+    if let Ok(root) = std::env::var("CADENSVIEW_ROOT") {
         return PathBuf::from(root);
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -806,9 +775,18 @@ impl eframe::App for App {
         egui::Panel::bottom("statusbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.state.dirty {
-                    ui.colored_label(egui::Color32::ORANGE, "● 未保存");
+                    ui.colored_label(theme::ACCENT, "● 未保存");
                 }
-                ui.label(&self.status);
+                // 语义色：⚠ 开头为错误（红），完成/导出为通过（绿），其余常规。
+                let status_text = egui::RichText::new(&self.status);
+                let colored = if self.status.starts_with('⚠') {
+                    status_text.color(theme::BAD)
+                } else if self.status.starts_with("已导出") || self.status.ends_with("完成") {
+                    status_text.color(theme::OK)
+                } else {
+                    status_text
+                };
+                ui.label(colored);
             });
         });
         egui::Panel::left("shots").default_size(230.0).show(ui, |ui| self.shot_list(ui));
@@ -891,7 +869,7 @@ impl App {
                 self.call("edit.redo", json!({}));
             }
             if self.state.pending_start.is_some() && self.index.is_some() {
-                ui.colored_label(egui::Color32::GRAY, "（有待分析尾段：先跑检测）");
+                ui.colored_label(theme::MUTED, "（有待分析尾段：先跑检测）");
             }
         });
     }
@@ -928,21 +906,21 @@ impl App {
                                 texture.id(),
                                 egui::Rect::from_min_size(origin, fitted),
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                egui::Color32::WHITE,
+                                theme::INK,
                             );
                             ui.painter_at(thumb_rect).rect_stroke(
                                 thumb_rect, 1.0,
-                                if selected { egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE) }
-                                else { egui::Stroke::new(1.0, egui::Color32::DARK_GRAY) },
+                                if selected { egui::Stroke::new(2.0, theme::ACCENT) }
+                                else { egui::Stroke::NONE },
                                 egui::StrokeKind::Inside,
                             );
                         } else {
                             self.request_thumb(&shot, &key);
                             ui.painter_at(thumb_rect).rect_filled(
-                                thumb_rect, 1.0, egui::Color32::from_gray(38));
+                                thumb_rect, 0.0, theme::GROUND);
                             ui.painter_at(thumb_rect).text(
                                 thumb_rect.center(), egui::Align2::CENTER_CENTER, "…",
-                                egui::FontId::proportional(14.0), egui::Color32::GRAY);
+                                egui::FontId::proportional(14.0), theme::MUTED);
                         }
                         // 文本
                         ui.vertical(|ui| {
@@ -958,7 +936,7 @@ impl App {
                                 if shot.pending { " ·待分析" } else { "" },
                             );
                             let text = if shot.pending {
-                                egui::RichText::new(label).color(egui::Color32::GRAY)
+                                egui::RichText::new(label).color(theme::MUTED)
                             } else {
                                 egui::RichText::new(label)
                             };
@@ -976,7 +954,7 @@ impl App {
                                         ui.label(
                                             egui::RichText::new(format!(" [{tag}]"))
                                                 .small()
-                                                .color(egui::Color32::from_rgb(100, 160, 255)),
+                                                .color(theme::ACCENT),
                                         );
                                     }
                                 });
@@ -1114,10 +1092,10 @@ impl App {
             egui::Sense::hover(),
         );
         let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)), egui::StrokeKind::Inside);
         let Some(max_count) = bins.iter().map(|b| b.count).max().filter(|m| *m > 0) else {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), egui::Color32::GRAY);
+                egui::FontId::proportional(12.0), theme::MUTED);
             return;
         };
         let inner = rect.shrink(4.0);
@@ -1130,14 +1108,14 @@ impl App {
                 egui::pos2(x0 + 1.0, inner.bottom() - bar_h),
                 egui::vec2((bar_w - 2.0).max(1.0), bar_h),
             );
-            painter.rect_filled(bar, 1.0, egui::Color32::from_rgb(86, 156, 214));
+            painter.rect_filled(bar, 1.0, theme::ACCENT);
             if bin.count > 0 && bar_w > 14.0 {
                 painter.text(
                     egui::pos2(bar.center().x, bar.top() - 7.0),
                     egui::Align2::CENTER_CENTER,
                     bin.count,
                     egui::FontId::proportional(9.0),
-                    egui::Color32::GRAY,
+                    theme::MUTED,
                 );
             }
         }
@@ -1148,7 +1126,7 @@ impl App {
                 egui::Align2::RIGHT_TOP,
                 format!("{:.0}s", last.end_s),
                 egui::FontId::proportional(9.0),
-                egui::Color32::GRAY,
+                theme::MUTED,
             );
         }
     }
@@ -1161,14 +1139,14 @@ impl App {
             egui::Sense::hover(),
         );
         let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)), egui::StrokeKind::Inside);
         let values: Vec<(f64, f64)> = points
             .iter()
             .filter_map(|p| p.cuts_per_minute.map(|v| (p.video_time_s, v)))
             .collect();
         if values.len() < 2 {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), egui::Color32::GRAY);
+                egui::FontId::proportional(12.0), theme::MUTED);
             return;
         }
         let max_t = values.last().map(|v| v.0).unwrap_or(1.0).max(0.001);
@@ -1181,7 +1159,7 @@ impl App {
                 inner.bottom() - (v / max_v) as f32 * (inner.height() - 10.0),
             )
         };
-        let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 120, 60));
+        let stroke = egui::Stroke::new(1.5, theme::ACCENT);
         for pair in values.windows(2) {
             let (t0, v0) = pair[0];
             let (t1, v1) = pair[1];
@@ -1192,14 +1170,14 @@ impl App {
             egui::Align2::RIGHT_TOP,
             format!("{max_t:.0}s"),
             egui::FontId::proportional(9.0),
-            egui::Color32::GRAY,
+            theme::MUTED,
         );
         painter.text(
             egui::pos2(inner.left(), inner.top() - 2.0),
             egui::Align2::LEFT_BOTTOM,
             format!("峰值 {max_v:.1}/分"),
             egui::FontId::proportional(9.0),
-            egui::Color32::GRAY,
+            theme::MUTED,
         );
     }
 
@@ -1229,7 +1207,7 @@ impl App {
                             ui.painter_at(rect).rect_filled(
                                 rect, 3.0, egui::Color32::from_rgb(r, g, b));
                             ui.painter_at(rect).rect_stroke(
-                                rect, 3.0, egui::Stroke::new(1.0, egui::Color32::BLACK),
+                                rect, 3.0, egui::Stroke::new(1.0, theme::GROUND),
                                 egui::StrokeKind::Inside);
                         }
                     });
@@ -1267,7 +1245,7 @@ impl App {
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), height), egui::Sense::hover());
             let painter = ui.painter_at(rect);
-            painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::GRAY), egui::StrokeKind::Inside);
+            painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)), egui::StrokeKind::Inside);
             let n = self.barcode.len().max(1) as f32;
             let inner = rect.shrink(2.0);
             let slice = inner.width() / n;
@@ -1385,7 +1363,7 @@ impl App {
                     for tag in &shot.tags {
                         let chip = egui::Button::new(format!("✕ {tag}"))
                             .small()
-                            .fill(egui::Color32::from_rgb(60, 80, 120));
+                            .fill(theme::ACCENT_DIM);
                         if ui.add(chip).clicked() {
                             remove = Some(tag.clone());
                         }

@@ -91,3 +91,23 @@ cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
 - 逐帧取帧走 ffmpeg 单次启动，约 50–150ms/次；连续播放不受影响
 - 景别模型在真人电影数据（MovieShots）上训练，动画泛化未验证，置信度仅供参考
 - `.shotlab` 项目格式与官方 exe 兼容（v1 schema + settings 扩展字段）
+
+## Agent 调用（CLI + MCP）
+
+**CLI**（全部 JSON 输出，错误走 stderr + 非零退出码）：
+
+```powershell
+..\.venv\Scripts\python -m shotlab.cli shots   <p.shotlab>
+..\.venv\Scripts\python -m shotlab.cli stats   <p.shotlab>
+..\.venv\Scripts\python -m shotlab.cli detect  <video.mkv> --save <p.shotlab> --device auto
+..\.venv\Scripts\python -m shotlab.cli scale   <p.shotlab>
+..\.venv\Scripts\python -m shotlab.cli palette <p.shotlab> --frame 120
+..\.venv\Scripts\python -m shotlab.cli tags    <p.shotlab> set --shot 1 --tags 对话,夜景
+..\.venv\Scripts\python -m shotlab.cli export  csv|sheet|gif|frame --project <p.shotlab> ...
+```
+
+**MCP**（stdio，11 个工具：cv_shots/cv_stats/cv_detect/cv_palette/cv_scale/cv_tags/
+cv_analysis/cv_export_csv/cv_contact_sheet/cv_export_gif/cv_export_frame）：
+
+- 项目根目录 `.mcp.json` 已注册（指向本 venv 的 `-m shotlab.mcp_server`）
+- 在支持项目级 MCP 配置的客户端里打开本仓库即自动生效；或手动把同一段配置加入客户端

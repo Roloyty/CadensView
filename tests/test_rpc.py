@@ -5,6 +5,8 @@ import io
 import json
 from pathlib import Path
 import queue
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import threading
 import time
@@ -443,3 +445,56 @@ class P2FeatureTests(unittest.TestCase):
         for info in scales.values():
             self.assertIn(info["label"], ("CS", "ECS", "FS", "LS", "MS"))
             self.assertGreater(info["confidence"], 0.0)
+
+
+class CliTests(unittest.TestCase):
+    """cv 命令行：JSON 输出契约与项目读写。"""
+
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.video_path = video(Path(self.directory.name) / "clip.mkv")
+
+    def test_cli_shots_and_tags(self):
+        import subprocess
+        session = Session()
+        session.build_index(str(self.video_path))
+        session.new_project()
+        session.project.extend_analysis([24], complete=True)
+        proj = Path(self.directory.name) / "cli.shotlab"
+        session.save_as(str(proj))
+        session.close_project()
+        venv_py = sys.executable
+        run = lambda *argv: subprocess.run(
+            [venv_py, "-m", "shotlab.cli", *argv],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True, text=True, encoding="utf-8", timeout=120)
+        # shots
+        r = json.loads(run("shots", str(proj)).stdout)
+        self.assertEqual(len(r["shots"]), 2)
+        # tags set → list → 输出契约
+        r = json.loads(run("tags", str(proj), "set", "--shot", "1", "--tags", "测试,CLI").stdout)
+        self.assertEqual(set(r["tags"]), {"测试", "CLI"})
+        r = json.loads(run("tags", str(proj), "list").stdout)
+        self.assertEqual(r["tags"]["1"], ["CLI", "测试"])
+        # stats
+        r = json.loads(run("stats", str(proj)).stdout)
+        self.assertEqual(r["overview"]["shot_count"], 2)
+        # 重开确认标签已写盘
+        reopened = Session()
+        reopened.open_project(str(proj))
+        self.assertEqual(reopened.state()["shots"][0]["tags"], ["CLI", "测试"])
+        reopened.close_project()
+
+    def test_cli_error_contract(self):
+        import subprocess
+        run = lambda *argv: subprocess.run(
+            [sys.executable, "-m", "shotlab.cli", *argv],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True, text=True, encoding="utf-8", timeout=120)
+        missing = Path(self.directory.name) / "nope.shotlab"
+        result = run("shots", str(missing))
+        self.assertNotEqual(result.returncode, 0)
+        payload = json.loads(result.stderr)
+        self.assertFalse(payload["ok"])
+        self.assertIn("error", payload)
