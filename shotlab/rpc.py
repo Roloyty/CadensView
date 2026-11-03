@@ -24,6 +24,28 @@ from t0.media import FrameIndex, build_index
 BUSY_ALLOWED = {"ping", "project.state", "job.cancel"}
 
 
+def _session_store(path):
+    """Keep core validation; busy gating serializes this session's SQLite access.
+
+    A successful index.build may retire the store on its job thread. Use a
+    thread-shareable connection so failed indexing can keep the old store open.
+    """
+    import sqlite3
+    store = ProjectStore(path)
+    try:
+        connection = sqlite3.connect(store.path.as_uri() + "?mode=rw", uri=True,
+                                     timeout=2, check_same_thread=False)
+    finally:
+        store.close()
+    store.connection = connection
+    return store
+
+
+def _same_path(first, second):
+    first, second = Path(first).resolve(), Path(second).resolve()
+    return first == second or (first.exists() and second.exists() and first.samefile(second))
+
+
 class Session:
     """One open video/project; the sidecar serves a single session at a time."""
 
@@ -45,9 +67,6 @@ class Session:
     def start_busy(self, name):
         if self.busy:
             raise ValueError(f"已有后台任务运行中（{self.busy}），请等待或取消")
-        if name == "index.build":
-            # 换片重建索引：先释放旧的项目文件句柄。
-            self.close_current_store()
         self.busy = name
 
     def end_busy(self):
@@ -57,6 +76,37 @@ class Session:
         if self.store is not None:
             self.store.close()
             self.store = None
+
+    def _reset_metadata(self, settings=None):
+        self.settings = settings if settings is not None else {}
+        self.shot_tags = self.settings.get("shot_tags", {})
+        self.scale_labels = self.settings.get("scale_labels", {})
+        self.subtitle_cues = []
+        self.history = History()
+        self.stats = None
+
+    def analysis_scope(self, params):
+        """Omission selects completed coverage; explicit IDs never widen it."""
+        from shotlab.statistics import AnalysisScope
+        if self.project is None or self.index is None:
+            raise ValueError("先打开视频并建立索引")
+        if "shot_ids" not in params:
+            return AnalysisScope()
+        ids = params["shot_ids"]
+        if not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids):
+            raise ValueError("shot_ids 必须是非空的已完成镜头 ID 列表")
+        completed = self.project.shots[:self.project.completed_count]
+        selected = set(ids)
+        if selected - {shot.id for shot in completed}:
+            raise ValueError("shot_ids 包含未知或未完成镜头 ID")
+        return AnalysisScope(kind="selected_shots",
+                             shot_ids=tuple(shot.id for shot in completed if shot.id in selected))
+
+    def scoped_shots(self, params):
+        scope = self.analysis_scope(params)
+        selected = set(scope.shot_ids) if scope.kind == "selected_shots" else None
+        return [shot for shot in self.state()["shots"]
+                if not shot["pending"] and (selected is None or shot["id"] in selected)]
 
     # -- snapshot -----------------------------------------------------------
 
@@ -72,12 +122,17 @@ class Session:
                                   - index.pts[start]) * float(index.tb)
                 except (IndexError, TypeError):
                     duration_s = 0.0
+                scale = self.scale_labels.get(shot.id)
+                if (not scale or number >= completed or
+                        scale.get("start") != start or scale.get("end") != end):
+                    scale = None
                 shots.append({"id": shot.id, "number": number, "start": start, "end": end,
                               "note": shot.note, "pending": number >= completed,
                               "duration_s": round(duration_s, 4),
                               "tags": self.shot_tags.get(shot.id, []),
-                              "scale": self.scale_labels.get(shot.id)})
+                              "scale": scale})
         return {
+            "project_id": project.id if project else None,
             "video_path": self.video_path,
             "project_path": self.project_path,
             "dirty": self.dirty,
@@ -99,24 +154,27 @@ class Session:
         if not path.is_file():
             raise ValueError(f"视频文件不存在: {video_path}")
         progress = (lambda count, seconds: emit("index", done=count, time_s=seconds)) if emit else None
-        self.close_current_store()
         index = build_index(str(path), limit=limit, progress=progress, cancel=cancel)
+        index.verify_source()
+        self.close_current_store()
         self.index = index
         self.video_path = str(path.resolve())
         self.project = None
         self.project_path = None
-        self.stats = None
+        self._reset_metadata()
         self.dirty = False
         return {"index": self.index.__dict__, "video_path": self.video_path}
 
-    def analysis_run(self, cancel=None, progress=None):
+    def analysis_run(self, cancel=None, progress=None, *, scope=None):
         """颜色时间轴 + 镜头统计；仅由后台任务线程调用（busy 保护下无并发写）。"""
         from shotlab.statistics import build_context
         from shotlab.statistics.colors import analyze_colors
         from shotlab.statistics.shots import shot_statistics
         if self.project is None or self.index is None:
             raise ValueError("先打开视频并建立索引")
-        context = build_context(self.project, self.index)
+        if scope is None:
+            scope = self.analysis_scope({})
+        context = build_context(self.project, self.index, scope)
         result = analyze_colors(context, cancel=cancel, progress=progress, include_summary=True)
         self.stats = shot_statistics(context)
         return dict(result, shot_statistics=self.stats)
@@ -153,55 +211,76 @@ class Session:
             raise ValueError("先建立视频索引")
         self.index.verify_source()
         shot = Shot()
-        self.project = Project(len(self.index.pts), [0, len(self.index.pts)], [shot],
-                               selected_id=shot.id, pending_start=0)
-        self.project.validate()
-        self.history = History()
+        project = Project(len(self.index.pts), [0, len(self.index.pts)], [shot],
+                          selected_id=shot.id, pending_start=0)
+        project.validate()
         self.close_current_store()
+        self.project = project
         self.project_path = None
-        self.stats = None
+        self._reset_metadata()
         self.dirty = True
         return self.state()
 
     def open_project(self, path):
-        store = ProjectStore(path)
+        store = _session_store(path)
         try:
             project, index, settings = store.load()
+            index.verify_source()
         except Exception:
             store.close()
             raise
-        index.verify_source()
         self.close_current_store()
-        self.store, self.project, self.index, self.settings = store, project, index, settings
+        self.store, self.project, self.index = store, project, index
         self.video_path = index.path
         self.project_path = str(store.path)
-        self.history = History()
-        self.stats = None
-        self.shot_tags = settings.get('shot_tags', {})
-        self.scale_labels = settings.get('scale_labels', {})
+        self._reset_metadata(settings)
         self.dirty = False
         return self.state()
 
-    def save_as(self, path):
+    def save_as(self, path, overwrite=False):
+        import os
+        from tempfile import TemporaryDirectory
         if self.project is None or self.index is None:
             raise ValueError("没有可保存的项目")
+        if type(overwrite) is not bool:
+            raise ValueError("overwrite 必须为布尔值")
         target = Path(path).resolve()
-        if self.project_path is not None and target == Path(self.project_path):
+        if _same_path(target, self.index.path):
+            raise ValueError("不能将项目保存到源视频路径")
+        if self.project_path is not None and _same_path(target, self.project_path):
+            # 同路径始终走普通保存，保留核心的并发写入冲突检测。
             return self.save()
-        # 标签/景别入 settings（save 与 save_as 共用同一条持久化通道）
-        self.settings['shot_tags'] = self.shot_tags
-        self.settings['scale_labels'] = self.scale_labels
-        if self.store is not None:
-            # 另存为：把当前内存态写进新副本，并把会话切换到新文件。
-            if target.exists():
-                target.unlink()
-            self.store.backup(target, self.project, self.settings)
-            self.close_current_store()
-            self.store = ProjectStore(target)
-        else:
-            if target.exists():
-                target.unlink()
-            self.store = ProjectStore.create(target, self.index, self.project, self.settings)
+        if target.exists() and not overwrite:
+            raise FileExistsError("目标文件已存在；覆盖需要 overwrite=true")
+        settings = dict(self.settings, shot_tags=self.shot_tags, scale_labels=self.scale_labels)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # 临时目录与目标同文件系统；只有完整、可重开的 SQLite 才能发布。
+        with TemporaryDirectory(prefix=".shotlab-save-", dir=target.parent) as directory:
+            staged = Path(directory) / "snapshot.shotlab"
+            if self.store is not None:
+                self.store.backup(staged, self.project, settings)
+            else:
+                created = ProjectStore.create(staged, self.index, self.project, settings)
+                created.close()
+            snapshot = ProjectStore(staged)
+            try:
+                if snapshot.connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    raise ValueError("临时项目 SQLite 校验失败")
+                project, index, saved_settings = snapshot.load()
+                index.verify_source()
+                if project != self.project or index != self.index:
+                    raise ValueError("临时项目与当前内存状态不一致")
+            finally:
+                snapshot.close()
+            if overwrite:
+                os.replace(staged, target)
+            else:
+                # 原子且不覆盖：即便确认后有其他进程创建目标，也必须拒绝。
+                os.link(staged, target)
+        store = _session_store(target)
+        self.close_current_store()
+        self.store = store
+        self.settings = saved_settings
         self.project_path = str(target)
         self.dirty = False
         return self.state()
@@ -209,17 +288,17 @@ class Session:
     def save(self):
         if self.store is None:
             raise ValueError("项目尚未保存过文件")
-        self.settings['shot_tags'] = self.shot_tags
-        self.settings['scale_labels'] = self.scale_labels
-        self.store.save(self.project, self.settings)
+        settings = dict(self.settings, shot_tags=self.shot_tags, scale_labels=self.scale_labels)
+        self.store.save(self.project, settings)
+        self.settings = settings
         self.dirty = False
         return self.state()
 
     def close_project(self):
-        if self.store is not None:
-            self.store.close()
-        self.store = self.project = None
+        self.close_current_store()
+        self.project = None
         self.project_path = None
+        self._reset_metadata()
         self.dirty = False
         return self.state()
 
@@ -315,7 +394,7 @@ def _project_save(session, params, emit=None):
 
 @method("project.save_as")
 def _project_save_as(session, params, emit=None):
-    return session.save_as(params["path"])
+    return session.save_as(params["path"], overwrite=params.get("overwrite", False))
 
 
 @method("project.close")
@@ -360,6 +439,7 @@ def _edit_select(session, params, emit=None):
 def _edit_undo(session, params, emit=None):
     session.project = session.history.restore(redo=False)
     session.project.validate()
+    session.stats = None
     session.dirty = True
     return session.state()
 
@@ -368,6 +448,7 @@ def _edit_undo(session, params, emit=None):
 def _edit_redo(session, params, emit=None):
     session.project = session.history.restore(redo=True)
     session.project.validate()
+    session.stats = None
     session.dirty = True
     return session.state()
 
@@ -383,8 +464,9 @@ def _stats_run(session, params, emit=None):
     from shotlab.statistics.shots import shot_statistics
     if session.project is None or session.index is None:
         raise ValueError("先打开视频并建立索引")
-    context = build_context(session.project, session.index)
-    return shot_statistics(context)
+    context = build_context(session.project, session.index, session.analysis_scope(params))
+    session.stats = shot_statistics(context)
+    return session.stats
 
 
 @method("palette.get")
@@ -404,6 +486,7 @@ def _analysis_run(session, params, emit=None):
     if session.project is None or session.index is None:
         raise ValueError("先打开视频并建立索引")
     return session.analysis_run(
+        scope=session.analysis_scope(params),
         progress=(lambda done, total: emit("analysis", done=done, total=total)) if emit else None)
 
 
@@ -415,7 +498,7 @@ def _export_shots_csv(session, params, emit=None):
         raise ValueError("先打开视频并建立索引")
     path = Path(params["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = session.state()["shots"]
+    rows = session.scoped_shots(params)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["镜头编号", "起始帧", "结束帧(不含)", "时长(秒)", "标签", "备注"])
@@ -478,7 +561,7 @@ def _export_contact_sheet(session, params, emit=None):
     cols = int(params.get("columns", 5))
     thumb_w = int(params.get("thumb_width", 160))
 
-    rows_data = [s for s in session.state()["shots"] if not s["pending"]]
+    rows_data = session.scoped_shots(params)
     if not rows_data:
         raise ValueError("没有已完成镜头")
 
@@ -578,6 +661,7 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
                                              emit=emit, cancel=cancel)
             elif name == "analysis.run":
                 result = session.analysis_run(
+                    scope=session.analysis_scope(params),
                     cancel=cancel,
                     progress=lambda done, total: emit("analysis", done=done, total=total))
             elif name == "scale.run":
@@ -633,9 +717,10 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
                 counter[0] += 1
                 job_id = counter[0]
             jobs[job_id] = {"cancel": threading.Event(), "name": name}
+            # 先应答再启动：极快任务也不能让 done 事件抢在 job_id 之前到达。
+            write({"id": request.get("id"), "ok": True, "result": {"job_id": job_id, "method": name}})
             threading.Thread(target=run_job, args=(job_id, name, params.get("params") or {}),
                              name=f"job-{job_id}", daemon=True).start()
-            write({"id": request.get("id"), "ok": True, "result": {"job_id": job_id, "method": name}})
             continue
 
         if method == "job.cancel":
@@ -730,7 +815,7 @@ def _subtitles_load(session, params, emit=None):
             current.append(line)
     flush()  # 文件末尾没有空行时也要处理最后一条
     session.subtitle_cues = cues
-    return {"cues": len(cues), "path": str(path.resolve())}
+    return {"cues": len(cues), "entries": cues, "path": str(path.resolve())}
 
 
 @method("subtitles.clear")
@@ -763,7 +848,7 @@ def _export_pdf_sheet(session, params, emit=None):
     thumb_w = int(params.get("thumb_width", 240))
     page_h = int(params.get("page_height", 2970))  # ~A4 @ 300dpi 缩小
 
-    rows_data = [s for s in session.state()["shots"] if not s["pending"]]
+    rows_data = session.scoped_shots(params)
     if not rows_data:
         raise ValueError("没有已完成镜头")
 

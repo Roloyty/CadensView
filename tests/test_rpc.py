@@ -373,6 +373,7 @@ class ExportTests(unittest.TestCase):
         session = Session()
         session.build_index(str(source))
         session.new_project()
+        session.apply_detection(json_free_result(directory.name))
         result = METHODS["export.shots_csv"](session, {"path": str(Path(directory.name) / "out.csv")}, None)
         out = Path(directory.name) / "out.csv"
         self.assertTrue(out.exists())

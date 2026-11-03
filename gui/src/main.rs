@@ -1,7 +1,9 @@
 //! CadensView 二开 GUI：egui 前端 + FFmpeg 播放 + shotlab Python 边车。
 //! 所有 RPC 调用都在工作线程执行，UI 线程只消费 UiMsg。
 
+mod analysis;
 mod audio;
+mod boundary;
 mod detect;
 mod model;
 mod player;
@@ -29,23 +31,26 @@ enum UiMsg {
     DetectionFinished { code: i32 },
     IndexJobStarted(u64),
     IndexJobFailed(String),
-    StatsReady(StatsData),
+    StatsReady { key: String, stats: StatsData },
+    StatsFailed { key: String, error: String },
     PaletteReady { shot_id: String, palette: PaletteInfo },
+    PaletteFailed { shot_id: String, error: String },
     AnalysisJobStarted(u64),
     AnalysisDone(Value),
     AnalysisFailed(String),
     ScaleJobStarted(u64),
+    ScaleFailed(String),
     Thumb(thumb::ThumbOutcome),
     AbCaptured { slot: usize, frame: u64, width: usize, height: usize, rgba: Vec<u8> },
     ExportSaved(String),
-    SubtitleText(Option<String>),
+    SubtitlesLoaded { project_id: String, cues: Vec<model::SubtitleCue> },
+    Saved { state: State, note: Option<(String, String)> },
 }
 
 /// 右侧面板的三个页签。
 #[derive(Clone, Copy, PartialEq)]
 enum RightTab {
     Notes,
-    Stats,
     Colors,
 }
 
@@ -72,6 +77,7 @@ struct App {
     detection_cpu_retried: bool,
     index_job: Option<u64>,
     index_busy: bool,
+    index_recovering: bool,
     repo_root: PathBuf,
     ffmpeg: PathBuf,
     python: PathBuf,
@@ -127,6 +133,17 @@ struct App {
     jump_open: bool,
     jump_time_mode: bool,
     jump_text: String,
+    jump_focus: bool,
+    analysis_open: bool,
+    analysis_view: analysis::Workspace,
+    analysis_data: Option<model::ColorAnalysis>,
+    stats_key: String,
+    stats_error: Option<String>,
+    analysis_key: String,
+    analysis_starting: bool,
+    scale_starting: bool,
+    boundary_editor: Option<boundary::BoundaryEditor>,
+    subtitle_cues: Vec<model::SubtitleCue>,
 }
 
 impl App {
@@ -168,6 +185,7 @@ impl App {
             detection_cpu_retried: false,
             index_job: None,
             index_busy: false,
+            index_recovering: false,
             repo_root,
             ffmpeg,
             python,
@@ -215,6 +233,17 @@ impl App {
             jump_open: false,
             jump_time_mode: false,
             jump_text: String::new(),
+            jump_focus: false,
+            analysis_open: false,
+            analysis_view: analysis::Workspace::default(),
+            analysis_data: None,
+            stats_key: String::new(),
+            stats_error: None,
+            analysis_key: String::new(),
+            analysis_starting: false,
+            scale_starting: false,
+            boundary_editor: None,
+            subtitle_cues: Vec::new(),
         };
         // 缩略图 worker：消费 ThumbOutcome 后发到主消息泵。
         let (thumb_done_tx, thumb_done_rx) = std::sync::mpsc::channel::<thumb::ThumbOutcome>();
@@ -268,11 +297,22 @@ impl App {
         });
     }
 
+    fn confirm_discard(&self) -> bool {
+        if !self.state.dirty { return true; }
+        rfd::MessageDialog::new()
+            .set_title("未保存的修改")
+            .set_description("当前项目有未保存修改。放弃并继续？")
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show() == rfd::MessageDialogResult::Yes
+    }
+
     fn open_video(&mut self, video: PathBuf) {
-        if self.index_busy {
-            self.status = "索引任务进行中，先取消再打开新视频".into();
+        if self.work_busy() {
+            self.status = "任务进行中，先取消再打开新视频".into();
             return;
         }
+        if !self.confirm_discard() { return; }
+        self.reset_project_view();
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
@@ -300,6 +340,9 @@ impl App {
     }
 
     fn open_project(&mut self, path: PathBuf) {
+        if self.work_busy() { self.status = "任务进行中，先取消再打开项目".into(); return; }
+        if !self.confirm_discard() { return; }
+        self.reset_project_view();
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
@@ -329,18 +372,36 @@ impl App {
     }
 
     fn save_project(&mut self, save_as: bool) {
-        if save_as || self.state.project_path.is_none() {
-            let file = rfd::FileDialog::new()
+        if self.work_busy() { self.status = "任务进行中，完成或取消后再保存".into(); return; }
+        let (method, params) = if save_as || self.state.project_path.is_none() {
+            let Some(path) = rfd::FileDialog::new()
                 .add_filter("CadensView 项目", &["shotlab"])
-                .set_file_name("project.shotlab")
-                .save_file();
-            match file {
-                Some(path) => self.call("project.save_as", json!({"path": path.to_string_lossy()})),
-                None => return,
-            }
-        } else {
-            self.call("project.save", json!({}));
-        }
+                .set_file_name("project.shotlab").save_file() else { return; };
+            let overwrite = path.exists() && rfd::MessageDialog::new()
+                .set_title("替换项目文件")
+                .set_description(format!("将当前项目保存为 {}，替换已有文件？", path.display()))
+                .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+            if path.exists() && !overwrite { return; }
+            ("project.save_as", json!({"path": path.to_string_lossy(), "overwrite": overwrite}))
+        } else { ("project.save", json!({})) };
+        // 同一线程先提交输入框草稿再存盘，避免 Ctrl+S 与失焦提交乱序。
+        let note = if self.note_dirty && !self.note_shot.is_empty() { Some((self.note_shot.clone(), self.note_draft.clone())) } else { None };
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        self.status = "保存项目…".into();
+        std::thread::spawn(move || {
+            let result = (|| {
+                if let Some((shot, text)) = &note { rpc.call("edit.set_note", json!({"shot_id": shot, "text": text}))?; }
+                let state = serde_json::from_value::<State>(rpc.call(method, params)?).map_err(|e| e.to_string())?;
+                Ok::<_, String>(state)
+            })();
+            let message = match result {
+                Ok(state) => UiMsg::Saved { state, note },
+                Err(error) => UiMsg::RpcError(error),
+            };
+            let _ = tx.send(message); wake();
+        });
     }
 
     fn run_detection(&mut self, force_cpu: bool) {
@@ -383,13 +444,66 @@ impl App {
 
     fn commit_cursor(&self, frame: u64) {
         self.call("edit.select", json!({"frame": frame}));
-        // 有字幕时同步刷新当前帧台词（静音分析也要看台词）
-        if self.subtitle_loaded {
-            if let Some(index) = &self.index {
-                let us = (index.seconds(frame) * 1_000_000.0) as i64;
-                self.call_subtitle(us);
+    }
+
+    fn work_busy(&self) -> bool {
+        self.index_busy || self.detection.is_some() || self.analysis_starting || self.scale_starting
+            || self.analysis_job.is_some() || self.scale_job.is_some()
+    }
+
+    fn stop_playback(&mut self) {
+        if let Some(player) = &self.player { player.stop(); }
+        if let Some(audio) = &self.audio { audio.stop(); }
+        if let Some(marker) = &mut self.playback_marker { marker.set(false); }
+        self.loop_active = false;
+    }
+
+    /// 索引失败后边车仍持有旧会话：重新取回索引，恢复播放器与项目状态。
+    fn restore_index(&mut self) {
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        std::thread::spawn(move || {
+            match rpc.call("index.get", json!({})) {
+                Ok(value) => {
+                    if let Err(error) = finish_index(rpc, tx.clone(), value.get("index").cloned().unwrap_or(Value::Null), Some(())) {
+                        let _ = tx.send(UiMsg::IndexJobFailed(error));
+                    }
+                }
+                Err(error) => { let _ = tx.send(UiMsg::IndexJobFailed(error)); }
             }
-        }
+            wake();
+        });
+    }
+
+    fn reset_project_view(&mut self) {
+        self.stop_playback();
+        self.player = None;
+        self.index = None;
+        self.index_json_path = None;
+        self.texture = None;
+        self.pending_image = None;
+        self.ui_frame = 0;
+        self.stats = None; self.stats_stale = true; self.stats_loading = false;
+        self.stats_key.clear(); self.stats_error = None;
+        self.analysis_data = None; self.analysis_view.reset_results();
+        self.analysis_view.scope = analysis::Scope::All;
+        self.barcode.clear(); self.palette = None; self.palette_shot.clear(); self.palette_loading = false;
+        self.marks.clear(); self.mark_anchor = None; self.boundary_editor = None;
+        self.note_draft.clear(); self.note_shot.clear(); self.note_dirty = false;
+        self.subtitle_cues.clear(); self.subtitle_loaded = false; self.subtitle_text = None;
+        self.thumbs.clear(); self.thumb_pending.clear(); self.thumb_failed.clear();
+        self.ab_textures = [None, None]; self.ab_data = [None, None]; self.ab_frames = [None, None];
+        self.ab_blend = None; self.ab_show = false;
+        self.track_start = 0.0; self.track_zoom = 1.0; self.zoom = 1.0; self.pan = egui::Vec2::ZERO;
+    }
+
+    fn refresh_subtitle(&mut self) {
+        let Some(index) = &self.index else { return; };
+        let us = (index.seconds(self.ui_frame) * 1_000_000.0).round() as i64;
+        let text = self.subtitle_cues.iter().filter(|cue| cue.start_us <= us && us < cue.end_us)
+            .map(|cue| cue.text.as_str()).collect::<Vec<_>>().join("\n");
+        self.subtitle_text = if text.is_empty() { None } else { Some(text) };
     }
 
     /// 起播音频（与视频同一时间点）。无音轨时静默跳过。
@@ -417,22 +531,26 @@ impl App {
             return;
         }
         let start_s = index.seconds(start.min(index.frames().saturating_sub(1)));
-        let end_s = index.seconds(end.min(index.frames().saturating_sub(1)));
+        let end_s = index.endpoint_seconds(end.min(index.frames()));
         audio.set_volume(self.volume);
         audio.set_muted(self.muted);
         audio.play_loop(Path::new(video), start_s, (end_s - start_s).max(0.05));
     }
 
-    fn call_subtitle(&self, timestamp_us: i64) {
+    fn load_subtitles(&self, path: PathBuf) {
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
+        let project_id = self.state.project_id.clone();
         std::thread::spawn(move || {
-            if let Ok(value) = rpc.call("subtitles.at", json!({"timestamp_us": timestamp_us})) {
-                let text = value.get("text").and_then(Value::as_str).map(str::to_string);
-                let _ = tx.send(UiMsg::SubtitleText(text));
-            }
-            wake();
+            let message = match rpc.call("subtitles.load", json!({"path": path.to_string_lossy()})) {
+                Ok(value) => match serde_json::from_value(value.get("entries").cloned().unwrap_or(Value::Null)) {
+                    Ok(cues) => UiMsg::SubtitlesLoaded { project_id, cues },
+                    Err(error) => UiMsg::RpcError(format!("字幕解析失败: {error}")),
+                },
+                Err(error) => UiMsg::RpcError(error),
+            };
+            let _ = tx.send(message); wake();
         });
     }
 
@@ -451,18 +569,34 @@ impl App {
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
                 UiMsg::State(state) => {
-                    // 镜头结构变化（数量/边界）→ 统计与选中镜头调色板失效。
+                    let changed_project = state.project_id != self.state.project_id;
+                    if changed_project {
+                        self.reset_project_view();
+                        self.ui_frame = state.current_frame;
+                    }
                     let structure_changed = state.shots.len() != self.state.shots.len()
                         || state.shots.iter().zip(self.state.shots.iter())
-                            .any(|(new, old)| new.start != old.start || new.end != old.end);
+                            .any(|(new, old)| new.id != old.id || new.start != old.start || new.end != old.end);
                     if structure_changed {
-                        self.stats_stale = true;
-                        self.palette = None;
-                        self.palette_shot.clear();
+                        self.stats_stale = true; self.stats_loading = false; self.stats_error = None;
+                        self.analysis_data = None; self.barcode.clear(); self.analysis_view.reset_results();
+                        self.palette = None; self.palette_shot.clear(); self.palette_loading = false;
+                        self.marks.retain(|id| state.shots.iter().any(|s| &s.id == id && !s.pending));
+                    }
+                    if self.boundary_editor.as_ref().map(|b| !b.valid_for(&state.project_id, &state.shots)).unwrap_or(false) {
+                        self.boundary_editor = None;
                     }
                     self.state = state;
                 }
+                UiMsg::Saved { state, note } => {
+                    if let Some((shot, text)) = note {
+                        if shot == self.note_shot && text == self.note_draft { self.note_dirty = false; }
+                    }
+                    let _ = self.msg_tx.send(UiMsg::State(state));
+                    self.status = "项目已保存".into();
+                }
                 UiMsg::IndexReady { index, index_json_path } => {
+                    self.index_recovering = false;
                     if let Some(video) = self.state.video_path.clone() {
                         let handle = player::PlayerHandle::spawn(
                             self.ffmpeg.clone(),
@@ -483,40 +617,91 @@ impl App {
                 UiMsg::IndexJobFailed(error) => {
                     self.index_busy = false;
                     self.status = format!("⚠ {error}");
+                    if self.index_recovering {
+                        // 恢复旧索引也失败：只报告一次，避免递归重试。
+                        self.index_recovering = false;
+                    } else if self.state.has_index {
+                        self.index_recovering = true;
+                        self.restore_index();
+                    }
                 }
-                UiMsg::StatsReady(stats) => {
-                    self.stats = Some(stats);
-                    self.stats_loading = false;
-                    self.stats_stale = false;
+                UiMsg::StatsReady { key, stats } => {
+                    if key == self.stats_key {
+                        self.stats = Some(stats);
+                        self.stats_loading = false;
+                        self.stats_stale = false;
+                        self.stats_error = None;
+                    }
+                }
+                UiMsg::StatsFailed { key, error } => {
+                    if key == self.stats_key {
+                        self.stats_loading = false;
+                        self.stats_stale = false;
+                        self.stats_error = Some(error);
+                    }
                 }
                 UiMsg::PaletteReady { shot_id, palette } => {
-                    // 迟到的调色板（用户已切换镜头）直接丢弃。
-                    if shot_id == self.palette_shot || shot_id.is_empty() {
+                    if shot_id == self.palette_shot && shot_id == self.state.selected_id {
                         self.palette = Some(palette);
+                        self.palette_loading = false;
                     }
-                    self.palette_loading = false;
                 }
-                UiMsg::AnalysisJobStarted(job_id) => self.analysis_job = Some(job_id),
-                UiMsg::ScaleJobStarted(job_id) => self.scale_job = Some(job_id),
+                UiMsg::PaletteFailed { shot_id, error } => {
+                    if shot_id == self.palette_shot {
+                        self.palette_loading = false;
+                        self.status = format!("调色板: {error}");
+                    }
+                }
+                // 终态可能先于 start 应答到达：只有仍处于“启动中”才接受 job id，
+                // 否则已完成的 id 会把界面永久锁在忙碌状态。
+                UiMsg::AnalysisJobStarted(job_id) if self.analysis_starting => {
+                    self.analysis_job = Some(job_id); self.analysis_starting = false;
+                }
+                UiMsg::AnalysisJobStarted(_) => {}
+                UiMsg::ScaleJobStarted(job_id) if self.scale_starting => {
+                    self.scale_job = Some(job_id); self.scale_starting = false;
+                }
+                UiMsg::ScaleJobStarted(_) => {}
+                UiMsg::ScaleFailed(error) => { self.scale_starting = false; self.status = format!("景别识别: {error}"); }
                 UiMsg::AnalysisDone(value) => {
                     self.analysis_job = None;
-                    let samples: Vec<BarcodeSample> = value
-                        .pointer("/video_color_timeline/movie_barcode")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                        .unwrap_or_default();
-                    self.barcode = samples;
-                    // 分析结果附带最新统计，顺手刷新统计面板。
-                    if let Some(stats) = value.get("shot_statistics") {
-                        if let Ok(parsed) = serde_json::from_value::<StatsData>(stats.clone()) {
-                            self.stats = Some(parsed);
-                            self.stats_stale = false;
-                        }
+                    self.analysis_starting = false;
+                    let key = self.analysis_key.clone();
+                    if key != self.current_stats_key() {
+                        // 范围或项目已经变化：迟到结果不得冒充当前选择。
+                        self.stats_stale = true;
+                        self.status = "色彩结果已过期，未应用".into();
+                        return;
                     }
-                    self.status = "色彩分析完成".into();
+                    let stats = value.get("shot_statistics").cloned()
+                        .and_then(|v| serde_json::from_value::<StatsData>(v).ok());
+                    match serde_json::from_value::<model::ColorAnalysis>(value) {
+                        Ok(parsed) => {
+                            self.barcode = parsed.video_color_timeline.movie_barcode.clone();
+                            self.analysis_data = Some(parsed);
+                            if let Some(stats) = stats {
+                                self.stats = Some(stats);
+                                self.stats_stale = false;
+                                self.stats_error = None;
+                                self.stats_key = key;
+                            }
+                            self.status = "色彩分析完成".into();
+                        }
+                        Err(error) => self.status = format!("色彩结果解析失败: {error}"),
+                    }
                 }
                 UiMsg::AnalysisFailed(error) => {
                     self.analysis_job = None;
+                    self.analysis_starting = false;
                     self.status = format!("色彩分析: {error}");
+                }
+                UiMsg::SubtitlesLoaded { project_id, cues } => {
+                    if project_id == self.state.project_id {
+                        self.subtitle_cues = cues;
+                        self.subtitle_loaded = true;
+                        self.refresh_subtitle();
+                        self.status = format!("字幕已加载 · {} 条", self.subtitle_cues.len());
+                    }
                 }
                 UiMsg::Thumb(thumb::ThumbOutcome::Ready { key, width, height, rgba }) => {
                     self.thumb_pending.remove(&key);
@@ -551,7 +736,6 @@ impl App {
                 UiMsg::ExportSaved(path) => {
                     self.status = format!("已导出: {path}");
                 }
-                UiMsg::SubtitleText(text) => self.subtitle_text = text,
                 UiMsg::RpcError(error) => self.status = format!("⚠ {error}"),
                 UiMsg::DetectionEvent(event) => self.on_detection_event(event),
                 UiMsg::DetectionFinished { code } => {
@@ -641,14 +825,16 @@ impl App {
                         self.status = format!("色彩分析… {done}/{total}");
                     }
                 }
-                ("analysis.run", "done") if job_id == self.analysis_job || self.analysis_job.is_some() => {
+                ("analysis.run", "done") if job_id == self.analysis_job || self.analysis_job.is_some() || self.analysis_starting => {
                     self.analysis_job = None;
+                    self.analysis_starting = false;
                     if let Some(result) = event.get("result") {
                         let _ = self.msg_tx.send(UiMsg::AnalysisDone(result.clone()));
                     }
                 }
                 ("analysis.run", "error") => {
                     self.analysis_job = None;
+                    self.analysis_starting = false;
                     let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
                     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
                     let _ = self.msg_tx.send(UiMsg::AnalysisFailed(
@@ -663,14 +849,16 @@ impl App {
                         self.status = format!("景别识别… {done}/{total}");
                     }
                 }
-                ("scale.run", "done") if job_id == self.scale_job || self.scale_job.is_some() => {
+                ("scale.run", "done") if job_id == self.scale_job || self.scale_job.is_some() || self.scale_starting => {
                     self.scale_job = None;
+                    self.scale_starting = false;
                     self.status = "景别识别完成".into();
                     // scale.run 返回的 state 含 scale 字段；直接拉一次最新状态。
                     self.call("project.state", json!({}));
                 }
                 ("scale.run", "error") => {
                     self.scale_job = None;
+                    self.scale_starting = false;
                     let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
                     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
                     self.status = if kind.contains("Cancelled") {
@@ -752,6 +940,7 @@ impl App {
                 self.last_frame = frame;
                 self.pending_image = Some((width, height, rgba));
                 self.ui_frame = frame;
+                self.refresh_subtitle();
                 if let Some(marker) = self.playback_marker.as_mut() {
                     if let Some(player) = &self.player {
                         marker.set(player.is_playing());
@@ -884,7 +1073,16 @@ impl eframe::App for App {
         self.pump(&ctx);
         self.handle_shortcuts(&ctx);
         self.jump_window(&ctx);
+        self.boundary_window(&ctx);
 
+        if self.analysis_open {
+            egui::Panel::top("topbar")
+                .frame(egui::Frame::new().fill(theme::top()).inner_margin(egui::Margin::symmetric(10, 6)))
+                .show(ui, |ui| self.topbar(ui));
+            egui::Panel::bottom("statusbar").show(ui, |ui| self.status_line(ui));
+            egui::CentralPanel::default().show(ui, |ui| self.analysis_workspace(ui, &ctx));
+            return;
+        }
         if self.video_only {
             // 视频模式（原版 Alt+Enter）：只留画面与控制条。
             egui::CentralPanel::default().show(ui, |ui| self.player_panel(ui));
@@ -894,26 +1092,7 @@ impl eframe::App for App {
         egui::Panel::top("topbar")
             .frame(egui::Frame::new().fill(theme::top()).inner_margin(egui::Margin::symmetric(10, 6)))
             .show(ui, |ui| self.topbar(ui));
-        egui::Panel::bottom("statusbar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if self.state.dirty {
-                    ui.colored_label(theme::accent(), "● 未保存");
-                }
-                let status_text = egui::RichText::new(&self.status);
-                let colored = if self.status.starts_with('⚠') {
-                    status_text.color(theme::error())
-                } else if self.status.starts_with("已导出") || self.status.ends_with("完成") {
-                    status_text.color(theme::accent())
-                } else {
-                    status_text
-                };
-                ui.label(colored);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let (clock, total) = self.clock_labels();
-                    ui.monospace(format!("{clock} / {total}"));
-                });
-            });
-        });
+        egui::Panel::bottom("statusbar").show(ui, |ui| self.status_line(ui));
         if self.list_open {
             egui::Panel::left("shots").default_size(230.0).show(ui, |ui| self.shot_list(ui));
         }
@@ -925,206 +1104,239 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn status_line(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if self.state.dirty { ui.colored_label(theme::accent(), "● 未保存"); }
+            let status_text = egui::RichText::new(&self.status);
+            let colored = if self.status.starts_with('⚠') {
+                status_text.color(theme::error())
+            } else if self.status.starts_with("已导出") || self.status.ends_with("完成") {
+                status_text.color(theme::accent())
+            } else { status_text };
+            ui.label(colored);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (clock, total) = self.clock_labels();
+                ui.monospace(format!("{clock} / {total}"));
+            });
+        });
+    }
+
+    fn analysis_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(index) = &self.index else {
+            ui.centered_and_justified(|ui| ui.label("打开视频并完成切镜后查看分析"));
+            return;
+        };
+        let stem = index.cache_stem();
+        let title = self.state.video_path.as_deref()
+            .and_then(|path| Path::new(path).file_stem()).map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "镜头观察".into());
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.analysis_view.scope, analysis::Scope::All, "全片已完成镜头");
+            ui.selectable_value(&mut self.analysis_view.scope, analysis::Scope::Marked,
+                format!("已标记镜头 ({})", self.marks.len()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("← 返回观察").clicked() { self.toggle_analysis(); }
+            });
+        });
+        if matches!(self.analysis_scope_ids(), Some(ids) if ids.is_empty()) {
+            ui.colored_label(theme::warning(), "尚未标记镜头：在镜头列表用 Ctrl 点击单选、Shift 点击范围，或切换为全片。");
+        }
+        if self.analysis_data.is_some() && self.analysis_key != self.current_stats_key() {
+            // 镜头色板/色差属于旧范围；全片色带仍有效，不清 barcode。
+            self.analysis_data = None;
+        }
+        let key = self.current_stats_key();
+        if self.stats_key != key {
+            // 范围变化：旧请求即使稍后返回，也不能写进新范围的界面。
+            self.stats_key = key;
+            self.stats_loading = false;
+            self.stats_stale = true;
+        }
+        if self.state.completed_count > 0 && self.stats_stale && !self.stats_loading
+            && !matches!(self.analysis_scope_ids(), Some(ids) if ids.is_empty())
+        {
+            self.stats_loading = true;
+            self.stats_error = None;
+            self.call_stats();
+        }
+        if let Some(error) = &self.stats_error { ui.colored_label(theme::error(), error); }
+        let busy = self.analysis_job.is_some() || self.analysis_starting;
+        let actions = self.analysis_view.show(ui, &title, self.stats.as_ref(), self.analysis_data.as_ref(),
+            &self.thumbs, &stem, busy);
+        for action in actions {
+            match action {
+                analysis::Action::RunColors => self.run_analysis(),
+                analysis::Action::Thumbnail(frame) => self.request_analysis_thumb(&stem, frame),
+                analysis::Action::Locate { frame, shot_id } => {
+                    self.analysis_open = false;
+                    if let Some(player) = &self.player { player.show(frame); }
+                    self.ui_frame = frame;
+                    self.commit_cursor(frame);
+                    if let Some(id) = shot_id { self.select_shot(&id); }
+                }
+            }
+        }
+        let actions = self.analysis_view.details(ctx, self.stats.as_ref(), self.analysis_data.as_ref(), &self.thumbs, &stem);
+        for action in actions {
+            match action {
+                analysis::Action::Locate { frame, shot_id } => {
+                    self.analysis_open = false;
+                    if let Some(player) = &self.player { player.show(frame); }
+                    self.ui_frame = frame;
+                    self.commit_cursor(frame);
+                    if let Some(id) = shot_id { self.select_shot(&id); }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn request_analysis_thumb(&mut self, stem: &str, frame: u64) {
+        let key = analysis::thumbnail_key(stem, frame);
+        if self.thumbs.contains_key(&key) || self.thumb_pending.contains(&key) || self.thumb_failed.contains(&key) { return; }
+        let (Some(sender), Some(index)) = (&self.thumb_tx, &self.index) else { return; };
+        let (iw, ih) = index.size();
+        if iw == 0 || ih == 0 { return; }
+        let width = 320u32;
+        let height = ((width as f64 * ih as f64 / iw as f64).round() as u32).max(2);
+        let _ = sender.send(thumb::ThumbRequest {
+            key: key.clone(), video: index.path.clone(),
+            seconds: index.seconds(frame.min(index.frames().saturating_sub(1))), width, height,
+        });
+        self.thumb_pending.insert(key);
+    }
+
     /// 当前时间码 "mm:ss" 与总时长（原版 clockLabel 语义）。
     fn clock_labels(&self) -> (String, String) {
         let Some(index) = &self.index else {
             return ("00:00".into(), "00:00".into());
         };
         let seconds = index.seconds(self.ui_frame.min(index.frames().saturating_sub(1)));
-        let total = index
-            .metadata
-            .duration_us
-            .map(|us| us / 1_000_000.0)
-            .unwrap_or_else(|| index.seconds(index.frames().saturating_sub(1)));
+        let total = index.endpoint_seconds(index.frames());
         (clock_text(seconds), clock_text(total))
     }
 
-    /// 原版快捷键表（Main.qml:681-709）。
+    /// 原版快捷键表（Main.qml:681-709）。组合键不与普通键互相穿透。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        // 文本输入/弹窗聚焦时不抢键。
-        let typing = ctx.memory(|m| m.focused().is_some());
-        if typing {
-            return;
-        }
+        if ctx.egui_wants_keyboard_input() { return; }
         let keys = ctx.input(|i| ShortcutKeys {
             space: i.key_pressed(egui::Key::Space),
             left: i.key_pressed(egui::Key::ArrowLeft),
             right: i.key_pressed(egui::Key::ArrowRight),
             up: i.key_pressed(egui::Key::ArrowUp),
             down: i.key_pressed(egui::Key::ArrowDown),
-            l: i.key_pressed(egui::Key::L),
-            b: i.key_pressed(egui::Key::B),
-            i: i.key_pressed(egui::Key::I),
-            m: i.key_pressed(egui::Key::M),
-            f: i.key_pressed(egui::Key::F),
-            g: i.key_pressed(egui::Key::G),
+            l: i.key_pressed(egui::Key::L), b: i.key_pressed(egui::Key::B),
+            i: i.key_pressed(egui::Key::I), m: i.key_pressed(egui::Key::M),
+            f: i.key_pressed(egui::Key::F), g: i.key_pressed(egui::Key::G),
             plus: i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
             minus: i.key_pressed(egui::Key::Minus),
-            k: i.key_pressed(egui::Key::K),
-            j: i.key_pressed(egui::Key::J),
-            z: i.key_pressed(egui::Key::Z),
-            s: i.key_pressed(egui::Key::S),
-            e: i.key_pressed(egui::Key::E),
-            a: i.key_pressed(egui::Key::A),
-            o: i.key_pressed(egui::Key::O),
-            escape: i.key_pressed(egui::Key::Escape),
-            f11: i.key_pressed(egui::Key::F11),
+            k: i.key_pressed(egui::Key::K), j: i.key_pressed(egui::Key::J),
+            z: i.key_pressed(egui::Key::Z), s: i.key_pressed(egui::Key::S),
+            e: i.key_pressed(egui::Key::E), a: i.key_pressed(egui::Key::A),
+            o: i.key_pressed(egui::Key::O), c: i.key_pressed(egui::Key::C),
+            escape: i.key_pressed(egui::Key::Escape), f11: i.key_pressed(egui::Key::F11),
             enter: i.key_pressed(egui::Key::Enter),
-            ctrl: i.modifiers.ctrl,
-            shift: i.modifiers.shift,
-            alt: i.modifiers.alt,
+            ctrl: i.modifiers.ctrl, shift: i.modifiers.shift, alt: i.modifiers.alt,
         });
+        let plain = !keys.ctrl && !keys.alt;
         if keys.escape {
-            if self.jump_open {
-                self.jump_open = false;
-                return;
-            }
-            if self.video_only {
-                self.video_only = false;
-                return;
-            }
-            if !self.marks.is_empty() {
-                self.marks.clear();
-                self.mark_anchor = None;
-                return;
-            }
+            if self.jump_open { self.jump_open = false; return; }
+            // 边界框自己处理 Esc：需要把预览帧恢复原位。
+            if self.boundary_editor.is_some() { return; }
+            if self.analysis_open { self.analysis_open = false; return; }
+            if self.video_only { self.video_only = false; return; }
+            if !self.marks.is_empty() { self.marks.clear(); self.mark_anchor = None; return; }
         }
-        if keys.f11 {
-            self.fullscreen = !self.fullscreen;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-            return;
-        }
-        if keys.alt && keys.enter {
-            self.video_only = !self.video_only;
-            return;
-        }
+        if keys.f11 { self.toggle_analysis(); return; }
+        if keys.alt && keys.enter { self.analysis_open = false; self.video_only = !self.video_only; return; }
+        if keys.ctrl && keys.shift && keys.c { self.ab_show = !self.ab_show; return; }
+        if self.analysis_open { return; }
         let frames = self.index.as_ref().map(|i| i.frames()).unwrap_or(0);
         if frames == 0 {
-            if keys.o && keys.ctrl {
-                self.pick_video();
-            }
+            if keys.ctrl && keys.o { self.pick_video(); }
             return;
         }
-
-        // 播放 / 步进 / 跳镜头
-        if keys.space {
-            self.toggle_playback();
-        }
-        if keys.left && !keys.ctrl {
-            self.step_ui(-1);
-        }
-        if keys.right && !keys.ctrl {
-            self.step_ui(1);
-        }
-        if keys.up || (keys.left && keys.ctrl) {
-            self.adjacent_shot(-1);
-        }
-        if keys.down || (keys.right && keys.ctrl) {
-            self.adjacent_shot(1);
-        }
-        if keys.l {
-            self.toggle_loop();
-        }
-        if keys.b {
-            self.commit_note();
-            self.list_open = !self.list_open;
-        }
-        if keys.i && self.state.completed_count > 0 {
-            self.toggle_info();
-        }
-        if keys.m {
+        if plain && keys.space { self.toggle_playback(); }
+        if plain && keys.left { self.step_ui(-1); }
+        if plain && keys.right { self.step_ui(1); }
+        if plain && keys.up { self.adjacent_shot(-1); }
+        if plain && keys.down { self.adjacent_shot(1); }
+        if keys.ctrl && keys.left { self.adjacent_shot(-1); }
+        if keys.ctrl && keys.right { self.adjacent_shot(1); }
+        if plain && keys.l { self.toggle_loop(); }
+        if plain && keys.b { self.commit_note(); self.list_open = !self.list_open; }
+        if plain && keys.i && self.state.completed_count > 0 { self.toggle_info(); }
+        if plain && keys.m {
             self.muted = !self.muted;
-            if let Some(audio) = &self.audio {
-                audio.set_muted(self.muted);
-            }
+            if let Some(audio) = &self.audio { audio.set_muted(self.muted); }
         }
-        if keys.plus {
+        if plain && keys.plus {
             self.volume = (self.volume + 0.05).min(1.0);
-            if let Some(audio) = &self.audio {
-                audio.set_volume(self.volume);
-            }
+            if let Some(audio) = &self.audio { audio.set_volume(self.volume); }
         }
-        if keys.minus {
+        if plain && keys.minus {
             self.volume = (self.volume - 0.05).max(0.0);
-            if let Some(audio) = &self.audio {
-                audio.set_volume(self.volume);
-            }
+            if let Some(audio) = &self.audio { audio.set_volume(self.volume); }
         }
-        if keys.f {
-            if self.index.is_some() {
-                self.jump_open = true;
-                self.jump_time_mode = false;
-                self.jump_text.clear();
-            }
+        if plain && keys.f && self.index.is_some() {
+            self.jump_open = true; self.jump_time_mode = false; self.jump_text.clear(); self.jump_focus = true;
         }
-        if keys.g {
-            if self.index.is_some() {
-                self.jump_open = true;
-                self.jump_time_mode = true;
-                self.jump_text.clear();
-            }
+        if plain && keys.g && self.index.is_some() {
+            self.jump_open = true; self.jump_time_mode = true; self.jump_text.clear(); self.jump_focus = true;
         }
-        // 编辑
         if keys.ctrl && keys.k {
-            if self.state.selected_id.is_empty() {
-                return;
-            }
             let frame = self.player.as_ref().map(|p| p.frame()).unwrap_or(self.ui_frame);
-            let within = self
-                .state
-                .shots
-                .iter()
-                .find(|s| s.id == self.state.selected_id)
-                .map(|s| frame >= s.start && frame < s.end && !s.pending)
-                .unwrap_or(false);
-            if within && frame > 0 {
-                self.call("edit.split", json!({"frame": frame}));
-            }
+            let within = self.state.shots.iter().find(|s| s.id == self.state.selected_id)
+                .map(|s| frame >= s.start && frame < s.end && !s.pending).unwrap_or(false);
+            if within && frame > 0 { self.commit_note(); self.call("edit.split", json!({"frame": frame})); }
         }
         if keys.ctrl && keys.j {
-            if let Some(shot) = self
-                .state
-                .shots
-                .iter()
-                .find(|s| s.id == self.state.selected_id && !s.pending)
-                .cloned()
+            if let Some(shot) = self.state.shots.iter()
+                .find(|s| s.id == self.state.selected_id && !s.pending).cloned()
             {
                 if shot.number + 1 < self.state.completed_count as usize {
+                    self.commit_note();
                     self.call("edit.merge", json!({"row": shot.number}));
                 }
             }
         }
         if keys.ctrl && keys.z && keys.shift {
-            if self.state.can_redo {
-                self.call("edit.redo", json!({}));
-            }
+            if self.state.can_redo { self.call("edit.redo", json!({})); }
         } else if keys.ctrl && keys.z {
-            if self.state.can_undo {
-                self.call("edit.undo", json!({}));
-            }
+            if self.state.can_undo { self.call("edit.undo", json!({})); }
         }
-        if keys.ctrl && keys.s {
-            self.save_project(false);
-        }
+        if keys.ctrl && keys.s { self.save_project(false); }
         if keys.ctrl && keys.e && keys.shift {
-            if self.state.completed_count > 0 {
-                self.export_contact_sheet();
-            }
+            if self.state.completed_count > 0 { self.export_contact_sheet(); }
         } else if keys.ctrl && keys.e {
-            if self.index.is_some() {
-                self.export_frame();
-            }
+            if self.index.is_some() { self.export_frame(); }
         }
         if keys.ctrl && keys.a && keys.shift {
-            self.marks.clear();
-            self.mark_anchor = None;
+            self.marks.clear(); self.mark_anchor = None;
         } else if keys.ctrl && keys.a && self.list_open {
             self.marks = self.state.shots.iter().filter(|s| !s.pending).map(|s| s.id.clone()).collect();
         }
-        if keys.ctrl && keys.o {
-            if !self.index_busy {
-                self.pick_video();
+        if keys.ctrl && keys.o && !self.work_busy() { self.pick_video(); }
+    }
+
+    fn boundary_window(&mut self, ctx: &egui::Context) {
+        let action = self.boundary_editor.as_mut().and_then(|editor| editor.show(ctx));
+        match action {
+            Some(boundary::Action::Preview(frame)) => {
+                if let Some(player) = &self.player { player.show(frame); }
+                self.ui_frame = frame;
             }
+            Some(boundary::Action::Apply { boundary, frame }) => {
+                self.boundary_editor = None;
+                self.commit_note();
+                self.call("edit.move_boundary", json!({"boundary": boundary, "frame": frame}));
+            }
+            Some(boundary::Action::Cancel(frame)) => {
+                self.boundary_editor = None;
+                if let Some(player) = &self.player { player.show(frame); }
+                self.ui_frame = frame;
+            }
+            None => {}
         }
     }
 
@@ -1134,6 +1346,15 @@ impl App {
             .pick_file()
         {
             self.open_video(path);
+        }
+    }
+
+    fn toggle_analysis(&mut self) {
+        self.analysis_open = !self.analysis_open;
+        if self.analysis_open {
+            self.stop_playback();
+            self.jump_open = false;
+            self.boundary_editor = None;
         }
     }
 
@@ -1235,7 +1456,7 @@ impl App {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.jump_text).desired_width(180.0),
                 );
-                response.request_focus();
+                if self.jump_focus { response.request_focus(); self.jump_focus = false; }
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui.button("跳转").clicked() || enter {
                     commit = true;
@@ -1250,20 +1471,7 @@ impl App {
                 let frames = index.frames();
                 let text = self.jump_text.trim();
                 let frame = if self.jump_time_mode {
-                    parse_timecode(text).map(|seconds| {
-                        let target = seconds as f64;
-                        // 找最接近的帧
-                        let mut best = 0u64;
-                        let mut best_delta = f64::MAX;
-                        for (number, _) in index.pts.iter().enumerate() {
-                            let delta = (index.seconds(number as u64) - target).abs();
-                            if delta < best_delta {
-                                best_delta = delta;
-                                best = number as u64;
-                            }
-                        }
-                        best
-                    })
+                    parse_timecode(text).map(|seconds| index.frame_at(seconds))
                 } else {
                     text.parse::<u64>().ok()
                 };
@@ -1302,6 +1510,7 @@ struct ShortcutKeys {
     e: bool,
     a: bool,
     o: bool,
+    c: bool,
     escape: bool,
     f11: bool,
     enter: bool,
@@ -1414,6 +1623,9 @@ impl App {
             }
             // 右侧：主题 / 视频模式 / 全屏（原版「设置」菜单语义）
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.selectable_label(self.analysis_open, "📊 分析").on_hover_text("分析工作区 · F11").clicked() {
+                    self.toggle_analysis();
+                }
                 if ui.selectable_label(self.fullscreen, "全屏").clicked() {
                     self.fullscreen = !self.fullscreen;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
@@ -1468,7 +1680,23 @@ impl App {
                         let (thumb_rect, thumb_response) =
                             ui.allocate_exact_size(thumb_size, egui::Sense::click());
                         if thumb_response.clicked() {
-                            follow = Some(shot.id.clone());
+                            let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+                            if ctrl {
+                                if self.marks.contains(&shot.id) { self.marks.remove(&shot.id); }
+                                else { self.marks.insert(shot.id.clone()); }
+                                self.mark_anchor = Some(row);
+                            } else if shift {
+                                let anchor = self.mark_anchor.unwrap_or(row);
+                                let (low, high) = if anchor <= row { (anchor, row) } else { (row, anchor) };
+                                for candidate in &self.state.shots[low..=high] {
+                                    if !candidate.pending { self.marks.insert(candidate.id.clone()); }
+                                }
+                                self.mark_anchor = Some(row);
+                            } else {
+                                follow = Some(shot.id.clone());
+                                self.marks.clear();
+                                self.mark_anchor = Some(row);
+                            }
                         }
                         if let Some(texture) = self.thumbs.get(&key) {
                             let size = texture.size_vec2();
@@ -1599,266 +1827,44 @@ impl App {
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.right_tab, RightTab::Notes, "📝 笔记");
-            ui.selectable_value(&mut self.right_tab, RightTab::Stats, "📊 统计");
+            ui.selectable_value(&mut self.right_tab, RightTab::Notes, "📝 镜头");
             ui.selectable_value(&mut self.right_tab, RightTab::Colors, "🎨 色彩");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("分析工作区").on_hover_text("剪辑 / 节奏 / 色彩图表").clicked() {
+                    self.toggle_analysis();
+                }
+            });
         });
         ui.separator();
         match self.right_tab {
             RightTab::Notes => self.note_panel(ui),
-            RightTab::Stats => self.stats_panel(ui),
             RightTab::Colors => self.colors_panel(ui),
         }
     }
 
-    fn stats_panel(&mut self, ui: &mut egui::Ui) {
-        // 打开面板时自动拉取（有索引、有镜头、且缓存缺失或过期）。
-        if !self.stats_loading && self.index.is_some() && self.state.completed_count > 0
-            && (self.stats.is_none() || self.stats_stale)
-        {
-            self.stats_loading = true;
-            self.call_stats();
-        }
-        let Some(stats) = &self.stats else {
-            ui.label("先完成切镜检测，统计在此显示。");
-            return;
-        };
-        ui.heading("剪辑统计");
-        egui::Grid::new("stats-overview").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-            let rows: [(&str, Option<f64>); 5] = [
-                ("镜头数", stats.overview.shot_count.map(|v| v as f64)),
-                ("ASL 平均镜头时长(秒)", stats.overview.asl_s),
-                ("MSL 中位数(秒)", stats.overview.msl_s),
-                ("标准差(秒)", stats.overview.stddev_s),
-                ("变异系数 CV", stats.overview.cv),
-            ];
-            for (label, value) in rows {
-                ui.strong(label);
-                ui.label(match value {
-                    Some(v) => format!("{v:.2}"),
-                    None => "—".into(),
-                });
-                ui.end_row();
-            }
-            let duration = stats.overview.scope_duration_s;
-            ui.strong("总时长(秒)");
-            ui.label(duration.map(|v| format!("{v:.1}")).unwrap_or("—".into()));
-            ui.end_row();
-            let p = &stats.distribution.percentiles_s;
-            for (label, value) in [("P10", p.p10), ("P25", p.p25), ("P75", p.p75), ("P90", p.p90)] {
-                ui.strong(format!("{label} 时长(秒)"));
-                ui.label(value.map(|v| format!("{v:.2}")).unwrap_or("—".into()));
-                ui.end_row();
-            }
-        });
-        ui.add_space(8.0);
-        ui.heading("镜头时长分布");
-        self.draw_histogram(ui, &stats.distribution.duration_histogram);
-        ui.add_space(8.0);
-        ui.heading("切镜密度(次/分钟)");
-        self.draw_density(ui, &stats.editing.cut_density_series);
-        // -- 滑动平均镜头时长（节奏趋势） -------------------------------------
-        if !stats.editing.rolling_asl_series.is_empty() {
-            ui.add_space(8.0);
-            ui.heading("滑动平均 ASL（节奏趋势）");
-            let points: Vec<(f64, f64)> = stats.editing.rolling_asl_series.iter()
-                .filter_map(|p| p.asl_s.map(|v| (p.video_time_s, v)))
-                .collect();
-            self.draw_series(ui, &points, "秒");
-        }
-        // -- 最密集切镜窗口 ----------------------------------------------------
-        if !stats.special.densest_cut_windows.is_empty() {
-            ui.add_space(8.0);
-            ui.heading("切镜最密集段落");
-            for (i, window) in stats.special.densest_cut_windows.iter().take(3).enumerate() {
-                let start = window.start_time_s;
-                let end = window.end_time_s;
-                let cpm = window.cuts_per_minute.unwrap_or(0.0);
-                ui.label(format!("{}. {:.0}s – {:.0}s · {:.1} 次/分", i + 1, start, end, cpm));
-            }
-        }
-        // -- 短镜头连击（快切检测） --------------------------------------------
-        if !stats.special.short_shot_runs.is_empty() {
-            ui.add_space(8.0);
-            ui.heading("快切段落（连续短镜头）");
-            for (i, run) in stats.special.short_shot_runs.iter().take(3).enumerate() {
-                match run.start_time_s {
-                    Some(start) => ui.label(format!("{}. {:.1}s 起 · {} 个短镜头", i + 1, start, run.shot_count)),
-                    None => ui.label(format!("{}. {} 个短镜头", i + 1, run.shot_count)),
-                };
-            }
-        }
-        // -- 时间分段汇总 ------------------------------------------------------
-        if !stats.editing.time_segment_summary.is_empty() {
-            ui.add_space(8.0);
-            ui.heading("分段节奏（按分钟）");
-            egui::Grid::new("segments").num_columns(4).spacing([10.0, 3.0]).show(ui, |ui| {
-                ui.weak("时段");
-                ui.weak("镜头数");
-                ui.weak("ASL");
-                ui.weak("次/分");
-                ui.end_row();
-                for row in stats.editing.time_segment_summary.iter().take(12) {
-                    ui.label(format!("{:.0}–{:.0}s", row.start_time_s, row.end_time_s));
-                    ui.label(row.shot_count.to_string());
-                    ui.label(row.asl_s.map(|v| format!("{v:.1}")).unwrap_or("—".into()));
-                    ui.label(row.cuts_per_minute.map(|v| format!("{v:.1}")).unwrap_or("—".into()));
-                    ui.end_row();
-                }
-            });
-        }
-        if ui.button("↻ 刷新统计").clicked() {
-            self.stats_loading = true;
-            self.call_stats();
+    /// None = 全部已完成镜头；Some = 用户显式标记的稳定 ID。
+    fn analysis_scope_ids(&self) -> Option<Vec<String>> {
+        match self.analysis_view.scope {
+            analysis::Scope::All => None,
+            analysis::Scope::Marked => Some(self.state.shots.iter()
+                .filter(|s| !s.pending && self.marks.contains(&s.id))
+                .map(|s| s.id.clone()).collect()),
         }
     }
 
-    /// 通用折线绘制（滑动 ASL 等单值序列）。
-    fn draw_series(&self, ui: &mut egui::Ui, points: &[(f64, f64)], unit: &str) {
-        let height = 80.0;
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), height), egui::Sense::hover());
-        let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()),
-                            egui::StrokeKind::Inside);
-        if points.len() < 2 {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), theme::secondary());
-            return;
-        }
-        let max_t = points.last().map(|p| p.0).unwrap_or(1.0).max(0.001);
-        let max_v = points.iter().map(|p| p.1).fold(0.0f64, f64::max).max(0.001);
-        let inner = rect.shrink(4.0);
-        let to_pos = |t: f64, v: f64| egui::pos2(
-            inner.left() + (t / max_t) as f32 * inner.width(),
-            inner.bottom() - (v / max_v) as f32 * (inner.height() - 10.0),
-        );
-        let stroke = egui::Stroke::new(1.5, theme::accent());
-        for pair in points.windows(2) {
-            painter.line_segment([to_pos(pair[0].0, pair[0].1), to_pos(pair[1].0, pair[1].1)], stroke);
-        }
-        painter.text(egui::pos2(inner.left(), inner.top() - 2.0),
-            egui::Align2::LEFT_BOTTOM, format!("峰值 {max_v:.1}{unit}"),
-            egui::FontId::proportional(9.0), theme::secondary());
-        painter.text(egui::pos2(inner.right(), inner.bottom() + 8.0),
-            egui::Align2::RIGHT_TOP, format!("{max_t:.0}s"),
-            egui::FontId::proportional(9.0), theme::secondary());
-    }
-
-    fn call_stats(&self) {
-        let rpc = Arc::clone(&self.rpc);
-        let tx = self.msg_tx.clone();
-        let wake = Arc::clone(&self.wake);
-        std::thread::spawn(move || {
-            match rpc.call("stats.run", json!({})) {
-                Ok(value) => {
-                    if let Ok(parsed) = serde_json::from_value::<StatsData>(value) {
-                        let _ = tx.send(UiMsg::StatsReady(parsed));
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(UiMsg::RpcError(error));
-                }
-            }
-            wake();
-        });
-    }
-
-    /// 手绘直方图（painter 矩形），零外部依赖。
-    fn draw_histogram(&self, ui: &mut egui::Ui, bins: &[model::HistBin]) {
-        let height = 110.0;
-        let (rect, _response) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), height),
-            egui::Sense::hover(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
-        let Some(max_count) = bins.iter().map(|b| b.count).max().filter(|m| *m > 0) else {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), theme::secondary());
-            return;
-        };
-        let inner = rect.shrink(4.0);
-        let n = bins.len() as f32;
-        for (index, bin) in bins.iter().enumerate() {
-            let bar_w = inner.width() / n;
-            let x0 = inner.left() + index as f32 * bar_w;
-            let bar_h = (bin.count as f32 / max_count as f32) * (inner.height() - 12.0);
-            let bar = egui::Rect::from_min_size(
-                egui::pos2(x0 + 1.0, inner.bottom() - bar_h),
-                egui::vec2((bar_w - 2.0).max(1.0), bar_h),
-            );
-            painter.rect_filled(bar, 1.0, theme::accent());
-            if bin.count > 0 && bar_w > 14.0 {
-                painter.text(
-                    egui::pos2(bar.center().x, bar.top() - 7.0),
-                    egui::Align2::CENTER_CENTER,
-                    bin.count,
-                    egui::FontId::proportional(9.0),
-                    theme::secondary(),
-                );
-            }
-        }
-        // X 轴末端标注最大时长桶
-        if let Some(last) = bins.last() {
-            painter.text(
-                egui::pos2(inner.right(), inner.bottom() + 8.0),
-                egui::Align2::RIGHT_TOP,
-                format!("{:.0}s", last.end_s),
-                egui::FontId::proportional(9.0),
-                theme::secondary(),
-            );
+    fn scope_params(&self) -> Result<Value, String> {
+        match self.analysis_scope_ids() {
+            None => Ok(json!({})),
+            Some(ids) if ids.is_empty() => Err("先标记至少一个已完成镜头，或切换到全片范围".into()),
+            Some(ids) => Ok(json!({"shot_ids": ids})),
         }
     }
 
-    /// 手绘密度折线（painter 线段）。
-    fn draw_density(&self, ui: &mut egui::Ui, points: &[model::DensityPoint]) {
-        let height = 90.0;
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), height),
-            egui::Sense::hover(),
-        );
-        let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
-        let values: Vec<(f64, f64)> = points
-            .iter()
-            .filter_map(|p| p.cuts_per_minute.map(|v| (p.video_time_s, v)))
-            .collect();
-        if values.len() < 2 {
-            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), theme::secondary());
-            return;
+    fn current_stats_key(&self) -> String {
+        match self.analysis_scope_ids() {
+            None => format!("{}|all", self.state.project_id),
+            Some(ids) => format!("{}|{}", self.state.project_id, ids.join(",")),
         }
-        let max_t = values.last().map(|v| v.0).unwrap_or(1.0).max(0.001);
-        let max_v = values.iter().map(|v| v.1).fold(0.0f64, f64::max).max(0.001);
-        let inner = rect.shrink(4.0);
-        inner.bottom();
-        let to_pos = |t: f64, v: f64| -> egui::Pos2 {
-            egui::pos2(
-                inner.left() + (t / max_t) as f32 * inner.width(),
-                inner.bottom() - (v / max_v) as f32 * (inner.height() - 10.0),
-            )
-        };
-        let stroke = egui::Stroke::new(1.5, theme::accent());
-        for pair in values.windows(2) {
-            let (t0, v0) = pair[0];
-            let (t1, v1) = pair[1];
-            painter.line_segment([to_pos(t0, v0), to_pos(t1, v1)], stroke);
-        }
-        painter.text(
-            egui::pos2(inner.right(), inner.bottom() + 8.0),
-            egui::Align2::RIGHT_TOP,
-            format!("{max_t:.0}s"),
-            egui::FontId::proportional(9.0),
-            theme::secondary(),
-        );
-        painter.text(
-            egui::pos2(inner.left(), inner.top() - 2.0),
-            egui::Align2::LEFT_BOTTOM,
-            format!("峰值 {max_v:.1}/分"),
-            egui::FontId::proportional(9.0),
-            theme::secondary(),
-        );
     }
 
     fn colors_panel(&mut self, ui: &mut egui::Ui) {
@@ -1944,31 +1950,52 @@ impl App {
         }
     }
 
+    fn call_stats(&self) {
+        let key = self.current_stats_key();
+        let scope = self.analysis_scope_ids();
+        if matches!(&scope, Some(ids) if ids.is_empty()) { return; }
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        std::thread::spawn(move || {
+            let mut params = json!({});
+            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
+            let message = match rpc.call("stats.run", params) {
+                Ok(value) => match serde_json::from_value::<StatsData>(value) {
+                    Ok(stats) => UiMsg::StatsReady { key, stats },
+                    Err(error) => UiMsg::StatsFailed { key, error: format!("统计结果解析失败: {error}") },
+                },
+                Err(error) => UiMsg::StatsFailed { key, error },
+            };
+            let _ = tx.send(message); wake();
+        });
+    }
+
     fn call_palette(&self, shot_id: String, frame: u64) {
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
-        std::thread::spawn(move || match rpc.call("palette.get", json!({"frame": frame})) {
-            Ok(value) => {
-                if let Ok(palette) = serde_json::from_value::<PaletteInfo>(value) {
-                    let _ = tx.send(UiMsg::PaletteReady { shot_id, palette });
-                }
-            }
-            Err(error) => {
-                let _ = tx.send(UiMsg::RpcError(error));
-            }
+        std::thread::spawn(move || {
+            let message = match rpc.call("palette.get", json!({"frame": frame})) {
+                Ok(value) => match serde_json::from_value::<PaletteInfo>(value) {
+                    Ok(palette) => UiMsg::PaletteReady { shot_id, palette },
+                    Err(error) => UiMsg::PaletteFailed { shot_id, error: format!("调色板解析失败: {error}") },
+                },
+                Err(error) => UiMsg::PaletteFailed { shot_id, error },
+            };
+            let _ = tx.send(message); wake();
         });
-        wake();
     }
 
     fn run_scale(&mut self) {
-        if self.scale_job.is_some() || self.index_busy {
+        if self.work_busy() {
             return;
         }
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
         self.status = "景别识别启动…".into();
+        self.scale_starting = true;
         std::thread::spawn(move || {
             match rpc.call("job.start", json!({"method": "scale.run", "params": {}})) {
                 Ok(value) => {
@@ -1977,7 +2004,7 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(UiMsg::RpcError(error));
+                    let _ = tx.send(UiMsg::ScaleFailed(error));
                 }
             }
             wake();
@@ -1985,21 +2012,29 @@ impl App {
     }
 
     fn run_analysis(&mut self) {
-        if self.analysis_job.is_some() || self.index_busy {
+        if self.work_busy() {
+            return;
+        }
+        let scope = self.analysis_scope_ids();
+        if matches!(&scope, Some(ids) if ids.is_empty()) {
+            self.status = "先标记至少一个已完成镜头，或切换到全片范围".into();
             return;
         }
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
         self.status = "色彩分析启动…".into();
+        self.analysis_starting = true;
+        self.analysis_key = self.current_stats_key();
         std::thread::spawn(move || {
-            match rpc.call("job.start", json!({"method": "analysis.run", "params": {}})) {
+            let mut params = json!({});
+            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
+            match rpc.call("job.start", json!({"method": "analysis.run", "params": params})) {
                 Ok(value) => {
                     if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
                         let _ = tx.send(UiMsg::AnalysisJobStarted(job_id));
                     }
                 }
-
                 Err(error) => {
                     let _ = tx.send(UiMsg::AnalysisFailed(error));
                 }
@@ -2085,15 +2120,29 @@ impl App {
                     self.call("edit.split", json!({"frame": current}));
                 }
                 if ui
-                    .add_enabled(shot.number + 1 < self.state.completed_count as usize, egui::Button::new("与左镜头合并"))
+                    .add_enabled(shot.number + 1 < self.state.completed_count as usize, egui::Button::new("与下一镜头合并"))
                     .clicked()
                 {
                     self.call("edit.merge", json!({"row": shot.number}));
                 }
-                // 边界微调（原版 move_boundary）：左边界 = 本镜头起始帧
+                // 共享边界：起点属于本镜头，终点属于下一镜头；两者指向同一帧。
+                ui.horizontal(|ui| {
+                    if shot.number > 0 && ui.add_enabled(!shot.pending, egui::Button::new("校正起点…")).clicked() {
+                        self.boundary_editor = boundary::BoundaryEditor::new(
+                            &self.state.project_id, &self.state.shots, shot.number,
+                            boundary::Side::Start, current);
+                    }
+                    if shot.number + 1 < self.state.completed_count as usize
+                        && ui.add_enabled(!shot.pending, egui::Button::new("校正终点…")).clicked()
+                    {
+                        self.boundary_editor = boundary::BoundaryEditor::new(
+                            &self.state.project_id, &self.state.shots, shot.number,
+                            boundary::Side::End, current);
+                    }
+                });
                 if shot.number > 0 {
                     ui.horizontal(|ui| {
-                        ui.weak("左边界");
+                        ui.weak("步进");
                         let step = if ui.input(|i| i.modifiers.shift) { 10 } else { 1 };
                         let left_ok = shot.start.saturating_sub(step) > self.state.shots[shot.number - 1].start;
                         if ui.add_enabled(left_ok, egui::Button::new("◀")).clicked() {
@@ -2104,7 +2153,7 @@ impl App {
                             self.call("edit.move_boundary",
                                 json!({"boundary": shot.number, "frame": shot.start + step}));
                         }
-                        ui.weak(format!("Shift ×10 · 当前 {}", shot.start));
+                        ui.weak(format!("Shift ×10 · 共享帧 {}", shot.start));
                     });
                 }
             }
@@ -2270,14 +2319,16 @@ impl App {
         });
         // 字幕 / 音量 / 缩放信息行
         ui.horizontal(|ui| {
-            if ui.button("💬 字幕").on_hover_text("加载 SRT").clicked() {
+            if ui.button("💬 字幕").on_hover_text("加载 SRT 字幕").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("SRT 字幕", &["srt", "ass"])
+                    .add_filter("SRT 字幕", &["srt"])
                     .pick_file()
                 {
-                    self.call_quiet("subtitles.load", json!({"path": path.to_string_lossy()}));
-                    self.subtitle_loaded = true;
+                    self.load_subtitles(path);
                 }
+            }
+            if self.subtitle_loaded {
+                ui.weak(format!("{} 条", self.subtitle_cues.len()));
             }
             let has_audio = self.audio.is_some()
                 && self.index.as_ref().map(|i| i.metadata.audio_tracks.unwrap_or(0) > 0).unwrap_or(false);
@@ -2349,6 +2400,9 @@ impl App {
             }
             if self.state.completed_count > 0 {
                 ui.weak(format!("已标记 {} · Ctrl+A", self.marks.len()));
+                if let Some(ids) = self.analysis_scope_ids() {
+                    ui.colored_label(theme::accent(), format!("导出/分析范围：已标记 {} 个", ids.len()));
+                }
             }
         });
         // A/B 帧信息行
@@ -2601,7 +2655,11 @@ impl App {
         else {
             return;
         };
-        self.call_quiet_result("export.shots_csv", json!({"path": path.to_string_lossy()}));
+        match self.scope_params() {
+            Ok(mut params) => { params["path"] = json!(path.to_string_lossy());
+                self.call_quiet_result("export.shots_csv", params); }
+            Err(error) => self.status = error,
+        }
     }
 
     /// 选中镜头导出为高质量 GIF（ffmpeg palettegen/paletteuse 双通道）。
@@ -2683,7 +2741,11 @@ impl App {
             return;
         };
         self.status = "生成分析长图…".into();
-        self.call_quiet_result("export.contact_sheet", json!({"path": path.to_string_lossy()}));
+        match self.scope_params() {
+            Ok(mut params) => { params["path"] = json!(path.to_string_lossy());
+                self.call_quiet_result("export.contact_sheet", params); }
+            Err(error) => self.status = error,
+        }
     }
 
     /// PDF 联系表（原版 contact_sheet.PdfSheet 语义：分页、编号+时长+标签）。
@@ -2696,7 +2758,11 @@ impl App {
             return;
         };
         self.status = "生成 PDF 联系表…".into();
-        self.call_quiet_result("export.pdf_sheet", json!({"path": path.to_string_lossy()}));
+        match self.scope_params() {
+            Ok(mut params) => { params["path"] = json!(path.to_string_lossy());
+                self.call_quiet_result("export.pdf_sheet", params); }
+            Err(error) => self.status = error,
+        }
     }
 
     fn call_quiet_result(&self, method: &str, params: Value) {

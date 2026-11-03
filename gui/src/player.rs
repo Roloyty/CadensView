@@ -3,7 +3,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -27,23 +27,44 @@ pub enum PlayerCmd {
 }
 
 struct Stream {
-    child: Child,
-    next_frame: u64,   // 下一个要读的帧号
-    started: Instant,  // 起播墙钟
-    start_pts: i64,    // 起播帧 pts，用于节流对齐
-    loop_end: Option<u64>, // 循环终点（到达后从 loop_start 重新开始）
-    loop_start: u64,   // 循环起点
+    child: Arc<Mutex<Child>>,
+    stdout: ChildStdout,
+    generation: u64,
+    next_frame: u64, // -ss from 的首个输出就是 from
+    started: Option<Instant>, // 首帧解出后起算，不把 ffmpeg 启动耗时算入播放
+    start_pts: i64,
+    loop_end: Option<u64>,
+    loop_start: u64,
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        terminate(&self.child);
+    }
+}
+
+struct Control {
+    cmd: Option<PlayerCmd>,
+    generation: u64,
+    child: Option<Arc<Mutex<Child>>>,
 }
 
 struct Inner {
-    cmd: Mutex<Option<PlayerCmd>>,
-    playing: Arc<AtomicBool>,
-    pub_frame: Arc<AtomicU64>,
+    control: Mutex<Control>,
+    playing: AtomicBool,
+    pub_frame: AtomicU64,
+}
+
+impl Inner {
+    fn is_current(&self, generation: u64) -> bool {
+        self.control.lock().unwrap().generation == generation
+    }
 }
 
 pub struct PlayerHandle {
     inner: Arc<Inner>,
     pub msgs: std::sync::mpsc::Receiver<PlayerMsg>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 /// 帧/状态送达后唤醒 UI 线程（egui 空闲时不会自轮询，必须显式请求重绘）。
@@ -53,30 +74,44 @@ impl PlayerHandle {
     pub fn spawn(ffmpeg: PathBuf, video: PathBuf, index: IndexInfo, wake: Waker) -> PlayerHandle {
         let (tx, rx) = std::sync::mpsc::channel::<PlayerMsg>();
         let inner = Arc::new(Inner {
-            cmd: Mutex::new(None),
-            playing: Arc::new(AtomicBool::new(false)),
-            pub_frame: Arc::new(AtomicU64::new(0)),
+            control: Mutex::new(Control { cmd: None, generation: 0, child: None }),
+            playing: AtomicBool::new(false),
+            pub_frame: AtomicU64::new(0),
         });
-        let worker = Arc::clone(&inner);
-        thread::spawn(move || worker_loop(worker, ffmpeg, video, index, Out { tx, wake }));
-        PlayerHandle { inner, msgs: rx }
+        let worker_inner = Arc::clone(&inner);
+        let worker = thread::spawn(move || worker_loop(worker_inner, ffmpeg, video, index, Out { tx, wake }));
+        PlayerHandle { inner, msgs: rx, worker: Some(worker) }
+    }
+
+    fn request(&self, cmd: PlayerCmd) {
+        let child = {
+            let mut control = self.inner.control.lock().unwrap();
+            control.generation = control.generation.wrapping_add(1);
+            control.cmd = Some(cmd);
+            self.inner.playing.store(false, Ordering::SeqCst);
+            control.child.take()
+        };
+        // 不能只投命令：worker 可能正阻塞在 stdout.read_exact。
+        if let Some(child) = child {
+            terminate(&child);
+        }
     }
 
     pub fn play(&self, frame: u64) {
-        *self.inner.cmd.lock().unwrap() = Some(PlayerCmd::Play(frame));
+        self.request(PlayerCmd::Play(frame));
     }
 
     /// 局部循环播放：到达 end 后自动从 start 重启（原版 transport.play repeat 语义）。
     pub fn play_loop(&self, start: u64, end: u64) {
-        *self.inner.cmd.lock().unwrap() = Some(PlayerCmd::PlayLoop(start, end));
+        self.request(PlayerCmd::PlayLoop(start, end));
     }
 
     pub fn show(&self, frame: u64) {
-        *self.inner.cmd.lock().unwrap() = Some(PlayerCmd::Show(frame));
+        self.request(PlayerCmd::Show(frame));
     }
 
     pub fn stop(&self) {
-        *self.inner.cmd.lock().unwrap() = Some(PlayerCmd::Stop);
+        self.request(PlayerCmd::Stop);
     }
 
     pub fn is_playing(&self) -> bool {
@@ -90,141 +125,130 @@ impl PlayerHandle {
 
 impl Drop for PlayerHandle {
     fn drop(&mut self) {
-        *self.inner.cmd.lock().unwrap() = Some(PlayerCmd::Shutdown);
+        self.request(PlayerCmd::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
 fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexInfo, out: Out) {
     let mut stream: Option<Stream> = None;
     loop {
-        // 命令到达时立刻打断当前流；否则继续泵流或小睡。
-        let cmd = if inner.cmd.lock().unwrap().is_some() {
-            inner.cmd.lock().unwrap().take()
-        } else {
-            None
+        let command = {
+            let mut control = inner.control.lock().unwrap();
+            control.cmd.take().map(|cmd| (cmd, control.generation))
         };
-        if let Some(cmd) = cmd {
-            if matches!(cmd, PlayerCmd::Shutdown) {
-                kill(&mut stream);
+        if let Some((cmd, generation)) = command {
+            clear_stream(&inner, &mut stream);
+            if cmd == PlayerCmd::Shutdown {
                 return;
             }
-            kill(&mut stream);
-            inner.playing.store(false, Ordering::SeqCst);
-            match cmd {
-                PlayerCmd::Stop => {}
-                PlayerCmd::Show(frame) => match capture_one(&ffmpeg, &video, &index, frame) {
-                    Ok((width, height, rgba)) => {
-                        let frame = frame.min(index.frames().saturating_sub(1));
-                        inner.pub_frame.store(frame, Ordering::SeqCst);
-                        out.send(PlayerMsg::Frame { frame, width, height, rgba });
+            if cmd == PlayerCmd::Stop {
+                continue;
+            }
+            let (from, loop_end, playing) = match cmd {
+                PlayerCmd::Show(frame) => (frame, None, false),
+                PlayerCmd::Play(frame) => (frame, None, true),
+                PlayerCmd::PlayLoop(start, end) => (start, Some(end), true),
+                _ => unreachable!(),
+            };
+            match start_stream(&ffmpeg, &video, &index, from, loop_end, generation) {
+                Ok(mut state) => {
+                    if !register_stream(&inner, &state, playing) {
+                        continue; // seek/stop 与 spawn 并发；Drop 回收这个过期 child
                     }
-                    Err(error) => {
-                        out.send(PlayerMsg::Failed(error));
-                    }
-                },
-                PlayerCmd::Play(from) => {
-                    let from = from.min(index.frames().saturating_sub(1));
-                    match spawn_stream(&ffmpeg, &video, &index, from) {
-                        Ok(child) => {
-                            inner.playing.store(true, Ordering::SeqCst);
-                            inner.pub_frame.store(from, Ordering::SeqCst);
-                            stream = Some(Stream {
-                                child,
-                                next_frame: from + 1,
-                                started: Instant::now(),
-                                start_pts: index.pts.get(from as usize).copied().unwrap_or(0),
-                                loop_end: None,
-                                loop_start: from,
-                            });
+                    if playing {
+                        stream = Some(state);
+                    } else {
+                        match pump_frame(&mut state, &index, &inner, &out) {
+                            Pump::Failed(error) => { out.send_current(&inner, generation, PlayerMsg::Failed(error)); }
+                            Pump::Disconnected => return,
+                            _ => {}
                         }
-                        Err(error) => {
-                            out.send(PlayerMsg::Failed(error.to_string()));
-                        }
+                        clear_stream(&inner, &mut Some(state));
                     }
                 }
-                PlayerCmd::PlayLoop(start, end) => {
-                    let start = start.min(index.frames().saturating_sub(1));
-                    let end = end.min(index.frames()).max(start + 1);
-                    match spawn_stream(&ffmpeg, &video, &index, start) {
-                        Ok(child) => {
-                            inner.playing.store(true, Ordering::SeqCst);
-                            inner.pub_frame.store(start, Ordering::SeqCst);
-                            stream = Some(Stream {
-                                child,
-                                next_frame: start + 1,
-                                started: Instant::now(),
-                                start_pts: index.pts.get(start as usize).copied().unwrap_or(0),
-                                loop_end: Some(end),
-                                loop_start: start,
-                            });
-                        }
-                        Err(error) => {
-                            out.send(PlayerMsg::Failed(error.to_string()));
-                        }
-                    }
-                }
-                PlayerCmd::Shutdown => unreachable!(),
+                Err(error) => finish(&inner, &out, generation, Some(error), playing),
             }
             continue;
         }
 
-        match stream.as_mut() {
-            Some(state) => {
-                // 循环模式：到达终点时重启 ffmpeg 流从起点
-                if let Some(loop_end) = state.loop_end {
-                    if state.next_frame >= loop_end {
-                        let restart = state.loop_start;
-                        kill(&mut stream);
-                        inner.playing.store(false, Ordering::SeqCst);
-                        match spawn_stream(&ffmpeg, &video, &index, restart) {
-                            Ok(child) => {
-                                inner.playing.store(true, Ordering::SeqCst);
-                                inner.pub_frame.store(restart, Ordering::SeqCst);
-                                stream = Some(Stream {
-                                    child,
-                                    next_frame: restart + 1,
-                                    started: Instant::now(),
-                                    start_pts: index.pts.get(restart as usize).copied().unwrap_or(0),
-                                    loop_end: Some(loop_end),
-                                    loop_start: restart,
-                                });
-                            }
-                            Err(error) => {
-                                out.send(PlayerMsg::Failed(error.to_string()));
-                            }
-                        }
-                        continue;
-                    }
+        let Some(state) = stream.as_mut() else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        let generation = state.generation;
+        let loop_end = state.loop_end;
+        let restart = state.loop_start;
+        match pump_frame(state, &index, &inner, &out) {
+            Pump::Frame => {}
+            Pump::Interrupted => clear_stream(&inner, &mut stream),
+            Pump::Disconnected => {
+                clear_stream(&inner, &mut stream);
+                return;
+            }
+            Pump::Failed(error) => {
+                clear_stream(&inner, &mut stream);
+                // 解码失败不能当作正常 EOF 无限重启。
+                finish(&inner, &out, generation, Some(error), true);
+            }
+            Pump::Finished => {
+                clear_stream(&inner, &mut stream);
+                if !inner.is_current(generation) {
+                    continue;
                 }
-                if !pump_frame(state, &index, &inner, &out) {
-                    // 流结束：循环模式下自动重启
-                    if let Some(loop_end) = state.loop_end {
-                        let restart = state.loop_start;
-                        kill(&mut stream);
-                        match spawn_stream(&ffmpeg, &video, &index, restart) {
-                            Ok(child) => {
-                                inner.playing.store(true, Ordering::SeqCst);
-                                inner.pub_frame.store(restart, Ordering::SeqCst);
-                                stream = Some(Stream {
-                                    child,
-                                    next_frame: restart + 1,
-                                    started: Instant::now(),
-                                    start_pts: index.pts.get(restart as usize).copied().unwrap_or(0),
-                                    loop_end: Some(loop_end),
-                                    loop_start: restart,
-                                });
-                                continue;
+                if let Some(end) = loop_end {
+                    match start_stream(&ffmpeg, &video, &index, restart, Some(end), generation) {
+                        Ok(state) => {
+                            if register_stream(&inner, &state, true) {
+                                stream = Some(state);
                             }
-                            Err(_) => {}
                         }
+                        Err(error) => finish(&inner, &out, generation, Some(error), true),
                     }
-                    stream = None;
-                    inner.playing.store(false, Ordering::SeqCst);
-                    out.send(PlayerMsg::Ended);
+                } else {
+                    finish(&inner, &out, generation, None, true);
                 }
             }
-            None => thread::sleep(Duration::from_millis(10)),
         }
+    }
+}
+
+fn register_stream(inner: &Inner, state: &Stream, playing: bool) -> bool {
+    let mut control = inner.control.lock().unwrap();
+    if control.generation != state.generation {
+        return false;
+    }
+    control.child = Some(Arc::clone(&state.child));
+    inner.playing.store(playing, Ordering::SeqCst);
+    true
+}
+
+fn clear_stream(inner: &Inner, stream: &mut Option<Stream>) {
+    if let Some(state) = stream.take() {
+        let mut control = inner.control.lock().unwrap();
+        if control.child.as_ref().is_some_and(|child| Arc::ptr_eq(child, &state.child)) {
+            control.child = None;
+        }
+        drop(control);
+        drop(state);
+    }
+}
+
+fn finish(inner: &Inner, out: &Out, generation: u64, error: Option<String>, ended: bool) {
+    {
+        let control = inner.control.lock().unwrap();
+        if control.generation != generation {
+            return;
+        }
+        inner.playing.store(false, Ordering::SeqCst);
+    }
+    if let Some(error) = error {
+        out.send_current(inner, generation, PlayerMsg::Failed(error));
+    }
+    if ended {
+        out.send_current(inner, generation, PlayerMsg::Ended);
     }
 }
 
@@ -235,43 +259,136 @@ struct Out {
 }
 
 impl Out {
-    fn send(&self, message: PlayerMsg) -> bool {
-        let ok = self.tx.send(message).is_ok();
+    fn send_current(&self, inner: &Inner, generation: u64, message: PlayerMsg) -> bool {
+        let ok = {
+            let control = inner.control.lock().unwrap();
+            if control.generation != generation {
+                return false;
+            }
+            if let PlayerMsg::Frame { frame, .. } = &message {
+                inner.pub_frame.store(*frame, Ordering::SeqCst);
+            }
+            self.tx.send(message).is_ok()
+        };
         (self.wake)();
         ok
     }
 }
 
-/// 读一帧、按 pts 节流后发出。false = 流结束或出错。
-fn pump_frame(state: &mut Stream, index: &IndexInfo, inner: &Inner, out: &Out) -> bool {
-    let (width, height) = index.size();
-    if width == 0 || height == 0 {
-        out.send(PlayerMsg::Failed("索引缺少画面尺寸".into()));
-        return false;
-    }
-    let mut rgba = vec![0u8; width * height * 4];
-    let stdout = match state.child.stdout.as_mut() {
-        Some(out) => out,
-        None => return false,
+#[derive(Debug, PartialEq)]
+enum Pump {
+    Frame,
+    Finished,
+    Interrupted,
+    Disconnected,
+    Failed(String),
+}
+
+fn start_stream(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, from: u64,
+    loop_end: Option<u64>, generation: u64) -> Result<Stream, String>
+{
+    validate_index(index)?;
+    let from = from.min(index.frames() - 1);
+    let loop_end = loop_end.map(|end| end.min(index.frames()).max(from + 1));
+    let mut child = spawn_stream(ffmpeg, video, index, from)
+        .map_err(|error| format!("ffmpeg 启动失败: {error}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("ffmpeg 未打开视频输出管道".into());
     };
-    if !read_exact_or_eof(stdout, &mut rgba) {
-        return false;
-    }
-    // 按 pts 差对齐墙钟：解码快于播放节奏时等待。
+    Ok(Stream {
+        child: Arc::new(Mutex::new(child)), stdout, generation, next_frame: from,
+        started: None, start_pts: index.pts[from as usize], loop_end, loop_start: from,
+    })
+}
+
+/// 边界使用下帧 PTS；片尾使用最后一帧时长，保证 [start, end) 的末帧也完整播放。
+fn target_seconds(index: &IndexInfo, frame: u64, start_pts: i64) -> f64 {
     let (num, den) = index.time_base();
-    let target = index
-        .pts
-        .get(state.next_frame as usize)
-        .map(|pts| (*pts - state.start_pts) as f64 * num as f64 / den as f64)
-        .unwrap_or_else(|| state.started.elapsed().as_secs_f64());
-    let elapsed = state.started.elapsed().as_secs_f64();
-    if target > elapsed {
-        thread::sleep(Duration::from_secs_f64((target - elapsed).min(0.25)));
+    let tick_s = num as f64 / den as f64;
+    if let Some(pts) = index.pts.get(frame as usize) {
+        return (*pts as i128 - start_pts as i128) as f64 * tick_s;
+    }
+    let last = index.pts.len() - 1;
+    let duration = index.durations.get(last).copied().filter(|duration| *duration > 0)
+        .or_else(|| last.checked_sub(1).map(|prev| index.pts[last].saturating_sub(index.pts[prev])).filter(|d| *d > 0));
+    let tail_s = duration.map(|duration| duration as f64 * tick_s).unwrap_or_else(|| {
+        let mut rate = index.metadata.average_rate.as_deref().unwrap_or("24").split('/');
+        let num = rate.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(24.0);
+        let den = rate.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0);
+        let seconds = den / num;
+        if seconds.is_finite() && seconds > 0.0 { seconds } else { 1.0 / 24.0 }
+    });
+    (index.pts[last] as i128 - start_pts as i128) as f64 * tick_s + tail_s
+}
+
+fn wait_for_frame(state: &Stream, index: &IndexInfo, inner: &Inner) -> bool {
+    let Some(started) = state.started else { return inner.is_current(state.generation) };
+    let target = target_seconds(index, state.next_frame, state.start_pts).max(0.0);
+    loop {
+        if !inner.is_current(state.generation) {
+            return false;
+        }
+        let remaining = target - started.elapsed().as_secs_f64();
+        if remaining <= 0.0 {
+            return true;
+        }
+        thread::sleep(Duration::from_secs_f64(remaining.min(0.01)));
+    }
+}
+
+/// 读取 rawvideo 后按真实帧号发消息；索引/循环边界在读下一帧之前检查。
+fn pump_frame(state: &mut Stream, index: &IndexInfo, inner: &Inner, out: &Out) -> Pump {
+    if !inner.is_current(state.generation) {
+        return Pump::Interrupted;
+    }
+    if state.next_frame >= state.loop_end.unwrap_or(index.frames()) {
+        return if wait_for_frame(state, index, inner) { Pump::Finished } else { Pump::Interrupted };
+    }
+    let (width, height) = index.size();
+    let expected = match image_bytes(width, height, 4) {
+        Ok(expected) => expected,
+        Err(error) => return Pump::Failed(error),
+    };
+    let mut rgba = vec![0u8; expected];
+    if let Err(error) = state.stdout.read_exact(&mut rgba) {
+        return if inner.is_current(state.generation) {
+            Pump::Failed(format!("ffmpeg 在帧 {} 提前结束或读取失败: {error}", state.next_frame))
+        } else { Pump::Interrupted };
+    }
+    state.started.get_or_insert_with(Instant::now);
+    if !wait_for_frame(state, index, inner) {
+        return Pump::Interrupted;
     }
     let frame = state.next_frame;
     state.next_frame += 1;
-    inner.pub_frame.store(frame, Ordering::SeqCst);
-    out.send(PlayerMsg::Frame { frame, width, height, rgba })
+    if out.send_current(inner, state.generation, PlayerMsg::Frame { frame, width, height, rgba }) {
+        Pump::Frame
+    } else if inner.is_current(state.generation) {
+        Pump::Disconnected
+    } else { Pump::Interrupted }
+}
+
+fn image_bytes(width: usize, height: usize, channels: usize) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err("画面尺寸必须大于零".into());
+    }
+    width.checked_mul(height).and_then(|n| n.checked_mul(channels))
+        .filter(|n| *n <= isize::MAX as usize).ok_or_else(|| "画面尺寸过大".into())
+}
+
+fn validate_index(index: &IndexInfo) -> Result<(), String> {
+    let (width, height) = index.size();
+    image_bytes(width, height, 4)?;
+    if index.frames() == 0 {
+        return Err("索引没有视频帧".into());
+    }
+    let (num, den) = index.time_base();
+    if num <= 0 || den <= 0 {
+        return Err("索引 time_base 无效".into());
+    }
+    Ok(())
 }
 
 fn spawn_stream(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, from: u64) -> std::io::Result<Child> {
@@ -281,7 +398,7 @@ fn spawn_stream(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, from: u64)
         .arg("-loglevel").arg("error")
         .arg("-ss").arg(format!("{seconds:.6}"))
         .arg("-i").arg(video)
-        .args(["-map", "0:v:0", "-an", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .args(["-map", "0:v:0", "-an", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -294,11 +411,9 @@ pub fn capture_frame(ffmpeg: &PathBuf, video: &PathBuf, index: IndexInfo, frame:
 }
 
 fn capture_one(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, frame: u64) -> Result<(usize, usize, Vec<u8>), String> {
-    let seconds = index.seconds(frame);
+    validate_index(index)?;
+    let seconds = index.seconds(frame.min(index.frames() - 1));
     let (width, height) = index.size();
-    if width == 0 || height == 0 {
-        return Err("索引缺少画面尺寸".into());
-    }
     let output = Command::new(ffmpeg)
         .arg("-nostdin")
         .arg("-loglevel").arg("error")
@@ -308,15 +423,22 @@ fn capture_one(ffmpeg: &PathBuf, video: &PathBuf, index: &IndexInfo, frame: u64)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("ffmpeg 启动失败: {e}"))?;
-    let expected = width * height * 4;
-    if output.stdout.len() < expected {
-        return Err(format!("ffmpeg 未返回完整帧 ({} < {})", output.stdout.len(), expected));
+    if !output.status.success() {
+        return Err(format!("ffmpeg 取帧失败: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let expected = image_bytes(width, height, 4)?;
+    if output.stdout.len() != expected {
+        return Err(format!("ffmpeg 帧长度不符 ({} != {})", output.stdout.len(), expected));
     }
     Ok((width, height, output.stdout[..expected].to_vec()))
 }
 
 /// 小尺寸单帧采集（rgb24）：缩略图与景别预处理复用。
 pub fn capture_small(ffmpeg: &PathBuf, video: &PathBuf, seconds: f64, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let expected = image_bytes(width as usize, height as usize, 3)?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err("缩略图时间必须为非负有限值".into());
+    }
     let scale = format!("scale={width}:{height}");
     let output = Command::new(ffmpeg)
         .arg("-nostdin")
@@ -325,12 +447,15 @@ pub fn capture_small(ffmpeg: &PathBuf, video: &PathBuf, seconds: f64, width: u32
         .arg("-i").arg(video)
         .args(["-map", "0:v:0", "-an", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24"])
         .arg("-vf").arg(&scale)
+        .arg("-")
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("ffmpeg 启动失败: {e}"))?;
-    let expected = (width as usize) * (height as usize) * 3;
-    if output.stdout.len() < expected {
-        return Err(format!("缩略图帧不完整 ({} < {})", output.stdout.len(), expected));
+    if !output.status.success() {
+        return Err(format!("ffmpeg 缩略图失败: {}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    if output.stdout.len() != expected {
+        return Err(format!("缩略图帧长度不符 ({} != {})", output.stdout.len(), expected));
     }
     Ok(output.stdout[..expected].to_vec())
 }
@@ -345,24 +470,10 @@ pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     rgba
 }
 
-fn read_exact_or_eof(stdout: &mut impl Read, buffer: &mut [u8]) -> bool {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match stdout.read(&mut buffer[filled..]) {
-            Ok(0) => return false,
-            Ok(n) => filled += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
-fn kill(stream: &mut Option<Stream>) {
-    if let Some(mut state) = stream.take() {
-        let _ = state.child.kill();
-        let _ = state.child.wait();
-    }
+fn terminate(child: &Arc<Mutex<Child>>) {
+    let mut child = child.lock().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// 播放时让检测 worker 让路的标记文件（协议见 shotlab/onnx_worker.py）。
@@ -434,16 +545,39 @@ mod tests {
             if red { assert_red(got, &format!("单帧 {frame}")); } else { assert_blue(got, &format!("单帧 {frame}")); }
         }
 
-        // 流式播放：从帧 22 起连续读 4 帧，应跨过 23/24 边界：红红蓝蓝
-        let mut stream = spawn_stream(&ffmpeg, &video, &index, 22).expect("stream");
-        let (w, h) = index.size();
+        // 经真实 worker/pump_frame 验证消息中的帧号，不能只验证 stdout 像素。
+        let player = PlayerHandle::spawn(ffmpeg, video, index, Arc::new(|| {}));
+        player.play(22);
         for (step, red) in [(0u64, true), (1, true), (2, false), (3, false)] {
-            let mut rgba = vec![0u8; w * h * 4];
-            assert!(read_exact_or_eof(stream.stdout.as_mut().unwrap(), &mut rgba), "流结束过早");
-            let got = family(&rgba, w, h);
-            let frame = 22 + step;
-            if red { assert_red(got, &format!("流式帧 {frame}")); } else { assert_blue(got, &format!("流式帧 {frame}")); }
+            match player.msgs.recv_timeout(Duration::from_secs(3)).expect("stream message") {
+                PlayerMsg::Frame { frame, width, height, rgba } => {
+                    assert_eq!(frame, 22 + step, "pump_frame 帧号偏移");
+                    let got = family(&rgba, width, height);
+                    if red { assert_red(got, &format!("流式帧 {frame}")); } else { assert_blue(got, &format!("流式帧 {frame}")); }
+                }
+                PlayerMsg::Failed(error) => panic!("stream failed: {error}"),
+                PlayerMsg::Ended => panic!("流结束过早"),
+            }
         }
-        let _ = stream.kill();
+    }
+
+    #[test]
+    fn capture_small_returns_rgb_from_fixture() {
+        let (Ok(video), Ok(ffmpeg)) = (
+            std::env::var("CV_TEST_VIDEO"),
+            std::env::var("CV_TEST_FFMPEG"),
+        ) else {
+            eprintln!("skipped: set CV_TEST_VIDEO/CV_TEST_FFMPEG to run");
+            return;
+        };
+        for (seconds, red) in [(0.0, true), (1.0, false)] {
+            let rgb = capture_small(&PathBuf::from(&ffmpeg), &PathBuf::from(&video), seconds, 32, 18)
+                .expect("capture_small must write RGB to stdout");
+            assert_eq!(rgb.len(), 32 * 18 * 3);
+            let center = ((18 / 2) * 32 + 32 / 2) * 3;
+            let got = &rgb[center..center + 3];
+            assert!(if red { got[0] > 200 && got[2] < 80 } else { got[2] > 200 && got[0] < 80 },
+                "缩略图 {seconds}s 颜色错误: {got:?}");
+        }
     }
 }

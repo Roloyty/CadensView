@@ -2,7 +2,7 @@
   "mcpServers": {
     "cadensview": {
       "command": "E:\\CadensView\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "shotlab.mcp_server"],
+      "args": ["-I", "-X", "utf8", "E:/CadensView/shotlab/mcp_server.py"],
       "env": {
         "PYTHONUTF8": "1",
         "PYTHONIOENCODING": "utf-8"

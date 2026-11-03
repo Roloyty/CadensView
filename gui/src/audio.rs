@@ -196,53 +196,72 @@ impl AudioHandle {
                 if generation_flag.load(Ordering::SeqCst) != generation || !alive.load(Ordering::Relaxed) {
                     break;
                 }
-                let child = match spawn_decoder(&video, start_s, duration, rate, channels) {
+                let mut child = match spawn_decoder(&video, start_s, duration, rate, channels) {
                     Ok(child) => child,
                     Err(error) => {
                         eprintln!("音频解码启动失败: {error}");
                         break;
                     }
                 };
-                let mut child = child;
                 let mut stdout = match child.stdout.take() {
                     Some(stdout) => stdout,
-                    None => break,
+                    None => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
                 };
-                *decoder.lock().unwrap() = Some(child);
+                // stop() 可能已换到新一代：旧线程不能把进程写进共享槽位。
+                {
+                    let mut slot = decoder.lock().unwrap();
+                    if generation_flag.load(Ordering::SeqCst) != generation {
+                        drop(slot);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    *slot = Some(child);
+                }
                 let capacity = (rate as f32 * channels as f32 * MAX_BUFFER_SECS) as usize;
                 let mut raw = vec![0u8; 8192];
+                // 缓冲满时保留未入队样本，不丢弃 chunk 尾部造成跳音。
+                let mut pending: VecDeque<f32> = VecDeque::new();
                 let mut reached_eof = false;
                 loop {
-                    use std::io::Read;
-                    match stdout.read(&mut raw) {
-                        Ok(0) => {
-                            reached_eof = true;
-                            break;
-                        }
-                        Ok(count) => {
-                            let mut queue = buffer.lock().unwrap();
-                            for chunk in raw[..count].chunks_exact(4) {
-                                if queue.len() >= capacity {
-                                    break;
-                                }
-                                queue.push_back(f32::from_le_bytes([
-                                    chunk[0], chunk[1], chunk[2], chunk[3],
-                                ]));
+                    if generation_flag.load(Ordering::SeqCst) != generation || !alive.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if pending.is_empty() {
+                        use std::io::Read;
+                        match stdout.read(&mut raw) {
+                            Ok(0) => {
+                                reached_eof = true;
+                                break;
                             }
-                            drop(queue);
-                            // 缓冲满时让出，避免把整段 PCM 一次性读进内存
-                            if buffer.lock().unwrap().len() >= capacity {
-                                thread::sleep(Duration::from_millis(20));
+                            Ok(count) => {
+                                pending.extend(raw[..count].chunks_exact(4).map(|chunk| {
+                                    f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                }));
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
+                    }
+                    let mut queue = buffer.lock().unwrap();
+                    drain_pending(&mut pending, &mut queue, capacity);
+                    let full = !pending.is_empty() || queue.len() >= capacity;
+                    drop(queue);
+                    if full {
+                        // 等播放线程消费，同时保持对 stop/换片的响应。
+                        thread::sleep(Duration::from_millis(5));
                     }
                 }
-                if let Some(mut child) = decoder.lock().unwrap().take() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
                 let still_current = generation_flag.load(Ordering::SeqCst) == generation;
+                if still_current {
+                    if let Some(mut child) = decoder.lock().unwrap().take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
                 if !(reached_eof && looping_flag.load(Ordering::Relaxed) && still_current) {
                     break;
                 }
@@ -291,6 +310,17 @@ fn spawn_decoder(
     command
         .spawn()
         .map_err(|error| format!("ffmpeg 启动失败: {error}"))
+}
+
+/// 把待入队样本搬到播放队列；容量不足时保留剩余，绝不丢样本。
+fn drain_pending(pending: &mut VecDeque<f32>, queue: &mut VecDeque<f32>, capacity: usize) {
+    while let Some(sample) = pending.front().copied() {
+        if queue.len() >= capacity {
+            break;
+        }
+        pending.pop_front();
+        queue.push_back(sample);
+    }
 }
 
 fn ffmpeg_path() -> PathBuf {
@@ -354,6 +384,19 @@ pub fn decode_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_buffer_keeps_unread_samples_in_order() {
+        let mut pending: VecDeque<f32> = (0..8).map(|v| v as f32).collect();
+        let mut queue = VecDeque::new();
+        drain_pending(&mut pending, &mut queue, 3);
+        assert_eq!(queue.iter().copied().collect::<Vec<_>>(), vec![0.0, 1.0, 2.0]);
+        assert_eq!(pending.len(), 5);
+        queue.pop_front();
+        drain_pending(&mut pending, &mut queue, 3);
+        assert_eq!(queue.iter().copied().collect::<Vec<_>>(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(pending.len(), 4, "未入队样本必须保留");
+    }
 
     #[test]
     fn decode_probe_reads_pcm_from_fixture() {

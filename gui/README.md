@@ -5,11 +5,13 @@
 ## 架构
 
 ```
-gui/src/main.rs     egui 界面与应用状态机（三栏：镜头列表 | 播放器 | 笔记）
+gui/src/main.rs     egui 界面与应用状态机（镜头列表 | 播放器 | 镜头/色彩面板；F11 独立分析页）
 gui/src/player.rs   FFmpeg 播放：连续播放 = rawvideo 流（按 PTS 节流），逐帧/seek = 单次 -ss 精取
 gui/src/rpc.rs      Python 边车客户端（stdin/stdout 按行 JSON-RPC，请求在后台线程）
 gui/src/detect.rs   spawn `python -m shotlab.onnx_worker`，读 stdout JSON-lines，退出码 3 自动 CPU 重试
-gui/src/model.rs    RPC 状态镜像、FrameIndex 视图（帧号 ↔ 时间）
+gui/src/model.rs    RPC 状态镜像、FrameIndex 视图（源时间原点、排他终点、帧号换算）
+gui/src/analysis.rs 独立分析工作区（剪辑/节奏/色彩、图表回看、范围标签）
+gui/src/boundary.rs 共享边界校正（输入/逐帧预览/应用或取消）
 shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / apply_detection
 ```
 
@@ -66,10 +68,11 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 |---|---|
 | 播放 | 连续播放/暂停、逐帧步进、帧轨 scrub（Ctrl+滚轮缩放/滚轮平移）、局部循环、缩放平移（1–16×，1.25×/步，光标锚定）、音频（音量/静音）、SRT 字幕叠层、A/B 对照 |
 | 检测 | TransNetV2 切镜（GPU DirectML/CPU 自适应、可取消、进度、失败自动 CPU 重试） |
-| 编辑 | 拆分/合并/移边界、笔记、撤销重做、保存/另存为（SQLite，官方 exe 兼容） |
+| 编辑 | 拆分/合并、共享边界精确校正（输入帧号、逐帧预览、应用/取消）、笔记、撤销重做、保存/另存为（SQLite；默认拒绝覆盖，确认后临时文件校验再替换） |
 | 缩略图 | 镜头列表行内缩略图（串行 worker+磁盘缓存+虚拟滚动） |
-| 统计 | ASL/MSL/σ/CV/百分位、时长直方图、切镜密度曲线、滑动平均 ASL、最密集切镜段落、快切连击、分段节奏表（编辑后自动失效重算） |
-| 色彩 | 镜头五主色调色板、全片秒级色带（可取消的后台分析） |
+| 分析 | 独立工作区（F11）：剪辑 / 节奏 / 色彩三主题，左指标右图表；柱、折线、色带可点击回看镜头与源帧；范围可选“全片已完成镜头”或“已标记镜头” |
+| 统计 | ASL/MSL/σ/CV/百分位、时长直方图、切镜密度、滑动平均 ASL、最密集切镜窗口、快切连击、分段节奏表（编辑后自动失效重算） |
+| 色彩 | 选中镜头五主色、全片秒级色带与代表帧（可取消后台任务）、当前范围镜头色板与相邻切换色差 |
 | 景别 | MobileNetV3 ONNX 五类识别（特写/大特写/全景/远景/中景），列表徽章显示 |
 | 标签 | 镜头标签 chips（Enter 添加、点击删除），随项目持久化，CSV 含标签列 |
 | 导出 | 当前帧 PNG、镜头 GIF（palettegen 高质量）、镜头 CSV、全片分析长图、PDF 联系表（分页） |
@@ -93,7 +96,8 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 | Ctrl+E | 截帧 PNG | Ctrl+Shift+E | 分析长图 |
 | Ctrl+A / Ctrl+Shift+A | 全选标记/清除标记 | Ctrl+O | 打开视频 |
 | Shift/Ctrl+点击镜头 | 范围标记 / 切换单个标记 | Alt+Enter | 视频模式 |
-| F11 | 全屏 | Esc | 关闭弹窗/退出模式/清标记 |
+| Ctrl+Shift+C | A/B 对照开关 | F11 | 分析工作区 |
+| Esc | 关闭弹窗/退出分析或视频模式/清标记 | | |
 
 ## 测试
 
@@ -102,16 +106,18 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 ..\.venv\Scripts\python -m pytest tests\ -q
 
 # Rust 侧（含播放帧精度夹具测试，需先生成夹具）
-..\.venv\Scripts\python ..	ests\make_fixture.py %TEMP%\cv-fixture
+..\.venv\Scripts\python ..\tests\make_fixture.py %TEMP%\cv-fixture
 cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
 ```
 
 ## 已知限制
 
-- 无音频、无字幕（分析模式静音播放）
+- 音频/字幕已接入，但长片音画漂移、暂停/seek 后的音画对齐仍缺真人长片验收；字幕仅实现 SRT，ASS 未解析
 - 逐帧取帧走 ffmpeg 单次启动，约 50–150ms/次；连续播放不受影响
-- 景别模型在真人电影数据（MovieShots）上训练，动画泛化未验证，置信度仅供参考
+- 景别模型在真人电影数据（MovieShots）上训练，动画泛化未验证，置信度仅供参考；模型与训练数据条款需分别核实，不能一概称“可商用”
+- 分析工作区范围只支持“全片已完成镜头 / 已标记镜头”；时间范围与 OP/ED 排除尚未暴露
 - `.shotlab` 项目格式与官方 exe 兼容（v1 schema + settings 扩展字段）
+- 尚未逐套主题截图验收、未做所有分辨率/密集点击的完整 GUI 验收
 
 ## Agent 调用（CLI + MCP）
 
@@ -119,16 +125,17 @@ cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
 
 ```powershell
 ..\.venv\Scripts\python -m shotlab.cli shots   <p.shotlab>
-..\.venv\Scripts\python -m shotlab.cli stats   <p.shotlab>
+..\.venv\Scripts\python -m shotlab.cli stats   <p.shotlab> [--shots 1,3]
 ..\.venv\Scripts\python -m shotlab.cli detect  <video.mkv> --save <p.shotlab> --device auto
 ..\.venv\Scripts\python -m shotlab.cli scale   <p.shotlab>
 ..\.venv\Scripts\python -m shotlab.cli palette <p.shotlab> --frame 120
 ..\.venv\Scripts\python -m shotlab.cli tags    <p.shotlab> set --shot 1 --tags 对话,夜景
-..\.venv\Scripts\python -m shotlab.cli export  csv|sheet|gif|frame --project <p.shotlab> ...
+..\.venv\Scripts\python -m shotlab.cli export  csv|sheet|pdf|gif|frame --project <p.shotlab> [--shots 1,3] ...
 ```
 
-**MCP**（stdio，11 个工具：cv_shots/cv_stats/cv_detect/cv_palette/cv_scale/cv_tags/
-cv_analysis/cv_export_csv/cv_contact_sheet/cv_export_gif/cv_export_frame）：
+**MCP**（stdio，13 个工具：cv_shots/cv_stats/cv_detect/cv_palette/cv_scale/cv_tags/
+cv_analysis/cv_export_csv/cv_contact_sheet/cv_export_pdf/cv_export_gif/cv_export_frame/cv_subtitles）：
 
-- 项目根目录 `.mcp.json` 已注册（指向本 venv 的 `-m shotlab.mcp_server`）
+- 项目根目录 `.mcp.json` 已注册（绝对脚本 + `-I`，从任意 cwd 启动；已实测 initialize/tools.list）
+- `cv_stats` / `cv_analysis` / CSV / 长图 / PDF 支持可选 `shot_ids`（取自 `cv_shots`）；省略=全部已完成镜头，空列表被拒绝
 - 在支持项目级 MCP 配置的客户端里打开本仓库即自动生效；或手动把同一段配置加入客户端

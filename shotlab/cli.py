@@ -1,22 +1,26 @@
 """CadensView CLI——给 agent / 脚本调用的命令行分析工具。
 
 所有命令输出 JSON（stdout），错误输出 {"ok": false, "error": ...}（stderr + 非零退出码）。
-项目打开自 .shotlab 文件；视频命令内部建索引并缓存（%TEMP%/cadensview/cli/）。
+项目打开自 .shotlab 文件；检测索引缓存于 ~/.cadensview-cli/index/。
+任意工作目录启动：
+    E:/CadensView/.venv/Scripts/python.exe -I -X utf8 E:/CadensView/shotlab/cli.py <命令>
+仓库根目录也可使用 python -m shotlab.cli <命令>。
 
-用法示例：
+用法示例（cv 表示上述入口）：
     cv shots E:/p.shotlab
-    cv stats E:/p.shotlab
+    cv stats E:/p.shotlab --shots 1,3
     cv detect E:/movie.mkv --save E:/p.shotlab
     cv scale E:/p.shotlab
     cv palette E:/p.shotlab --frame 120
     cv tags E:/p.shotlab set --shot 1 --tags 对话,夜景
-    cv export-csv E:/p.shotlab E:/out/汇总.csv
-    cv export-sheet E:/p.shotlab E:/out/长图.png --columns 5
-    cv export-gif E:/p.shotlab --shot 2 E:/out/s2.gif
-    cv export-frame E:/p.shotlab --frame 120 E:/out/f.png
+    cv export csv E:/out/汇总.csv --project E:/p.shotlab --shots 1,3
+    cv export sheet E:/out/长图.png --project E:/p.shotlab --columns 5
+    cv export gif E:/out/s2.gif --project E:/p.shotlab --shot 2
+    cv export frame E:/out/f.png --project E:/p.shotlab --frame 120
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import subprocess
@@ -27,8 +31,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from shotlab.rpc import Session, serve  # noqa: E402
-from shotlab.storage import ProjectStore  # noqa: E402
+from shotlab.rpc import Session  # noqa: E402
 
 FFMPEG = REPO_ROOT / "tools" / "ffmpeg.exe"
 WEIGHTS = REPO_ROOT / "models" / "transnet-split.onnx"
@@ -43,10 +46,17 @@ def _out(payload, pretty=False):
     print(json.dumps(payload, ensure_ascii=False, indent=indent))
 
 
-def _open_session(args) -> Session:
+@contextmanager
+def _session(project=None):
+    """Own one command's session, including cleanup when opening or work fails."""
     session = Session()
-    session.open_project(args.project)
-    return session
+    try:
+        if project is not None:
+            session.open_project(project)
+        yield session
+    finally:
+        # This only releases the store; it does not build a state snapshot.
+        session.close_current_store()
 
 
 def _save(session):
@@ -58,17 +68,17 @@ def _save(session):
 
 
 def _cli_index(video: str, limit=None):
-    session = Session()
-    result = session.build_index(video, limit=limit)
-    index = result["index"]
-    return {
-        "video": result["video_path"],
-        "frames": len(index["pts"]),
-        "complete": index["complete"],
-        "width": index["metadata"].get("width"),
-        "height": index["metadata"].get("height"),
-        "duration_s": round(index["metadata"].get("duration_us", 0) / 1e6, 2),
-    }
+    with _session() as session:
+        result = session.build_index(video, limit=limit)
+        index = result["index"]
+        return {
+            "video": result["video_path"],
+            "frames": len(index["pts"]),
+            "complete": index["complete"],
+            "width": index["metadata"].get("width"),
+            "height": index["metadata"].get("height"),
+            "duration_s": round((index["metadata"].get("duration_us") or 0) / 1e6, 2),
+        }
 
 
 def _cli_detect(video: str, device="auto", save=None):
@@ -83,109 +93,124 @@ def _cli_detect(video: str, device="auto", save=None):
     cache_dir.mkdir(parents=True, exist_ok=True)
     index_json = cache_dir / f"{digest}.json"
 
-    session = Session()
-    if index_json.exists():
-        from t0.media import FrameIndex
-        session.index = FrameIndex(**json.loads(index_json.read_text(encoding="utf-8")))
-        session.index.verify_source()
-        session.video_path = str(path.resolve())
-    else:
-        session.build_index(str(path))
-        index_json.write_text(json.dumps(session.index.__dict__), encoding="utf-8")
+    with _session() as session:
+        if index_json.exists():
+            from t0.media import FrameIndex
+            session.index = FrameIndex(**json.loads(index_json.read_text(encoding="utf-8")))
+            session.index.verify_source()
+            session.video_path = str(path.resolve())
+        else:
+            session.build_index(str(path))
+            index_json.write_text(json.dumps(session.index.__dict__), encoding="utf-8")
 
-    session.new_project()
-    out_dir = cache_dir / f"det-{digest}-{int(time.time())}"
-    worker = subprocess.run(
-        [sys.executable, "-m", "shotlab.onnx_worker",
-         "--index", str(index_json), "--out", str(out_dir),
-         "--weights", str(WEIGHTS), "--device", device],
-        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=3600)
-    if worker.returncode == 3:
-        # GPU 失败 → CPU 重试一次（协议约定）
-        out_dir = cache_dir / f"det-{digest}-cpu-{int(time.time())}"
+        session.new_project()
+        out_dir = cache_dir / f"det-{digest}-{int(time.time())}"
         worker = subprocess.run(
             [sys.executable, "-m", "shotlab.onnx_worker",
              "--index", str(index_json), "--out", str(out_dir),
-             "--weights", str(WEIGHTS), "--device", "cpu"],
-            cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=3600)
-    if worker.returncode != 0:
-        raise CliError(f"检测失败（退出码 {worker.returncode}）: {worker.stdout[-300:]}")
-    state = session.apply_detection(str(out_dir))
-    payload = {"shots": state["shots"], "frame_count": state["frame_count"]}
-    if save:
-        session.save_as(save)
-        payload["project"] = session.project_path
-    return payload
+             "--weights", str(WEIGHTS), "--device", device],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, encoding="utf-8", timeout=3600)
+        if worker.returncode == 3:
+            # GPU 失败 → CPU 重试一次（协议约定）
+            out_dir = cache_dir / f"det-{digest}-cpu-{int(time.time())}"
+            worker = subprocess.run(
+                [sys.executable, "-m", "shotlab.onnx_worker",
+                 "--index", str(index_json), "--out", str(out_dir),
+                 "--weights", str(WEIGHTS), "--device", "cpu"],
+                cwd=str(REPO_ROOT), capture_output=True, text=True, encoding="utf-8", timeout=3600)
+        if worker.returncode != 0:
+            raise CliError(f"检测失败（退出码 {worker.returncode}）: {worker.stdout[-300:]}")
+        state = session.apply_detection(str(out_dir))
+        payload = {"shots": state["shots"], "frame_count": state["frame_count"]}
+        if save:
+            session.save_as(save)
+            payload["project"] = session.project_path
+        return payload
 
 
 def _cli_export_gif(project: str, shot_number: int, out: str):
-    session = _open_session_args(project)
-    shots = [s for s in session.state()["shots"] if not s["pending"]]
-    shot = next((s for s in shots if s["number"] == shot_number - 1), None)
-    if shot is None:
-        raise CliError(f"镜头 {shot_number} 不存在或未完成")
-    index = session.index
-    start_s = float(index.pts[shot["start"]] * index.tb)
-    end_s = float(index.pts[shot["end"] - 1] * index.tb) + float(index.durations[shot["end"] - 1] * index.tb)
-    duration = end_s - start_s
-    output = subprocess.run(
-        [str(FFMPEG), "-nostdin", "-loglevel", "error",
-         "-ss", f"{start_s:.6f}", "-t", f"{duration:.6f}",
-         "-i", index.path,
-         "-vf", "fps=12,scale=480:-1:flags=lanczos,split[a][b];"
-                "[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=3",
-         "-loop", "0", out],
-        capture_output=True, text=True, timeout=600)
-    out_path = Path(out)
-    if output.returncode != 0 or not out_path.exists():
-        raise CliError(f"GIF 导出失败: {output.stderr[-300:]}")
-    return {"path": str(out_path.resolve()), "size_kb": out_path.stat().st_size // 1024,
-            "duration_s": round(duration, 3)}
-
-
-def _open_session_args(project):
-    """按参数打开项目；也接受无扩展名路径。"""
-    session = Session()
-    session.open_project(project)
-    return session
+    with _session(project) as session:
+        shots = [s for s in session.state()["shots"] if not s["pending"]]
+        shot = next((s for s in shots if s["number"] == shot_number - 1), None)
+        if shot is None:
+            raise CliError(f"镜头 {shot_number} 不存在或未完成")
+        index = session.index
+        start_s = float(index.pts[shot["start"]] * index.tb)
+        end_s = float(index.pts[shot["end"] - 1] * index.tb) + float(index.durations[shot["end"] - 1] * index.tb)
+        duration = end_s - start_s
+        output = subprocess.run(
+            [str(FFMPEG), "-nostdin", "-loglevel", "error",
+             "-ss", f"{start_s:.6f}", "-t", f"{duration:.6f}",
+             "-i", index.path,
+             "-vf", "fps=12,scale=480:-1:flags=lanczos,split[a][b];"
+                    "[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=3",
+             "-loop", "0", out],
+            capture_output=True, text=True, encoding="utf-8", timeout=600)
+        out_path = Path(out)
+        if output.returncode != 0 or not out_path.exists():
+            raise CliError(f"GIF 导出失败: {output.stderr[-300:]}")
+        return {"path": str(out_path.resolve()), "size_kb": out_path.stat().st_size // 1024,
+                "duration_s": round(duration, 3)}
 
 
 def _cli_export_frame(project: str, frame: int, out: str):
-    session = _open_session_args(project)
-    index = session.index
-    frame = max(0, min(frame, len(index.pts) - 1))
-    seconds = float(index.pts[frame] * index.tb)
-    output = subprocess.run(
-        [str(FFMPEG), "-nostdin", "-loglevel", "error",
-         "-ss", f"{seconds:.6f}", "-i", index.path,
-         "-map", "0:v:0", "-an", "-frames:v", "1", out],
-        capture_output=True, text=True, timeout=120)
-    out_path = Path(out)
-    if output.returncode != 0 or not out_path.exists():
-        raise CliError(f"截帧失败: {output.stderr[-300:]}")
-    return {"path": str(out_path.resolve()), "frame": frame}
+    with _session(project) as session:
+        index = session.index
+        frame = max(0, min(frame, len(index.pts) - 1))
+        seconds = float(index.pts[frame] * index.tb)
+        output = subprocess.run(
+            [str(FFMPEG), "-nostdin", "-loglevel", "error",
+             "-ss", f"{seconds:.6f}", "-i", index.path,
+             "-map", "0:v:0", "-an", "-frames:v", "1", out],
+            capture_output=True, text=True, encoding="utf-8", timeout=120)
+        out_path = Path(out)
+        if output.returncode != 0 or not out_path.exists():
+            raise CliError(f"截帧失败: {output.stderr[-300:]}")
+        return {"path": str(out_path.resolve()), "frame": frame}
 
 
 # -- 子命令表 -----------------------------------------------------------------
 
+def _parse_shot_numbers(value):
+    try:
+        numbers = [int(part.strip()) for part in value.split(",")]
+        if not numbers or any(number < 1 for number in numbers):
+            raise ValueError()
+    except ValueError:
+        raise argparse.ArgumentTypeError("镜头编号须为逗号分隔的正整数，例如 1,3") from None
+    return numbers
+
+
+def _selection_params(session, shot_numbers):
+    if shot_numbers is None:
+        return {}
+    by_number = {shot["number"] + 1: shot for shot in session.state()["shots"]}
+    shot_ids = []
+    for number in shot_numbers:
+        shot = by_number.get(number)
+        if shot is None:
+            raise CliError(f"镜头 {number} 不存在")
+        shot_ids.append(shot["id"])
+    return {"shot_ids": shot_ids}
+
+
 def cmd_shots(args):
-    session = _open_session_args(args.project)
-    state = session.state()
-    return {"video": state["video_path"], "project": state["project_path"],
-            "frame_count": state["frame_count"], "shots": state["shots"]}
+    with _session(args.project) as session:
+        state = session.state()
+        return {"video": state["video_path"], "project": state["project_path"],
+                "frame_count": state["frame_count"], "shots": state["shots"]}
 
 
 def cmd_stats(args):
-    session = _open_session_args(args.project)
-    from shotlab.statistics import build_context
-    from shotlab.statistics.shots import shot_statistics
-    context = build_context(session.project, session.index)
-    return shot_statistics(context)
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS
+        return METHODS["stats.run"](
+            session, _selection_params(session, args.shots), None)
 
 
 def cmd_palette(args):
-    session = _open_session_args(args.project)
-    return _palette_one(session, args.frame)
+    with _session(args.project) as session:
+        return _palette_one(session, args.frame)
 
 
 def _palette_one(session, frame):
@@ -196,32 +221,32 @@ def _palette_one(session, frame):
 
 
 def cmd_scale(args):
-    session = _open_session_args(args.project)
-    result = session.scale_run()
-    if args.project and session.store is not None:
+    with _session(args.project) as session:
+        result = session.scale_run()
         _save(session)
-    return result
+        return result
 
 
 def cmd_tags(args):
-    session = _open_session_args(args.project)
-    shots = session.state()["shots"]
-    if args.action == "list":
-        return {"tags": {s["number"] + 1: s["tags"] for s in shots if s["tags"]}}
-    by_number = {s["number"] + 1: s for s in shots}
-    shot = by_number.get(args.shot)
-    if shot is None:
-        raise CliError(f"镜头 {args.shot} 不存在")
-    if args.action == "set":
-        tags = sorted({t.strip() for t in args.tags.split(",") if t.strip()})
-        session.shot_tags[shot["id"]] = tags
-    elif args.action == "remove":
-        tags = [t for t in session.shot_tags.get(shot["id"], []) if t != args.tag]
-        session.shot_tags[shot["id"]] = tags if tags else None
-        if not tags:
-            session.shot_tags.pop(shot["id"], None)
-    _save(session)
-    return {"shot": args.shot, "tags": session.shot_tags.get(shot["id"], [])}
+    with _session(args.project) as session:
+        shots = session.state()["shots"]
+        if args.action == "list":
+            return {"tags": {s["number"] + 1: s["tags"] for s in shots if s["tags"]}}
+        by_number = {s["number"] + 1: s for s in shots}
+        shot = by_number.get(args.shot)
+        if shot is None:
+            raise CliError(f"镜头 {args.shot} 不存在")
+        if args.action == "set":
+            tags = sorted({t.strip() for t in args.tags.split(",") if t.strip()})
+            session.shot_tags[shot["id"]] = tags
+        elif args.action == "remove":
+            tags = [t for t in session.shot_tags.get(shot["id"], []) if t != args.tag]
+            if tags:
+                session.shot_tags[shot["id"]] = tags
+            else:
+                session.shot_tags.pop(shot["id"], None)
+        _save(session)
+        return {"shot": args.shot, "tags": session.shot_tags.get(shot["id"], [])}
 
 
 def cmd_detect(args):
@@ -233,34 +258,36 @@ def cmd_index(args):
 
 
 def cmd_export(args):
-    if args.kind == "csv":
-        session = _open_session_args(args.project)
-        from shotlab.rpc import METHODS
-        return METHODS["export.shots_csv"](session, {"path": args.out}, None)
-    if args.kind == "sheet":
-        session = _open_session_args(args.project)
-        from shotlab.rpc import METHODS
-        return METHODS["export.contact_sheet"](session, {"path": args.out, "columns": args.columns}, None)
-    if args.kind == "pdf":
-        session = _open_session_args(args.project)
-        from shotlab.rpc import METHODS
-        return METHODS["export.pdf_sheet"](session, {"path": args.out, "columns": args.columns}, None)
+    methods = {"csv": "export.shots_csv", "sheet": "export.contact_sheet", "pdf": "export.pdf_sheet"}
+    if args.kind in methods:
+        with _session(args.project) as session:
+            from shotlab.rpc import METHODS
+            params = {"path": args.out, **_selection_params(session, args.shots)}
+            if args.kind != "csv":
+                params["columns"] = args.columns
+            return METHODS[methods[args.kind]](session, params, None)
+    if args.shots is not None:
+        raise CliError("--shots 仅适用于 csv/sheet/pdf 导出")
     if args.kind == "gif":
+        if args.shot is None or args.shot < 1:
+            raise CliError("GIF 导出须指定 --shot 正整数镜头编号")
         return _cli_export_gif(args.project, args.shot, args.out)
     if args.kind == "frame":
+        if args.frame is None:
+            raise CliError("截帧导出须指定 --frame")
         return _cli_export_frame(args.project, args.frame, args.out)
     raise CliError(f"未知导出类型: {args.kind}")
 
 
 def cmd_subtitles(args):
-    session = _open_session_args(args.project)
-    from shotlab.rpc import METHODS
-    loaded = METHODS["subtitles.load"](session, {"path": args.srt}, None)
-    payload = {"cues": loaded["cues"]}
-    if args.at is not None:
-        found = METHODS["subtitles.at"](session, {"timestamp_us": int(args.at * 1_000_000)}, None)
-        payload["text"] = found["text"]
-    return payload
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS
+        loaded = METHODS["subtitles.load"](session, {"path": args.srt}, None)
+        payload = {"cues": loaded["cues"]}
+        if args.at is not None:
+            found = METHODS["subtitles.at"](session, {"timestamp_us": int(args.at * 1_000_000)}, None)
+            payload["text"] = found["text"]
+        return payload
 
 
 def cmd_version(_args):
@@ -288,6 +315,8 @@ def build_parser():
 
     p = sub.add_parser("stats", help="剪辑统计（ASL/分布/密度）")
     p.add_argument("project")
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None,
+                   help="选择镜头编号（1 起，逗号分隔）；省略则分析全部已完成镜头")
     p.set_defaults(fn=cmd_stats)
 
     p = sub.add_parser("palette", help="单帧五色调色板")
@@ -307,10 +336,12 @@ def build_parser():
     p.add_argument("--tag", default=None, help="单个标签（remove）")
     p.set_defaults(fn=cmd_tags)
 
-    p = sub.add_parser("export", help="导出 csv|sheet|gif|frame")
+    p = sub.add_parser("export", help="导出 csv|sheet|pdf|gif|frame")
     p.add_argument("kind", choices=("csv", "sheet", "pdf", "gif", "frame"))
     p.add_argument("out")
     p.add_argument("--project", required=True)
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None,
+                   help="csv/sheet/pdf 选择镜头编号（1 起，逗号分隔）；省略则导出全部已完成镜头")
     p.add_argument("--columns", type=int, default=5, help="长图列数")
     p.add_argument("--shot", type=int, default=None, help="镜头编号（gif）")
     p.add_argument("--frame", type=int, default=None, help="帧号（frame）")
