@@ -62,6 +62,7 @@ pub struct IndexMetadata {
     pub height: Option<u32>,
     pub duration_us: Option<f64>,
     pub average_rate: Option<String>,
+    pub audio_tracks: Option<u32>,
 }
 
 impl IndexInfo {

@@ -1,6 +1,7 @@
 //! CadensView 二开 GUI：egui 前端 + FFmpeg 播放 + shotlab Python 边车。
 //! 所有 RPC 调用都在工作线程执行，UI 线程只消费 UiMsg。
 
+mod audio;
 mod detect;
 mod model;
 mod player;
@@ -106,6 +107,14 @@ struct App {
     loop_active: bool,
     subtitle_loaded: bool,
     subtitle_text: Option<String>,
+    // -- 缩放平移 --------------------------------------------------------------
+    zoom: f32,
+    pan: egui::Vec2,
+    // -- 音频 ----------------------------------------------------------------
+    audio: Option<audio::AudioHandle>,
+    volume: f32,
+    muted: bool,
+    last_frame: u64,
 }
 
 impl App {
@@ -177,6 +186,12 @@ impl App {
             loop_active: false,
             subtitle_loaded: false,
             subtitle_text: None,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            audio: audio::AudioHandle::spawn(),
+            volume: 0.8,
+            muted: false,
+            last_frame: 0,
         };
         // 缩略图 worker：消费 ThumbOutcome 后发到主消息泵。
         let (thumb_done_tx, thumb_done_rx) = std::sync::mpsc::channel::<thumb::ThumbOutcome>();
@@ -352,6 +367,37 @@ impl App {
                 self.call_subtitle(us);
             }
         }
+    }
+
+    /// 起播音频（与视频同一时间点）。无音轨时静默跳过。
+    fn start_audio(&self, frame: u64) {
+        let (Some(audio), Some(index), Some(video)) =
+            (&self.audio, &self.index, self.state.video_path.as_ref())
+        else {
+            return;
+        };
+        if index.metadata.audio_tracks.unwrap_or(0) == 0 {
+            return;
+        }
+        audio.set_volume(self.volume);
+        audio.set_muted(self.muted);
+        audio.play(Path::new(video), index.seconds(frame.min(index.frames().saturating_sub(1))));
+    }
+
+    fn start_audio_loop(&self, start: u64, end: u64) {
+        let (Some(audio), Some(index), Some(video)) =
+            (&self.audio, &self.index, self.state.video_path.as_ref())
+        else {
+            return;
+        };
+        if index.metadata.audio_tracks.unwrap_or(0) == 0 {
+            return;
+        }
+        let start_s = index.seconds(start.min(index.frames().saturating_sub(1)));
+        let end_s = index.seconds(end.min(index.frames().saturating_sub(1)));
+        audio.set_volume(self.volume);
+        audio.set_muted(self.muted);
+        audio.play_loop(Path::new(video), start_s, (end_s - start_s).max(0.05));
     }
 
     fn call_subtitle(&self, timestamp_us: i64) {
@@ -671,6 +717,16 @@ impl App {
     fn on_player_msg(&mut self, message: player::PlayerMsg) {
         match message {
             player::PlayerMsg::Frame { frame, width, height, rgba } => {
+                // 循环播放重启：帧号回跳时音频同步重起（视频流由 player 内部重启）
+                if self.loop_active && frame < self.last_frame {
+                    if let Some(shot) = self.state.shots.iter()
+                        .find(|s| s.id == self.state.selected_id && !s.pending)
+                        .cloned()
+                    {
+                        self.start_audio_loop(shot.start, shot.end);
+                    }
+                }
+                self.last_frame = frame;
                 self.pending_image = Some((width, height, rgba));
                 self.ui_frame = frame;
                 if let Some(marker) = self.playback_marker.as_mut() {
@@ -682,6 +738,9 @@ impl App {
             player::PlayerMsg::Ended => {
                 if let Some(marker) = self.playback_marker.as_mut() {
                     marker.set(false);
+                }
+                if let Some(audio) = &self.audio {
+                    audio.stop();
                 }
                 let frame = self.player.as_ref().map(|p| p.frame()).unwrap_or(0);
                 self.commit_cursor(frame);
@@ -1547,14 +1606,48 @@ impl App {
 
     fn player_panel(&mut self, ui: &mut egui::Ui) {
         let frames = self.index.as_ref().map(|i| i.frames()).unwrap_or(1).max(1);
-        match &self.texture {
-            Some(texture) => {
-                let size = texture.size_vec2();
-                ui.add(
-                    egui::Image::new(egui::load::SizedTexture::new(texture.id(), size))
-                        .max_width(ui.available_width())
-                        .maintain_aspect_ratio(true),
-                );
+        // 画面区：滚轮缩放（1×–8×）、拖拽平移、双击复位。
+        let texture_id = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
+        match texture_id {
+            Some((id, image_size)) => {
+                let avail_w = ui.available_width().max(64.0);
+                let avail_h = (ui.available_height() - 150.0).max(140.0);
+                let fit = (avail_w / image_size.x).min(avail_h / image_size.y);
+                let display = image_size * fit;
+                let (rect, response) =
+                    ui.allocate_exact_size(display, egui::Sense::click_and_drag());
+
+                if response.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.5 {
+                        self.zoom = (self.zoom * (1.0 + scroll * 0.0015)).clamp(1.0, 8.0);
+                        clamp_pan(&mut self.pan, self.zoom);
+                    }
+                }
+                if response.dragged() && self.zoom > 1.0 {
+                    let delta = response.drag_delta();
+                    self.pan.x -= delta.x * (1.0 / self.zoom) / display.x;
+                    self.pan.y -= delta.y * (1.0 / self.zoom) / display.y;
+                    clamp_pan(&mut self.pan, self.zoom);
+                }
+                if response.double_clicked() {
+                    self.zoom = 1.0;
+                    self.pan = egui::Vec2::ZERO;
+                }
+
+                let half = 0.5 / self.zoom;
+                let center = egui::pos2(0.5 + self.pan.x, 0.5 + self.pan.y);
+                let uv = egui::Rect::from_center_size(center, egui::vec2(2.0 * half, 2.0 * half));
+                ui.painter_at(rect).image(id, rect, uv, egui::Color32::WHITE);
+                if self.zoom > 1.001 {
+                    ui.painter_at(rect).text(
+                        rect.right_top() + egui::vec2(-8.0, 6.0),
+                        egui::Align2::RIGHT_TOP,
+                        format!("{:.0}%", self.zoom * 100.0),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_white_alpha(200),
+                    );
+                }
             }
             None => {
                 ui.centered_and_justified(|ui| ui.label("打开视频后在此播放（静音分析模式）"));
@@ -1581,9 +1674,16 @@ impl App {
                         let frame = player.frame();
                         player.stop();
                         player.show(frame);
+                        if let Some(audio) = &self.audio {
+                            audio.stop();
+                        }
+                        self.loop_active = false;
                         self.commit_cursor(frame);
                     } else {
-                        player.play(self.ui_frame.min(frames - 1));
+                        let frame = self.ui_frame.min(frames - 1);
+                        player.play(frame);
+                        // 音频与视频用同一时间点起播（静音视频自动跳过）
+                        self.start_audio(frame);
                     }
                 }
             }
@@ -1615,11 +1715,15 @@ impl App {
                             player.stop();
                             player.show(self.ui_frame);
                         }
+                        if let Some(audio) = &self.audio {
+                            audio.stop();
+                        }
                     } else {
                         self.loop_active = true;
                         if let Some(player) = &self.player {
                             player.play_loop(loop_start, loop_end);
                         }
+                        self.start_audio_loop(loop_start, loop_end);
                     }
                 }
             }
@@ -1631,6 +1735,26 @@ impl App {
                 {
                     self.call_quiet("subtitles.load", json!({"path": path.to_string_lossy()}));
                     self.subtitle_loaded = true;
+                }
+            }
+            // 音量（无音频设备或无音轨时禁用）
+            let has_audio = self.audio.is_some()
+                && self.index.as_ref().map(|i| i.metadata.audio_tracks.unwrap_or(0) > 0).unwrap_or(false);
+            if has_audio {
+                let mute_label = if self.muted { "🔇" } else { "🔊" };
+                if ui.button(mute_label).clicked() {
+                    self.muted = !self.muted;
+                    if let Some(audio) = &self.audio {
+                        audio.set_muted(self.muted);
+                    }
+                }
+                let response = ui.add(
+                    egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false),
+                );
+                if response.changed() {
+                    if let Some(audio) = &self.audio {
+                        audio.set_volume(self.volume);
+                    }
                 }
             }
             ui.separator();
@@ -1969,6 +2093,13 @@ impl App {
     }
 }
 
+/// 把平移量限制在缩放后的可视范围内（uv 中心不得露出画面外）。
+fn clamp_pan(pan: &mut egui::Vec2, zoom: f32) {
+    let limit = (0.5 - 0.5 / zoom).max(0.0);
+    pan.x = pan.x.clamp(-limit, limit);
+    pan.y = pan.y.clamp(-limit, limit);
+}
+
 /// 等比缩放：把 source 尺寸装进 target 框（居中显示用）。
 fn fit_into(target: egui::Vec2, source: egui::Vec2) -> egui::Vec2 {
     if source.x <= 0.0 || source.y <= 0.0 {
@@ -2024,5 +2155,34 @@ mod tests {
         assert_ne!(first, second);
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::clamp_pan;
+    use eframe::egui;
+
+    #[test]
+    fn zoom_one_forces_zero_pan() {
+        let mut pan = egui::vec2(0.4, -0.3);
+        clamp_pan(&mut pan, 1.0);
+        assert_eq!(pan, egui::Vec2::ZERO, "1× 时不允许平移");
+    }
+
+    #[test]
+    fn zoom_two_allows_quarter_shift() {
+        let mut pan = egui::vec2(0.9, -0.9);
+        clamp_pan(&mut pan, 2.0);
+        // 2× 时可见范围 0.5，中心最多偏移 ±0.25
+        assert!((pan.x - 0.25).abs() < 1e-6);
+        assert!((pan.y + 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zoom_eight_limits() {
+        let mut pan = egui::vec2(10.0, 10.0);
+        clamp_pan(&mut pan, 8.0);
+        assert!((pan.x - 0.4375).abs() < 1e-6, "0.5 - 0.5/8 = 0.4375");
     }
 }

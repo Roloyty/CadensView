@@ -21,6 +21,9 @@ with av.open(str(video), "w") as container:
     stream.width, stream.height, stream.pix_fmt = 160, 90, "yuv444p"
     stream.codec_context.colorspace, stream.codec_context.color_range = 1, 1
     stream.codec_context.color_primaries, stream.codec_context.color_trc = 1, 13
+    # 音轨必须在任何 mux 之前创建
+    audio = container.add_stream("pcm_s16le", rate=48000)
+    audio.layout = "stereo"
     for number in range(48):
         array = np.zeros((90, 160, 3), np.uint8)
         array[:] = [255, 0, 0] if number < 24 else [0, 0, 255]
@@ -30,6 +33,18 @@ with av.open(str(video), "w") as container:
         for packet in stream.encode(frame):
             container.mux(packet)
     for packet in stream.encode():
+        container.mux(packet)
+    # 440Hz 正弦音轨（音频测试用；不影响视频帧内容）
+    sample_rate = 48000
+    t = np.arange(sample_rate * 2) / sample_rate
+    tone = (np.sin(2 * np.pi * 440 * t) * 0.3 * 32767).astype(np.int16)
+    interleaved = np.stack([tone, tone], axis=1).reshape(1, -1)
+    frame = av.AudioFrame.from_ndarray(interleaved, format="s16", layout="stereo")
+    frame.sample_rate = sample_rate
+    frame.pts = 0
+    for packet in audio.encode(frame):
+        container.mux(packet)
+    for packet in audio.encode():
         container.mux(packet)
 
 index = build_index(str(video))
