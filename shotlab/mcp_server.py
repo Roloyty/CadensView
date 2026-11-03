@@ -177,6 +177,35 @@ def cv_export_frame(project: str, frame: int, out_path: str) -> str:
 
 
 @mcp.tool()
+def cv_export_pdf(project: str, out_path: str, columns: int = 4) -> str:
+    """全镜头 PDF 联系表（分页，编号+时长+标签+景别）。"""
+    try:
+        session = _open(project)
+        from shotlab.rpc import METHODS
+        return _dump(METHODS["export.pdf_sheet"](
+            session, {"path": out_path, "columns": columns}, None))
+    except Exception as error:  # noqa: BLE001
+        return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+@mcp.tool()
+def cv_subtitles(project: str, srt_path: str, at_seconds: float = -1.0) -> str:
+    """加载 SRT 字幕；at_seconds>=0 时同时返回该时刻台词。"""
+    try:
+        session = _open(project)
+        from shotlab.rpc import METHODS
+        loaded = METHODS["subtitles.load"](session, {"path": srt_path}, None)
+        payload = {"cues": loaded["cues"]}
+        if at_seconds >= 0:
+            found = METHODS["subtitles.at"](
+                session, {"timestamp_us": int(at_seconds * 1_000_000)}, None)
+            payload["text"] = found["text"]
+        return _dump(payload)
+    except Exception as error:  # noqa: BLE001
+        return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+@mcp.tool()
 def cv_analysis(project: str) -> str:
     """全片色彩分析（秒级色带样本 + 镜头色板 + 代表帧），耗时与视频长度成正比。"""
     try:

@@ -498,3 +498,53 @@ class CliTests(unittest.TestCase):
         payload = json.loads(result.stderr)
         self.assertFalse(payload["ok"])
         self.assertIn("error", payload)
+
+
+class SubtitleAndPdfTests(unittest.TestCase):
+    """SRT 字幕解析 + PDF 联系表（逆向原版 subtitles.pyc / contact_sheet.pyc 移植）。"""
+
+    def setUp(self):
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.video_path = video(Path(self.directory.name) / "clip.mkv")
+
+    def _session_with_shots(self):
+        session = Session()
+        session.build_index(str(self.video_path))
+        session.new_project()
+        session.project.extend_analysis([24], complete=True)
+        return session
+
+    def test_srt_parse_and_lookup(self):
+        from shotlab.rpc import METHODS
+        srt = Path(self.directory.name) / "test.srt"
+        # 末尾故意不留空行：解析器必须 flush 最后一条
+        srt.write_text(
+            "1\n00:00:00,000 --> 00:00:00,500\n第一句\n\n"
+            "2\n00:00:00,500 --> 00:00:01,000\n第二句\n\n"
+            "3\n00:00:01,000 --> 00:00:01,500\n<i>第三句</i>",
+            encoding="utf-8")
+        session = self._session_with_shots()
+        loaded = METHODS["subtitles.load"](session, {"path": str(srt)}, None)
+        self.assertEqual(loaded["cues"], 3, "末尾无空行的最后一条也必须解析")
+        # 时间点查询
+        self.assertEqual(METHODS["subtitles.at"](session, {"timestamp_us": 200_000}, None)["text"], "第一句")
+        self.assertEqual(METHODS["subtitles.at"](session, {"timestamp_us": 1_200_000}, None)["text"], "第三句",
+                         "HTML 标签必须剥掉")
+        self.assertIsNone(METHODS["subtitles.at"](session, {"timestamp_us": 9_000_000}, None)["text"])
+
+    def test_pdf_sheet_is_valid_pdf(self):
+        from shotlab.rpc import METHODS
+        session = self._session_with_shots()
+        out = Path(self.directory.name) / "sheet.pdf"
+        result = METHODS["export.pdf_sheet"](session, {"path": str(out)}, None)
+        self.assertTrue(out.exists())
+        self.assertEqual(out.read_bytes()[:4], b"%PDF")
+        self.assertGreaterEqual(result["written"], 1)
+        self.assertGreaterEqual(result["pages"], 1)
+
+    def test_move_boundary_rpc(self):
+        from shotlab.rpc import METHODS
+        session = self._session_with_shots()
+        state = METHODS["edit.move_boundary"](session, {"boundary": 1, "frame": 30}, None)
+        self.assertEqual([(s["start"], s["end"]) for s in state["shots"]], [(0, 30), (30, 48)])

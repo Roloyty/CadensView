@@ -37,6 +37,7 @@ enum UiMsg {
     Thumb(thumb::ThumbOutcome),
     AbCaptured { slot: usize, frame: u64, width: usize, height: usize, rgba: Vec<u8> },
     ExportSaved(String),
+    SubtitleText(Option<String>),
 }
 
 /// 右侧面板的三个页签。
@@ -101,6 +102,10 @@ struct App {
     ab_alpha: f32,
     ab_blend: Option<TextureHandle>,
     ab_blend_dirty: bool,
+    // -- 局部循环与字幕 ----------------------------------------------------------
+    loop_active: bool,
+    subtitle_loaded: bool,
+    subtitle_text: Option<String>,
 }
 
 impl App {
@@ -169,6 +174,9 @@ impl App {
             ab_alpha: 0.5,
             ab_blend: None,
             ab_blend_dirty: false,
+            loop_active: false,
+            subtitle_loaded: false,
+            subtitle_text: None,
         };
         // 缩略图 worker：消费 ThumbOutcome 后发到主消息泵。
         let (thumb_done_tx, thumb_done_rx) = std::sync::mpsc::channel::<thumb::ThumbOutcome>();
@@ -337,6 +345,26 @@ impl App {
 
     fn commit_cursor(&self, frame: u64) {
         self.call("edit.select", json!({"frame": frame}));
+        // 有字幕时同步刷新当前帧台词（静音分析也要看台词）
+        if self.subtitle_loaded {
+            if let Some(index) = &self.index {
+                let us = (index.seconds(frame) * 1_000_000.0) as i64;
+                self.call_subtitle(us);
+            }
+        }
+    }
+
+    fn call_subtitle(&self, timestamp_us: i64) {
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        std::thread::spawn(move || {
+            if let Ok(value) = rpc.call("subtitles.at", json!({"timestamp_us": timestamp_us})) {
+                let text = value.get("text").and_then(Value::as_str).map(str::to_string);
+                let _ = tx.send(UiMsg::SubtitleText(text));
+            }
+            wake();
+        });
     }
 
     fn commit_note(&mut self) {
@@ -454,6 +482,7 @@ impl App {
                 UiMsg::ExportSaved(path) => {
                     self.status = format!("已导出: {path}");
                 }
+                UiMsg::SubtitleText(text) => self.subtitle_text = text,
                 UiMsg::RpcError(error) => self.status = format!("⚠ {error}"),
                 UiMsg::DetectionEvent(event) => self.on_detection_event(event),
                 UiMsg::DetectionFinished { code } => {
@@ -1059,10 +1088,92 @@ impl App {
         ui.add_space(8.0);
         ui.heading("切镜密度(次/分钟)");
         self.draw_density(ui, &stats.editing.cut_density_series);
+        // -- 滑动平均镜头时长（节奏趋势） -------------------------------------
+        if !stats.editing.rolling_asl_series.is_empty() {
+            ui.add_space(8.0);
+            ui.heading("滑动平均 ASL（节奏趋势）");
+            let points: Vec<(f64, f64)> = stats.editing.rolling_asl_series.iter()
+                .filter_map(|p| p.asl_s.map(|v| (p.video_time_s, v)))
+                .collect();
+            self.draw_series(ui, &points, "秒");
+        }
+        // -- 最密集切镜窗口 ----------------------------------------------------
+        if !stats.special.densest_cut_windows.is_empty() {
+            ui.add_space(8.0);
+            ui.heading("切镜最密集段落");
+            for (i, window) in stats.special.densest_cut_windows.iter().take(3).enumerate() {
+                let start = window.start_time_s;
+                let end = window.end_time_s;
+                let cpm = window.cuts_per_minute.unwrap_or(0.0);
+                ui.label(format!("{}. {:.0}s – {:.0}s · {:.1} 次/分", i + 1, start, end, cpm));
+            }
+        }
+        // -- 短镜头连击（快切检测） --------------------------------------------
+        if !stats.special.short_shot_runs.is_empty() {
+            ui.add_space(8.0);
+            ui.heading("快切段落（连续短镜头）");
+            for (i, run) in stats.special.short_shot_runs.iter().take(3).enumerate() {
+                match run.start_time_s {
+                    Some(start) => ui.label(format!("{}. {:.1}s 起 · {} 个短镜头", i + 1, start, run.shot_count)),
+                    None => ui.label(format!("{}. {} 个短镜头", i + 1, run.shot_count)),
+                };
+            }
+        }
+        // -- 时间分段汇总 ------------------------------------------------------
+        if !stats.editing.time_segment_summary.is_empty() {
+            ui.add_space(8.0);
+            ui.heading("分段节奏（按分钟）");
+            egui::Grid::new("segments").num_columns(4).spacing([10.0, 3.0]).show(ui, |ui| {
+                ui.weak("时段");
+                ui.weak("镜头数");
+                ui.weak("ASL");
+                ui.weak("次/分");
+                ui.end_row();
+                for row in stats.editing.time_segment_summary.iter().take(12) {
+                    ui.label(format!("{:.0}–{:.0}s", row.start_time_s, row.end_time_s));
+                    ui.label(row.shot_count.to_string());
+                    ui.label(row.asl_s.map(|v| format!("{v:.1}")).unwrap_or("—".into()));
+                    ui.label(row.cuts_per_minute.map(|v| format!("{v:.1}")).unwrap_or("—".into()));
+                    ui.end_row();
+                }
+            });
+        }
         if ui.button("↻ 刷新统计").clicked() {
             self.stats_loading = true;
             self.call_stats();
         }
+    }
+
+    /// 通用折线绘制（滑动 ASL 等单值序列）。
+    fn draw_series(&self, ui: &mut egui::Ui, points: &[(f64, f64)], unit: &str) {
+        let height = 80.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)),
+                            egui::StrokeKind::Inside);
+        if points.len() < 2 {
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
+                egui::FontId::proportional(12.0), theme::MUTED);
+            return;
+        }
+        let max_t = points.last().map(|p| p.0).unwrap_or(1.0).max(0.001);
+        let max_v = points.iter().map(|p| p.1).fold(0.0f64, f64::max).max(0.001);
+        let inner = rect.shrink(4.0);
+        let to_pos = |t: f64, v: f64| egui::pos2(
+            inner.left() + (t / max_t) as f32 * inner.width(),
+            inner.bottom() - (v / max_v) as f32 * (inner.height() - 10.0),
+        );
+        let stroke = egui::Stroke::new(1.5, theme::ACCENT);
+        for pair in points.windows(2) {
+            painter.line_segment([to_pos(pair[0].0, pair[0].1), to_pos(pair[1].0, pair[1].1)], stroke);
+        }
+        painter.text(egui::pos2(inner.left(), inner.top() - 2.0),
+            egui::Align2::LEFT_BOTTOM, format!("峰值 {max_v:.1}{unit}"),
+            egui::FontId::proportional(9.0), theme::MUTED);
+        painter.text(egui::pos2(inner.right(), inner.bottom() + 8.0),
+            egui::Align2::RIGHT_TOP, format!("{max_t:.0}s"),
+            egui::FontId::proportional(9.0), theme::MUTED);
     }
 
     fn call_stats(&self) {
@@ -1410,6 +1521,23 @@ impl App {
                 {
                     self.call("edit.merge", json!({"row": shot.number}));
                 }
+                // 边界微调（原版 move_boundary）：左边界 = 本镜头起始帧
+                if shot.number > 0 {
+                    ui.horizontal(|ui| {
+                        ui.weak("左边界");
+                        let step = if ui.input(|i| i.modifiers.shift) { 10 } else { 1 };
+                        let left_ok = shot.start.saturating_sub(step) > self.state.shots[shot.number - 1].start;
+                        if ui.add_enabled(left_ok, egui::Button::new("◀")).clicked() {
+                            self.call("edit.move_boundary",
+                                json!({"boundary": shot.number, "frame": shot.start.saturating_sub(step)}));
+                        }
+                        if ui.add_enabled(shot.end > shot.start + step, egui::Button::new("▶")).clicked() {
+                            self.call("edit.move_boundary",
+                                json!({"boundary": shot.number, "frame": shot.start + step}));
+                        }
+                        ui.weak(format!("Shift ×10 · 当前 {}", shot.start));
+                    });
+                }
             }
             None => {
                 ui.label("（未选中镜头）");
@@ -1430,6 +1558,17 @@ impl App {
             }
             None => {
                 ui.centered_and_justified(|ui| ui.label("打开视频后在此播放（静音分析模式）"));
+            }
+        }
+        // 字幕行（加载 SRT 后显示当前帧时间对应的台词）
+        if self.subtitle_loaded {
+            let text = self.subtitle_text.clone().unwrap_or_default();
+            if !text.is_empty() {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.weak("字幕:");
+                    ui.label(egui::RichText::new(text).color(theme::INK).size(13.0));
+                });
             }
         }
         ui.add_space(6.0);
@@ -1459,6 +1598,40 @@ impl App {
                 .clicked()
             {
                 self.step(1, frames);
+            }
+            // 局部循环：选中镜头范围内反复播放
+            let in_shot = self.state.shots.iter()
+                .find(|s| s.id == self.state.selected_id && !s.pending)
+                .map(|s| (s.start, s.end));
+            if let Some((loop_start, loop_end)) = in_shot {
+                let loop_label = if self.loop_active { "🔁 循环中" } else { "🔁 循环" };
+                if ui
+                    .add_enabled(self.player.is_some(), egui::Button::new(loop_label))
+                    .clicked()
+                {
+                    if self.loop_active {
+                        self.loop_active = false;
+                        if let Some(player) = &self.player {
+                            player.stop();
+                            player.show(self.ui_frame);
+                        }
+                    } else {
+                        self.loop_active = true;
+                        if let Some(player) = &self.player {
+                            player.play_loop(loop_start, loop_end);
+                        }
+                    }
+                }
+            }
+            // 字幕加载
+            if ui.button("💬 字幕").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("SRT 字幕", &["srt", "ass"])
+                    .pick_file()
+                {
+                    self.call_quiet("subtitles.load", json!({"path": path.to_string_lossy()}));
+                    self.subtitle_loaded = true;
+                }
             }
             ui.separator();
             let mut slider = self.ui_frame.min(frames - 1) as i64;
@@ -1521,6 +1694,12 @@ impl App {
                 .clicked()
             {
                 self.export_contact_sheet();
+            }
+            if ui
+                .add_enabled(self.state.completed_count > 0, egui::Button::new("📄 PDF 联系表"))
+                .clicked()
+            {
+                self.export_pdf_sheet();
             }
         });
         // A/B 帧信息行
@@ -1745,6 +1924,19 @@ impl App {
         };
         self.status = "生成分析长图…".into();
         self.call_quiet_result("export.contact_sheet", json!({"path": path.to_string_lossy()}));
+    }
+
+    /// PDF 联系表（原版 contact_sheet.PdfSheet 语义：分页、编号+时长+标签）。
+    fn export_pdf_sheet(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PDF 文档", &["pdf"])
+            .set_file_name("镜头联系表.pdf")
+            .save_file()
+        else {
+            return;
+        };
+        self.status = "生成 PDF 联系表…".into();
+        self.call_quiet_result("export.pdf_sheet", json!({"path": path.to_string_lossy()}));
     }
 
     fn call_quiet_result(&self, method: &str, params: Value) {

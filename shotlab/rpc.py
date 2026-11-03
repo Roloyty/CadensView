@@ -40,6 +40,7 @@ class Session:
         self.busy = None   # 正在运行的后台任务名（index.build / analysis.run）
         self.shot_tags = {}  # {shot_id: [tag1, tag2, ...]}（存 settings，零迁移）
         self.scale_labels = {}  # {shot_id: {label, label_zh, confidence}}（存 settings）
+        self.subtitle_cues = []  # 外挂 SRT 字幕 [{start_us, end_us, text}]
 
     def start_busy(self, name):
         if self.busy:
@@ -666,9 +667,169 @@ def _write(stdout, payload):
     stdout.flush()
 
 
+@method("subtitles.load")
+def _subtitles_load(session, params, emit=None):
+    """加载外挂 SRT 字幕（原版 subtitles.pyc 移植）。"""
+    import html
+    from html.parser import HTMLParser
+
+    class _PlainText(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.parts = []
+        def handle_data(self, data):
+            self.parts.append(data)
+        def handle_starttag(self, tag, attrs):
+            if tag == 'br':
+                self.parts.append('\n')
+
+    def plain_text(text):
+        parser = _PlainText()
+        parser.feed(text)
+        return html.unescape(''.join(parser.parts)).strip()
+
+    path = Path(params["path"])
+    if not path.is_file():
+        raise ValueError(f"字幕文件不存在: {params['path']}")
+
+    def timestamp(value):
+        value = value.strip().replace(',', '.')
+        parts = value.split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+        elif len(parts) == 2:
+            h, m, s = 0, parts[0], parts[1]
+        else:
+            raise ValueError(f"bad timestamp: {value}")
+        return round((int(h) * 3600 + int(m) * 60 + float(s)) * 1_000_000)
+
+    cues = []
+    current = []
+
+    def flush():
+        if not current:
+            return
+        try:
+            index = next((i for i, l in enumerate(current) if '-->' in l), None)
+            if index is not None:
+                start_s, end_s = current[index].split('-->')
+                text = plain_text('\n'.join(current[index + 1:]))
+                if text:
+                    cues.append({"start_us": timestamp(start_s),
+                                 "end_us": timestamp(end_s),
+                                 "text": text})
+        except (ValueError, IndexError):
+            pass
+        current.clear()
+
+    for line in path.read_text(encoding='utf-8-sig').splitlines():
+        line = line.strip()
+        if not line:
+            flush()
+        else:
+            current.append(line)
+    flush()  # 文件末尾没有空行时也要处理最后一条
+    session.subtitle_cues = cues
+    return {"cues": len(cues), "path": str(path.resolve())}
+
+
+@method("subtitles.clear")
+def _subtitles_clear(session, params, emit=None):
+    session.subtitle_cues = []
+    return {"cleared": True}
+
+
+@method("subtitles.at")
+def _subtitles_at(session, params, emit=None):
+    """获取指定时间（微秒）的字幕文本。"""
+    us = int(params["timestamp_us"])
+    for cue in getattr(session, 'subtitle_cues', []):
+        if cue["start_us"] <= us < cue["end_us"]:
+            return {"text": cue["text"]}
+    return {"text": None}
+
+
+@method("export.pdf_sheet")
+def _export_pdf_sheet(session, params, emit=None):
+    """全镜头 PDF 联系表（原版 contact_sheet.PdfSheet 移植，Pillow 渲染）。"""
+    if session.project is None or session.index is None:
+        raise ValueError("先打开视频并建立索引")
+    from PIL import Image, ImageDraw, ImageFont
+    from t0.media import FrameReader
+
+    path = Path(params["path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = int(params.get("columns", 4))
+    thumb_w = int(params.get("thumb_width", 240))
+    page_h = int(params.get("page_height", 2970))  # ~A4 @ 300dpi 缩小
+
+    rows_data = [s for s in session.state()["shots"] if not s["pending"]]
+    if not rows_data:
+        raise ValueError("没有已完成镜头")
+
+    reader = FrameReader(session.index)
+    try:
+        thumbs = []
+        for shot in rows_data:
+            mid = min((shot["start"] + shot["end"]) // 2, len(session.index.pts) - 1)
+            frame = reader.read(mid)
+            arr = frame.to_ndarray(format="rgb24")
+            h, w = arr.shape[:2]
+            tw = thumb_w
+            th = int(h * tw / w)
+            ys = (np.arange(th) * h // th).clip(0, h - 1)
+            xs = (np.arange(tw) * w // tw).clip(0, w - 1)
+            thumbs.append((arr[ys][:, xs], shot))
+    finally:
+        reader.close()
+
+    import math
+    try:
+        font = ImageFont.truetype("C:/Windows/Fonts/segoeui.ttf", 11)
+        title_font = ImageFont.truetype("C:/Windows/Fonts/segoeui.ttf", 16)
+    except OSError:
+        font = ImageFont.load_default()
+        title_font = font
+
+    label_h = 22
+    cell_h = max(t[0].shape[0] for t in thumbs) + label_h + 8
+    per_page = max(1, (page_h - 80) // cell_h)
+    pages = math.ceil(len(thumbs) / per_page)
+    sheet_w = cols * (thumb_w + 8) + 16
+
+    # 全部页合到一张长图，一次性存 PDF（Pillow 多页 PDF）
+    all_pages = []
+    for page in range(pages):
+        img = Image.new("RGB", (sheet_w, min(page_h, (per_page) * cell_h + 80)), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        draw.text((16, 16), f"CadensView 镜头联系表 — 第 {page+1}/{pages} 页", fill=(40,40,40), font=title_font)
+        y_off = 60
+        start = page * per_page
+        for i, (thumb_arr, shot) in enumerate(thumbs[start:start+per_page]):
+            row, col = divmod(i, cols)
+            x = col * (thumb_w + 8) + 16
+            y = y_off + row * cell_h
+            img.paste(Image.fromarray(thumb_arr), (x, y))
+            draw.rectangle([x, y, x+thumb_w-1, y+thumb_arr.shape[0]-1], outline=(200,200,200))
+            label = f"#{shot['number']+1}  {shot['duration_s']:.1f}s"
+            if shot.get("tags"):
+                label += "  " + " ".join(shot["tags"])
+            if shot.get("scale"):
+                label += f"  [{shot['scale'].get('label_zh','')}]"
+            draw.text((x, y + thumb_arr.shape[0] + 2), label, fill=(60,60,60), font=font)
+        all_pages.append(img)
+
+    if len(all_pages) == 1:
+        all_pages[0].save(str(path), "PDF", resolution=150)
+    else:
+        all_pages[0].save(str(path), "PDF", save_all=True, append_images=all_pages[1:], resolution=150)
+    return {"written": len(thumbs), "pages": pages, "path": str(path.resolve())}
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         from tests.test_rpc import selftest
         selftest()
     else:
         serve()
+
+

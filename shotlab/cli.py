@@ -241,11 +241,26 @@ def cmd_export(args):
         session = _open_session_args(args.project)
         from shotlab.rpc import METHODS
         return METHODS["export.contact_sheet"](session, {"path": args.out, "columns": args.columns}, None)
+    if args.kind == "pdf":
+        session = _open_session_args(args.project)
+        from shotlab.rpc import METHODS
+        return METHODS["export.pdf_sheet"](session, {"path": args.out, "columns": args.columns}, None)
     if args.kind == "gif":
         return _cli_export_gif(args.project, args.shot, args.out)
     if args.kind == "frame":
         return _cli_export_frame(args.project, args.frame, args.out)
     raise CliError(f"未知导出类型: {args.kind}")
+
+
+def cmd_subtitles(args):
+    session = _open_session_args(args.project)
+    from shotlab.rpc import METHODS
+    loaded = METHODS["subtitles.load"](session, {"path": args.srt}, None)
+    payload = {"cues": loaded["cues"]}
+    if args.at is not None:
+        found = METHODS["subtitles.at"](session, {"timestamp_us": int(args.at * 1_000_000)}, None)
+        payload["text"] = found["text"]
+    return payload
 
 
 def cmd_version(_args):
@@ -293,13 +308,19 @@ def build_parser():
     p.set_defaults(fn=cmd_tags)
 
     p = sub.add_parser("export", help="导出 csv|sheet|gif|frame")
-    p.add_argument("kind", choices=("csv", "sheet", "gif", "frame"))
+    p.add_argument("kind", choices=("csv", "sheet", "pdf", "gif", "frame"))
     p.add_argument("out")
     p.add_argument("--project", required=True)
     p.add_argument("--columns", type=int, default=5, help="长图列数")
     p.add_argument("--shot", type=int, default=None, help="镜头编号（gif）")
     p.add_argument("--frame", type=int, default=None, help="帧号（frame）")
     p.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("subtitles", help="加载 SRT 字幕并查询台词")
+    p.add_argument("project")
+    p.add_argument("srt")
+    p.add_argument("--at", type=float, default=None, help="查询某秒的台词")
+    p.set_defaults(fn=cmd_subtitles)
 
     p = sub.add_parser("version", help="版本信息")
     p.set_defaults(fn=cmd_version)

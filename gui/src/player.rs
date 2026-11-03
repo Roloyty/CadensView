@@ -20,6 +20,7 @@ pub enum PlayerMsg {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PlayerCmd {
     Play(u64), // 从某帧连续播放（静音分析模式）
+    PlayLoop(u64, u64), // 局部循环：在 [start, end) 帧范围内反复
     Show(u64), // 暂停态精确显示某帧
     Stop,
     Shutdown,
@@ -30,6 +31,8 @@ struct Stream {
     next_frame: u64,   // 下一个要读的帧号
     started: Instant,  // 起播墙钟
     start_pts: i64,    // 起播帧 pts，用于节流对齐
+    loop_end: Option<u64>, // 循环终点（到达后从 loop_start 重新开始）
+    loop_start: u64,   // 循环起点
 }
 
 struct Inner {
@@ -61,6 +64,11 @@ impl PlayerHandle {
 
     pub fn play(&self, frame: u64) {
         *self.inner.cmd.lock().unwrap() = Some(PlayerCmd::Play(frame));
+    }
+
+    /// 局部循环播放：到达 end 后自动从 start 重启（原版 transport.play repeat 语义）。
+    pub fn play_loop(&self, start: u64, end: u64) {
+        *self.inner.cmd.lock().unwrap() = Some(PlayerCmd::PlayLoop(start, end));
     }
 
     pub fn show(&self, frame: u64) {
@@ -125,6 +133,29 @@ fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexI
                                 next_frame: from + 1,
                                 started: Instant::now(),
                                 start_pts: index.pts.get(from as usize).copied().unwrap_or(0),
+                                loop_end: None,
+                                loop_start: from,
+                            });
+                        }
+                        Err(error) => {
+                            out.send(PlayerMsg::Failed(error.to_string()));
+                        }
+                    }
+                }
+                PlayerCmd::PlayLoop(start, end) => {
+                    let start = start.min(index.frames().saturating_sub(1));
+                    let end = end.min(index.frames()).max(start + 1);
+                    match spawn_stream(&ffmpeg, &video, &index, start) {
+                        Ok(child) => {
+                            inner.playing.store(true, Ordering::SeqCst);
+                            inner.pub_frame.store(start, Ordering::SeqCst);
+                            stream = Some(Stream {
+                                child,
+                                next_frame: start + 1,
+                                started: Instant::now(),
+                                start_pts: index.pts.get(start as usize).copied().unwrap_or(0),
+                                loop_end: Some(end),
+                                loop_start: start,
                             });
                         }
                         Err(error) => {
@@ -139,7 +170,54 @@ fn worker_loop(inner: Arc<Inner>, ffmpeg: PathBuf, video: PathBuf, index: IndexI
 
         match stream.as_mut() {
             Some(state) => {
+                // 循环模式：到达终点时重启 ffmpeg 流从起点
+                if let Some(loop_end) = state.loop_end {
+                    if state.next_frame >= loop_end {
+                        let restart = state.loop_start;
+                        kill(&mut stream);
+                        inner.playing.store(false, Ordering::SeqCst);
+                        match spawn_stream(&ffmpeg, &video, &index, restart) {
+                            Ok(child) => {
+                                inner.playing.store(true, Ordering::SeqCst);
+                                inner.pub_frame.store(restart, Ordering::SeqCst);
+                                stream = Some(Stream {
+                                    child,
+                                    next_frame: restart + 1,
+                                    started: Instant::now(),
+                                    start_pts: index.pts.get(restart as usize).copied().unwrap_or(0),
+                                    loop_end: Some(loop_end),
+                                    loop_start: restart,
+                                });
+                            }
+                            Err(error) => {
+                                out.send(PlayerMsg::Failed(error.to_string()));
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if !pump_frame(state, &index, &inner, &out) {
+                    // 流结束：循环模式下自动重启
+                    if let Some(loop_end) = state.loop_end {
+                        let restart = state.loop_start;
+                        kill(&mut stream);
+                        match spawn_stream(&ffmpeg, &video, &index, restart) {
+                            Ok(child) => {
+                                inner.playing.store(true, Ordering::SeqCst);
+                                inner.pub_frame.store(restart, Ordering::SeqCst);
+                                stream = Some(Stream {
+                                    child,
+                                    next_frame: restart + 1,
+                                    started: Instant::now(),
+                                    start_pts: index.pts.get(restart as usize).copied().unwrap_or(0),
+                                    loop_end: Some(loop_end),
+                                    loop_start: restart,
+                                });
+                                continue;
+                            }
+                            Err(_) => {}
+                        }
+                    }
                     stream = None;
                     inner.playing.store(false, Ordering::SeqCst);
                     out.send(PlayerMsg::Ended);

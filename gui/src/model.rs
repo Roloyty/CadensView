@@ -105,6 +105,7 @@ pub struct StatsData {
     pub overview: StatsOverview,
     pub distribution: StatsDistribution,
     pub editing: StatsEditing,
+    pub special: StatsSpecial,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -146,6 +147,48 @@ pub struct HistBin {
 #[serde(default)]
 pub struct StatsEditing {
     pub cut_density_series: Vec<DensityPoint>,
+    pub rolling_asl_series: Vec<RollingPoint>,
+    pub time_segment_summary: Vec<SegmentRow>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct RollingPoint {
+    pub video_time_s: f64,
+    pub asl_s: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct SegmentRow {
+    pub start_time_s: f64,
+    pub end_time_s: f64,
+    pub shot_count: u64,
+    pub asl_s: Option<f64>,
+    pub cuts_per_minute: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct StatsSpecial {
+    pub densest_cut_windows: Vec<DensestWindow>,
+    pub short_shot_runs: Vec<ShortRun>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct DensestWindow {
+    pub start_time_s: f64,
+    pub end_time_s: f64,
+    pub cut_count: Option<u64>,
+    pub cuts_per_minute: Option<f64>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct ShortRun {
+    pub start_time_s: Option<f64>,
+    pub shot_count: u64,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
