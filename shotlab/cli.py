@@ -257,6 +257,21 @@ def cmd_index(args):
     return _cli_index(args.video, limit=args.limit)
 
 
+def cmd_motion(args):
+    with _session(args.project) as session:
+        result = session.motion_run(session.analysis_scope(_selection_params(session, args.shots)))
+        values = [row["motion"] for row in result["shots"] if row.get("motion") is not None]
+        payload = dict(
+            duration_s=result["duration_s"],
+            mean_motion=sum(values) / len(values) if values else None,
+            parameters=result["parameters"],
+            shots=result["shots"])
+        if args.spectrum:
+            from shotlab.motion import write_spectrum
+            payload["spectrum"] = write_spectrum(result, args.spectrum)
+        return payload
+
+
 def cmd_export(args):
     methods = {"csv": "export.shots_csv", "sheet": "export.contact_sheet", "pdf": "export.pdf_sheet"}
     if args.kind in methods:
@@ -266,8 +281,22 @@ def cmd_export(args):
             if args.kind != "csv":
                 params["columns"] = args.columns
             return METHODS[methods[args.kind]](session, params, None)
+    if args.kind == "slit":
+        with _session(args.project) as session:
+            return session.slit_run({"path": args.out, "width": args.width,
+                                     "columns": args.columns,
+                                     **_selection_params(session, args.shots)})
+    if args.kind == "stills":
+        with _session(args.project) as session:
+            return session.stills_run({"path": args.out, "count": args.count, "width": args.width,
+                                       **_selection_params(session, args.shots)})
+    if args.kind == "motion":
+        with _session(args.project) as session:
+            from shotlab.motion import write_spectrum
+            result = session.motion_run(session.analysis_scope(_selection_params(session, args.shots)))
+            return write_spectrum(result, args.out)
     if args.shots is not None:
-        raise CliError("--shots 仅适用于 csv/sheet/pdf 导出")
+        raise CliError("--shots 仅适用于 csv/sheet/pdf/slit/stills/motion 导出")
     if args.kind == "gif":
         if args.shot is None or args.shot < 1:
             raise CliError("GIF 导出须指定 --shot 正整数镜头编号")
@@ -324,6 +353,13 @@ def build_parser():
     p.add_argument("--frame", type=int, required=True)
     p.set_defaults(fn=cmd_palette)
 
+    p = sub.add_parser("motion", help="逐帧运动量与镜头平均运动量")
+    p.add_argument("project")
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None,
+                   help="选择镜头编号（1 起，逗号分隔）；省略则分析全部已完成镜头")
+    p.add_argument("--spectrum", default=None, help="同时导出运动指纹 PNG")
+    p.set_defaults(fn=cmd_motion)
+
     p = sub.add_parser("scale", help="逐镜头景别识别")
     p.add_argument("project")
     p.set_defaults(fn=cmd_scale)
@@ -336,8 +372,8 @@ def build_parser():
     p.add_argument("--tag", default=None, help="单个标签（remove）")
     p.set_defaults(fn=cmd_tags)
 
-    p = sub.add_parser("export", help="导出 csv|sheet|pdf|gif|frame")
-    p.add_argument("kind", choices=("csv", "sheet", "pdf", "gif", "frame"))
+    p = sub.add_parser("export", help="导出 csv|sheet|pdf|slit|stills|motion|gif|frame")
+    p.add_argument("kind", choices=("csv", "sheet", "pdf", "slit", "stills", "motion", "gif", "frame"))
     p.add_argument("out")
     p.add_argument("--project", required=True)
     p.add_argument("--shots", type=_parse_shot_numbers, default=None,
@@ -345,6 +381,8 @@ def build_parser():
     p.add_argument("--columns", type=int, default=5, help="长图列数")
     p.add_argument("--shot", type=int, default=None, help="镜头编号（gif）")
     p.add_argument("--frame", type=int, default=None, help="帧号（frame）")
+    p.add_argument("--width", type=int, default=160, help="slit 每镜头列数 / stills 宽度")
+    p.add_argument("--count", type=int, default=100, help="stills 张数")
     p.set_defaults(fn=cmd_export)
 
     p = sub.add_parser("subtitles", help="加载 SRT 字幕并查询台词")

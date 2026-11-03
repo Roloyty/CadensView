@@ -63,6 +63,8 @@ class Session:
         self.shot_tags = {}  # {shot_id: [tag1, tag2, ...]}（存 settings，零迁移）
         self.scale_labels = {}  # {shot_id: {label, label_zh, confidence}}（存 settings）
         self.subtitle_cues = []  # 外挂 SRT 字幕 [{start_us, end_us, text}]
+        self.motion = None  # 最近一次运动分析结果
+        self.motion_key = None
 
     def start_busy(self, name):
         if self.busy:
@@ -82,6 +84,8 @@ class Session:
         self.shot_tags = self.settings.get("shot_tags", {})
         self.scale_labels = self.settings.get("scale_labels", {})
         self.subtitle_cues = []
+        self.motion = None
+        self.motion_key = None
         self.history = History()
         self.stats = None
 
@@ -107,6 +111,38 @@ class Session:
         selected = set(scope.shot_ids) if scope.kind == "selected_shots" else None
         return [shot for shot in self.state()["shots"]
                 if not shot["pending"] and (selected is None or shot["id"] in selected)]
+
+    def motion_run(self, scope, cancel=None, progress=None):
+        from shotlab.motion import analyze_motion
+        result = analyze_motion(self.project, self.index, scope, cancel=cancel, progress=progress)
+        self.motion = result
+        self.motion_key = (self.project.id, scope.kind, tuple(scope.shot_ids))
+        return result
+
+    def motion_current(self, params):
+        if self.motion is None or self.project is None:
+            raise ValueError("先运行运动分析")
+        scope = self.analysis_scope(params)
+        if self.motion_key != (self.project.id, scope.kind, tuple(scope.shot_ids)):
+            raise ValueError("范围或镜头边界已变化，请重新运行运动分析")
+        return self.motion
+
+    def stills_run(self, params):
+        from shotlab.slit import export_stills
+        scope = self.analysis_scope(params)
+        return export_stills(self.project, self.index, params["path"],
+                             count=int(params.get("count", 100)),
+                             scope=scope, width=int(params.get("width", 480)))
+
+    def slit_run(self, params, cancel=None, progress=None):
+        from shotlab.slit import build_sheet
+        from shotlab.statistics import build_context
+        scope = self.analysis_scope(params)
+        context = build_context(self.project, self.index, scope)
+        return build_sheet(self.index, context.records, params["path"],
+                           width=int(params.get("width", 160)),
+                           columns=int(params.get("columns", 6)),
+                           cancel=cancel, progress=progress)
 
     # -- snapshot -----------------------------------------------------------
 
@@ -315,6 +351,8 @@ class Session:
         self.project.validate()
         self.history.record(before, self.project, label, key)
         self.stats = None  # 镜头结构/笔记变化后统计缓存失效
+        self.motion = None
+        self.motion_key = None
         self.dirty = True
         return self.state()
 
@@ -628,10 +666,30 @@ def _export_gif_range(session, params, emit=None):
     return {"start_s": start_s, "duration_s": end_s - start_s, "frame_count": end_frame - start_frame}
 
 
+@method("motion.get")
+def _motion_get(session, params, emit=None):
+    return session.motion_current(params)
+
+
+@method("export.motion_spectrum")
+def _export_motion_spectrum(session, params, emit=None):
+    from shotlab.motion import write_spectrum
+    result = session.motion_current(params)
+    return write_spectrum(result, params["path"], width=int(params.get("width", 1800)),
+                          height=int(params.get("height", 300)))
+
+
+@method("export.stills")
+def _export_stills(session, params, emit=None):
+    if session.project is None or session.index is None:
+        raise ValueError("先打开视频并建立索引")
+    return session.stills_run(params)
+
+
 # -- protocol loop ----------------------------------------------------------
 
 # 允许以后台任务方式运行的方法（长耗时、可取消）。
-JOB_METHODS = {"index.build", "analysis.run", "scale.run"}
+JOB_METHODS = {"index.build", "analysis.run", "scale.run", "motion.run", "slit.run"}
 
 
 def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
@@ -668,6 +726,14 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
                 result = session.scale_run(
                     cancel=cancel,
                     progress=lambda done, total: emit("scale", done=done, total=total))
+            elif name == "motion.run":
+                result = session.motion_run(
+                    session.analysis_scope(params), cancel=cancel,
+                    progress=lambda done, total: emit("motion", done=done, total=total))
+            elif name == "slit.run":
+                result = session.slit_run(
+                    params, cancel=cancel,
+                    progress=lambda done, total: emit("slit", done=done, total=total))
             else:
                 raise ValueError(f"不支持的任务: {name}")
         except Exception as error:

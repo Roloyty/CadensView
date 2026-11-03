@@ -380,6 +380,41 @@ pub struct ColorChange {
 
 #[derive(Deserialize, Default, Clone, Debug)]
 #[serde(default)]
+pub struct MotionAnalysis {
+    pub samples: Vec<MotionSample>,
+    pub shots: Vec<MotionShot>,
+    pub duration_s: f64,
+    pub parameters: MotionParameters,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct MotionSample {
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub video_time_s: f64,
+    pub motion: f64,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct MotionShot {
+    #[serde(flatten)]
+    pub shot: ShotMetric,
+    pub motion: Option<f64>,
+    pub motion_samples: u64,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct MotionParameters {
+    pub threshold: u32,
+    pub first_frame: String,
+    pub definition: String,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
 pub struct SubtitleCue {
     pub start_us: i64,
     pub end_us: i64,

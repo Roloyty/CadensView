@@ -197,6 +197,60 @@ def cv_subtitles(project: str, srt_path: str, at_seconds: float = -1.0) -> str:
 
 
 @mcp.tool()
+def cv_motion(project: str, shot_ids: list[str] | None = None, spectrum_path: str = "") -> str:
+    """逐帧运动量（RGB 差>10/255）与镜头平均运动量；可选导出运动指纹 PNG。"""
+    try:
+        with _session(project) as session:
+            result = session.motion_run(session.analysis_scope(_shot_params(shot_ids)))
+            values = [row["motion"] for row in result["shots"] if row.get("motion") is not None]
+            payload = dict(duration_s=result["duration_s"],
+                           mean_motion=sum(values) / len(values) if values else None,
+                           parameters=result["parameters"], shots=result["shots"])
+            if spectrum_path:
+                from shotlab.motion import write_spectrum
+                payload["spectrum"] = write_spectrum(result, spectrum_path)
+            return _dump(payload)
+    except Exception as error:  # noqa: BLE001
+        return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+@mcp.tool()
+def cv_motion_spectrum(project: str, out_path: str, shot_ids: list[str] | None = None) -> str:
+    """运动指纹 PNG（横轴源时间，纵轴运动量；含切镜点）。"""
+    try:
+        with _session(project) as session:
+            from shotlab.motion import write_spectrum
+            result = session.motion_run(session.analysis_scope(_shot_params(shot_ids)))
+            return _dump(write_spectrum(result, out_path))
+    except Exception as error:  # noqa: BLE001
+        return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+@mcp.tool()
+def cv_export_slit(project: str, out_path: str, width: int = 160, columns: int = 6,
+                   shot_ids: list[str] | None = None) -> str:
+    """镜头 slit-scan 扫描条网格 PNG（每镜头逐帧取中列）。shot_ids 省略为全部已完成镜头。"""
+    try:
+        with _session(project) as session:
+            return _dump(session.slit_run({"path": out_path, "width": width,
+                                           "columns": columns, **_shot_params(shot_ids)}))
+    except Exception as error:  # noqa: BLE001
+        return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+@mcp.tool()
+def cv_export_stills(project: str, out_dir: str, count: int = 100, width: int = 480,
+                     shot_ids: list[str] | None = None) -> str:
+    """范围内均匀抽取 count 张静帧（JPEG）。shot_ids 省略为全部已完成镜头。"""
+    try:
+        with _session(project) as session:
+            return _dump(session.stills_run({"path": out_dir, "count": count,
+                                             "width": width, **_shot_params(shot_ids)}))
+    except Exception as error:  # noqa: BLE001
+        return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+@mcp.tool()
 def cv_analysis(project: str, shot_ids: list[str] | None = None) -> str:
     """色彩分析（秒级色带+镜头色板+代表帧）。shot_ids 省略为全部已完成镜头，空列表无效。"""
     try:

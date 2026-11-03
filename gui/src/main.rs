@@ -40,6 +40,12 @@ enum UiMsg {
     AnalysisFailed(String),
     ScaleJobStarted(u64),
     ScaleFailed(String),
+    MotionJobStarted(u64),
+    MotionDone(Value),
+    MotionFailed(String),
+    SlitJobStarted(u64),
+    SlitDone(Value),
+    SlitFailed(String),
     Thumb(thumb::ThumbOutcome),
     AbCaptured { slot: usize, frame: u64, width: usize, height: usize, rgba: Vec<u8> },
     ExportSaved(String),
@@ -141,6 +147,12 @@ struct App {
     stats_error: Option<String>,
     analysis_key: String,
     analysis_starting: bool,
+    motion_data: Option<model::MotionAnalysis>,
+    motion_key: String,
+    motion_job: Option<u64>,
+    motion_starting: bool,
+    slit_job: Option<u64>,
+    slit_starting: bool,
     scale_starting: bool,
     boundary_editor: Option<boundary::BoundaryEditor>,
     subtitle_cues: Vec<model::SubtitleCue>,
@@ -241,6 +253,12 @@ impl App {
             stats_error: None,
             analysis_key: String::new(),
             analysis_starting: false,
+            motion_data: None,
+            motion_key: String::new(),
+            motion_job: None,
+            motion_starting: false,
+            slit_job: None,
+            slit_starting: false,
             scale_starting: false,
             boundary_editor: None,
             subtitle_cues: Vec::new(),
@@ -449,6 +467,8 @@ impl App {
     fn work_busy(&self) -> bool {
         self.index_busy || self.detection.is_some() || self.analysis_starting || self.scale_starting
             || self.analysis_job.is_some() || self.scale_job.is_some()
+            || self.motion_job.is_some() || self.motion_starting
+            || self.slit_job.is_some() || self.slit_starting
     }
 
     fn stop_playback(&mut self) {
@@ -487,6 +507,7 @@ impl App {
         self.stats = None; self.stats_stale = true; self.stats_loading = false;
         self.stats_key.clear(); self.stats_error = None;
         self.analysis_data = None; self.analysis_view.reset_results();
+        self.motion_data = None; self.motion_key.clear();
         self.analysis_view.scope = analysis::Scope::All;
         self.barcode.clear(); self.palette = None; self.palette_shot.clear(); self.palette_loading = false;
         self.marks.clear(); self.mark_anchor = None; self.boundary_editor = None;
@@ -580,6 +601,7 @@ impl App {
                     if structure_changed {
                         self.stats_stale = true; self.stats_loading = false; self.stats_error = None;
                         self.analysis_data = None; self.barcode.clear(); self.analysis_view.reset_results();
+                        self.motion_data = None; self.motion_key.clear();
                         self.palette = None; self.palette_shot.clear(); self.palette_loading = false;
                         self.marks.retain(|id| state.shots.iter().any(|s| &s.id == id && !s.pending));
                     }
@@ -663,6 +685,44 @@ impl App {
                 }
                 UiMsg::ScaleJobStarted(_) => {}
                 UiMsg::ScaleFailed(error) => { self.scale_starting = false; self.status = format!("景别识别: {error}"); }
+                UiMsg::MotionJobStarted(job_id) if self.motion_starting => {
+                    self.motion_job = Some(job_id); self.motion_starting = false;
+                }
+                UiMsg::MotionJobStarted(_) => {}
+                UiMsg::MotionDone(value) => {
+                    self.motion_job = None; self.motion_starting = false;
+                    let key = self.current_stats_key();
+                    if self.motion_key != key {
+                        self.motion_data = None;
+                        self.status = "运动结果已过期，未应用".into();
+                    } else {
+                        match serde_json::from_value::<model::MotionAnalysis>(value) {
+                            Ok(parsed) => {
+                                self.motion_data = Some(parsed);
+                                self.status = "运动分析完成".into();
+                            }
+                            Err(error) => self.status = format!("运动结果解析失败: {error}"),
+                        }
+                    }
+                }
+                UiMsg::MotionFailed(error) => {
+                    self.motion_job = None; self.motion_starting = false;
+                    self.status = format!("运动分析: {error}");
+                }
+                UiMsg::SlitJobStarted(job_id) if self.slit_starting => {
+                    self.slit_job = Some(job_id); self.slit_starting = false;
+                }
+                UiMsg::SlitJobStarted(_) => {}
+                UiMsg::SlitDone(value) => {
+                    self.slit_job = None; self.slit_starting = false;
+                    let path = value.get("path").and_then(Value::as_str).unwrap_or("");
+                    if path.is_empty() { self.status = "扫描条导出完成".into(); }
+                    else { self.status = format!("已导出扫描条: {path}"); }
+                }
+                UiMsg::SlitFailed(error) => {
+                    self.slit_job = None; self.slit_starting = false;
+                    self.status = format!("扫描条导出: {error}");
+                }
                 UiMsg::AnalysisDone(value) => {
                     self.analysis_job = None;
                     self.analysis_starting = false;
@@ -866,6 +926,48 @@ impl App {
                     } else {
                         format!("景别识别: {message}")
                     };
+                }
+                ("motion", "progress") => {
+                    if let (Some(done), Some(total)) = (
+                        event.get("done").and_then(Value::as_u64),
+                        event.get("total").and_then(Value::as_u64),
+                    ) {
+                        self.status = format!("运动分析… {done}/{total} 帧");
+                    }
+                }
+                ("motion.run", "done") if job_id == self.motion_job || self.motion_job.is_some() || self.motion_starting => {
+                    self.motion_job = None; self.motion_starting = false;
+                    if let Some(result) = event.get("result") {
+                        let _ = self.msg_tx.send(UiMsg::MotionDone(result.clone()));
+                    }
+                }
+                ("motion.run", "error") => {
+                    self.motion_job = None; self.motion_starting = false;
+                    let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
+                    let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+                    self.status = if kind.contains("Cancelled") { "运动分析已取消".into() }
+                        else { format!("运动分析: {message}") };
+                }
+                ("slit", "progress") => {
+                    if let (Some(done), Some(total)) = (
+                        event.get("done").and_then(Value::as_u64),
+                        event.get("total").and_then(Value::as_u64),
+                    ) {
+                        self.status = format!("扫描条导出… {done}/{total} 帧");
+                    }
+                }
+                ("slit.run", "done") if job_id == self.slit_job || self.slit_job.is_some() || self.slit_starting => {
+                    self.slit_job = None; self.slit_starting = false;
+                    if let Some(result) = event.get("result") {
+                        let _ = self.msg_tx.send(UiMsg::SlitDone(result.clone()));
+                    }
+                }
+                ("slit.run", "error") => {
+                    self.slit_job = None; self.slit_starting = false;
+                    let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
+                    let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+                    self.status = if kind.contains("Cancelled") { "扫描条导出已取消".into() }
+                        else { format!("扫描条导出: {message}") };
                 }
                 (_, "error") => {
                     let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
@@ -1145,6 +1247,9 @@ impl App {
             // 镜头色板/色差属于旧范围；全片色带仍有效，不清 barcode。
             self.analysis_data = None;
         }
+        if self.motion_data.is_some() && self.motion_key != self.current_stats_key() {
+            self.motion_data = None;
+        }
         let key = self.current_stats_key();
         if self.stats_key != key {
             // 范围变化：旧请求即使稍后返回，也不能写进新范围的界面。
@@ -1161,11 +1266,17 @@ impl App {
         }
         if let Some(error) = &self.stats_error { ui.colored_label(theme::error(), error); }
         let busy = self.analysis_job.is_some() || self.analysis_starting;
+        let motion_busy = self.motion_job.is_some() || self.motion_starting
+            || self.slit_job.is_some() || self.slit_starting;
         let actions = self.analysis_view.show(ui, &title, self.stats.as_ref(), self.analysis_data.as_ref(),
-            &self.thumbs, &stem, busy);
+            self.motion_data.as_ref(), &self.thumbs, &stem, busy, motion_busy);
         for action in actions {
             match action {
                 analysis::Action::RunColors => self.run_analysis(),
+                analysis::Action::RunMotion => self.run_motion(),
+                analysis::Action::ExportMotion => self.export_motion_spectrum(),
+                analysis::Action::ExportSlit => self.export_slit_scan(),
+                analysis::Action::ExportStills => self.export_stills(),
                 analysis::Action::Thumbnail(frame) => self.request_analysis_thumb(&stem, frame),
                 analysis::Action::Locate { frame, shot_id } => {
                     self.analysis_open = false;
@@ -1611,6 +1722,22 @@ impl App {
                     self.run_scale();
                 }
             }
+            if self.motion_job.is_some() || self.motion_starting {
+                ui.spinner();
+                if let Some(job_id) = self.motion_job {
+                    if ui.button("取消运动").clicked() {
+                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
+                    }
+                }
+            }
+            if self.slit_job.is_some() || self.slit_starting {
+                ui.spinner();
+                if let Some(job_id) = self.slit_job {
+                    if ui.button("取消扫描条").clicked() {
+                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
+                    }
+                }
+            }
             ui.separator();
             if ui.add_enabled(self.state.can_undo, egui::Button::new("↶ 撤销")).clicked() {
                 self.call("edit.undo", json!({}));
@@ -2041,6 +2168,107 @@ impl App {
             }
             wake();
         });
+    }
+
+    fn run_motion(&mut self) {
+        if self.work_busy() { return; }
+        let scope = self.analysis_scope_ids();
+        if matches!(&scope, Some(ids) if ids.is_empty()) {
+            self.status = "先标记至少一个已完成镜头，或切换到全片范围".into();
+            return;
+        }
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        self.status = "运动分析启动…".into();
+        self.motion_starting = true;
+        self.motion_key = self.current_stats_key();
+        std::thread::spawn(move || {
+            let mut params = json!({});
+            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
+            match rpc.call("job.start", json!({"method": "motion.run", "params": params})) {
+                Ok(value) => {
+                    if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
+                        let _ = tx.send(UiMsg::MotionJobStarted(job_id));
+                    }
+                }
+                Err(error) => { let _ = tx.send(UiMsg::MotionFailed(error)); }
+            }
+            wake();
+        });
+    }
+
+    fn export_motion_spectrum(&mut self) {
+        let Some(motion) = &self.motion_data else {
+            self.status = "先运行运动分析再导出指纹".into();
+            return;
+        };
+        if self.motion_key != self.current_stats_key() {
+            self.status = "范围已变化，请重新运行运动分析".into();
+            return;
+        }
+        let duration = motion.duration_s;
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG 图片", &["png"])
+            .set_file_name(format!("运动指纹-{:.0}s.png", duration))
+            .save_file() else { return; };
+        match self.scope_params() {
+            Ok(mut params) => {
+                params["path"] = json!(path.to_string_lossy());
+                self.call_quiet_result("export.motion_spectrum", params);
+            }
+            Err(error) => self.status = error,
+        }
+    }
+
+    fn export_slit_scan(&mut self) {
+        if self.work_busy() { return; }
+        let count = self.analysis_scope_ids().map(|ids| ids.len())
+            .unwrap_or(self.state.completed_count as usize);
+        if count == 0 { self.status = "没有可导出的已完成镜头".into(); return; }
+        let confirmed = rfd::MessageDialog::new()
+            .set_title("导出镜头扫描条")
+            .set_description(format!("将对 {count} 个镜头逐帧解码，生成 slit-scan 网格图。
+长片或大量镜头可能耗时数分钟，可取消。继续？"))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show() == rfd::MessageDialogResult::Yes;
+        if !confirmed { return; }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG 图片", &["png"])
+            .set_file_name("镜头扫描条.png")
+            .save_file() else { return; };
+        let scope = self.analysis_scope_ids();
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        self.status = "扫描条导出启动…".into();
+        self.slit_starting = true;
+        std::thread::spawn(move || {
+            let mut params = json!({"path": path.to_string_lossy(), "width": 160, "columns": 6});
+            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
+            match rpc.call("job.start", json!({"method": "slit.run", "params": params})) {
+                Ok(value) => {
+                    if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
+                        let _ = tx.send(UiMsg::SlitJobStarted(job_id));
+                    }
+                }
+                Err(error) => { let _ = tx.send(UiMsg::SlitFailed(error)); }
+            }
+            wake();
+        });
+    }
+
+    fn export_stills(&mut self) {
+        let Some(folder) = rfd::FileDialog::new().pick_folder() else { return; };
+        match self.scope_params() {
+            Ok(mut params) => {
+                params["path"] = json!(folder.to_string_lossy());
+                params["count"] = json!(100);
+                self.status = "导出 100 静帧…".into();
+                self.call_quiet_result("export.stills", params);
+            }
+            Err(error) => self.status = error,
+        }
     }
 
     fn note_panel(&mut self, ui: &mut egui::Ui) {

@@ -5,7 +5,7 @@ use eframe::egui::{self, TextureHandle};
 use crate::{model::*, theme};
 
 #[derive(Clone, Copy, Default, PartialEq)]
-pub enum Topic { #[default] Duration, Rhythm, Colors }
+pub enum Topic { #[default] Duration, Rhythm, Colors, Motion }
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Scope { #[default] All, Marked }
@@ -27,6 +27,10 @@ struct Detail {
 
 pub enum Action {
     RunColors,
+    RunMotion,
+    ExportMotion,
+    ExportSlit,
+    ExportStills,
     Thumbnail(u64),
     Locate { frame: u64, shot_id: Option<String> },
 }
@@ -37,11 +41,13 @@ impl Workspace {
     pub fn reset_results(&mut self) { self.detail = None; }
 
     pub fn show(&mut self, ui: &mut egui::Ui, title: &str, stats: Option<&StatsData>, colors: Option<&ColorAnalysis>,
-                thumbs: &HashMap<String, TextureHandle>, stem: &str, busy: bool) -> Vec<Action> {
+                motion: Option<&MotionAnalysis>, thumbs: &HashMap<String, TextureHandle>, stem: &str,
+                busy: bool, motion_busy: bool) -> Vec<Action> {
         let mut actions = Vec::new();
         let previous = self.topic;
         ui.horizontal(|ui| {
-            for (topic, label) in [(Topic::Duration, "剪辑"), (Topic::Rhythm, "节奏"), (Topic::Colors, "色彩")] {
+            for (topic, label) in [(Topic::Duration, "剪辑"), (Topic::Rhythm, "节奏"),
+                                   (Topic::Colors, "色彩"), (Topic::Motion, "运动")] {
                 ui.selectable_value(&mut self.topic, topic, label);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -62,12 +68,12 @@ impl Workspace {
             ui.allocate_ui_with_layout(egui::vec2(rail_width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_max_width(rail_width);
                 egui::ScrollArea::vertical().id_salt("analysis-rail").show(ui, |ui| {
-                    ui.monospace(match self.topic { Topic::Duration => "01 / SHOTS", Topic::Rhythm => "02 / RHYTHM", Topic::Colors => "03 / COLOR" });
+                    ui.monospace(match self.topic { Topic::Duration => "01 / SHOTS", Topic::Rhythm => "02 / RHYTHM", Topic::Colors => "03 / COLOR", Topic::Motion => "04 / MOTION" });
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(title).size(18.0).strong());
                     ui.add_space(24.0);
                     if let Some(stats) = stats {
-                        self.metrics(ui, stats, colors);
+                        self.metrics(ui, stats, colors, motion, busy, motion_busy, &mut actions);
                     } else {
                         ui.weak("完成切镜后显示指标。");
                     }
@@ -94,6 +100,7 @@ impl Workspace {
                         Topic::Duration => self.duration(ui, stats),
                         Topic::Rhythm => self.rhythm(ui, stats),
                         Topic::Colors => self.colors(ui, colors, thumbs, stem, busy, &mut actions),
+                        Topic::Motion => self.motion(ui, motion, busy, motion_busy, &mut actions),
                     }
                 });
             });
@@ -101,8 +108,13 @@ impl Workspace {
         actions
     }
 
-    fn metrics(&mut self, ui: &mut egui::Ui, stats: &StatsData, colors: Option<&ColorAnalysis>) {
+    fn metrics(&mut self, ui: &mut egui::Ui, stats: &StatsData, colors: Option<&ColorAnalysis>,
+               motion: Option<&MotionAnalysis>, busy: bool, motion_busy: bool, actions: &mut Vec<Action>) {
         let overview = &stats.overview;
+        if self.topic == Topic::Motion {
+            self.motion_metrics(ui, motion, busy, motion_busy, actions);
+            return;
+        }
         let primary = if self.topic == Topic::Rhythm {
             stats.special.densest_cut_windows.first().and_then(|w| w.cut_count).unwrap_or(0)
         } else { overview.shot_count.unwrap_or(0) };
@@ -280,6 +292,106 @@ impl Workspace {
         ui.weak(format!("当前范围：{} 个镜头色板 · {} 个相邻切换色差", colors.shot_color_statistics.shot_palette.len(), colors.shot_color_statistics.cut_color_distance.len()));
     }
 
+    fn motion_metrics(&mut self, ui: &mut egui::Ui, motion: Option<&MotionAnalysis>,
+                      busy: bool, motion_busy: bool, actions: &mut Vec<Action>) {
+        let Some(motion) = motion else {
+            ui.weak("逐帧比较相邻画面，得到运动量曲线与每个镜头的平均运动量。");
+            ui.add_space(10.0);
+            if ui.add_enabled(!busy && !motion_busy, egui::Button::new("运行运动分析")).clicked() {
+                actions.push(Action::RunMotion);
+            }
+            ui.add_space(8.0);
+            ui.weak("首次分析会解码范围内全部帧，可随时取消。");
+            return;
+        };
+        let values: Vec<f64> = motion.shots.iter().filter_map(|s| s.motion).collect();
+        let mean = if values.is_empty() { None } else { Some(values.iter().sum::<f64>() / values.len() as f64) };
+        let peak = motion.shots.iter().filter_map(|s| s.motion.map(|m| (m, s)))
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        ui.weak("镜头平均运动量");
+        ui.label(egui::RichText::new(mean.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into()))
+            .size(40.0).monospace().color(theme::accent()));
+        if let Some((value, shot)) = peak {
+            if ui.button(format!("最高 #{} · {:.3}", shot.shot.shot_number, value)).clicked() {
+                self.detail = Some(Detail { title: "运动量最高镜头".into(),
+                    description: format!("{} 起 · 平均运动量 {value:.3}", clock(shot.shot.start_time_s)),
+                    ids: vec![shot.shot.shot_id.clone()], frame: Some(shot.shot.start_frame) });
+            }
+        }
+        ui.add_space(10.0);
+        metric(ui, "阈值", Some(motion.parameters.threshold as f64), "/255");
+        metric(ui, "曲线采样点", Some(motion.samples.len() as f64), "");
+        ui.add_space(12.0);
+        if ui.add_enabled(!motion_busy, egui::Button::new("↻ 重新分析")).clicked() {
+            actions.push(Action::RunMotion);
+        }
+        if ui.button("导出运动指纹 PNG").clicked() { actions.push(Action::ExportMotion); }
+        ui.add_space(8.0);
+        ui.strong("镜头运动量");
+        egui::ScrollArea::vertical().id_salt("motion-shots").max_height(240.0).show(ui, |ui| {
+            let mut rows: Vec<_> = motion.shots.iter().collect();
+            rows.sort_by(|a, b| b.motion.unwrap_or(0.0).total_cmp(&a.motion.unwrap_or(0.0)));
+            for row in rows {
+                let value = row.motion.map(|v| format!("{v:.3}")).unwrap_or_else(|| "—".into());
+                if ui.button(format!("#{:03}  {value}  {:.2}s", row.shot.shot_number, row.shot.duration_s)).clicked() {
+                    self.detail = Some(Detail { title: format!("镜头 #{:03} 运动量", row.shot.shot_number),
+                        description: format!("平均 {value} · {} 起 · {} 个样本",
+                                             clock(row.shot.start_time_s), row.motion_samples),
+                        ids: vec![row.shot.shot_id.clone()], frame: Some(row.shot.start_frame) });
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ui.weak("首帧没有同镜头内前帧，按定义排除，避免把硬切当成运动。");
+    }
+
+    fn motion(&mut self, ui: &mut egui::Ui, motion: Option<&MotionAnalysis>, busy: bool,
+              motion_busy: bool, actions: &mut Vec<Action>) {
+        ui.heading("运动指纹");
+        ui.horizontal(|ui| {
+            ui.weak("逐帧 RGB 绝对差 · 阈值 10/255");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(!motion_busy, egui::Button::new("导出扫描条…")).clicked() {
+                    actions.push(Action::ExportSlit);
+                }
+                if ui.add_enabled(!motion_busy, egui::Button::new("100 静帧…")).clicked() {
+                    actions.push(Action::ExportStills);
+                }
+            });
+        });
+        ui.add_space(12.0);
+        let Some(motion) = motion else {
+            ui.label("运行运动分析后显示逐帧曲线。");
+            if ui.add_enabled(!busy && !motion_busy, egui::Button::new("运行运动分析")).clicked() {
+                actions.push(Action::RunMotion);
+            }
+            return;
+        };
+        let points: Vec<(f64, Option<f64>)> = motion.samples.iter()
+            .map(|s| (s.video_time_s, Some(s.motion))).collect();
+        let cuts: Vec<f64> = motion.shots.iter().skip(1).map(|s| s.shot.start_time_s).collect();
+        if let Some(i) = line(ui, &points, motion.duration_s.max(0.001), "0–1", 360.0, &cuts) {
+            let sample = &motion.samples[i];
+            let shot_id = motion.shots.iter()
+                .find(|s| s.shot.start_time_s <= sample.video_time_s && sample.video_time_s < s.shot.end_time_s)
+                .map(|s| s.shot.shot_id.clone()).into_iter().collect();
+            self.detail = Some(Detail { title: "运动采样".into(),
+                description: format!("{} · 帧 {} · 运动量 {:.4}",
+                                     clock(sample.video_time_s), sample.start_frame, sample.motion),
+                ids: shot_id, frame: Some(sample.start_frame) });
+        }
+        ui.weak("横轴为源视频时间；灰线为切镜点。点击曲线查看对应帧。");
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!motion_busy, egui::Button::new("导出运动指纹 PNG")).clicked() {
+                actions.push(Action::ExportMotion);
+            }
+            if ui.add_enabled(!busy && !motion_busy, egui::Button::new("重新分析")).clicked() {
+                actions.push(Action::RunMotion);
+            }
+        });
+    }
+
     pub fn details(&mut self, ctx: &egui::Context, stats: Option<&StatsData>, colors: Option<&ColorAnalysis>, thumbs: &HashMap<String, TextureHandle>, stem: &str) -> Vec<Action> {
         let mut actions = Vec::new();
         let Some(detail) = self.detail.as_mut() else { return actions; };
@@ -418,7 +530,7 @@ fn line(ui: &mut egui::Ui, points: &[(f64, Option<f64>)], duration: f64, unit: &
 mod tests {
     use super::*;
 
-    fn payloads() -> (StatsData, ColorAnalysis) {
+    fn payloads() -> (StatsData, ColorAnalysis, MotionAnalysis) {
         let stats = serde_json::from_value(serde_json::json!({
             "metadata": {"scope": {"kind": "selected_shots", "analysis_complete": true, "scope_duration_s": 4.0}},
             "shots": [{"shot_id": "a", "shot_number": 1, "start_frame": 0, "end_frame_exclusive": 24,
@@ -456,20 +568,34 @@ mod tests {
             "shot_color_statistics": {"shot_palette": [], "cut_color_distance": [],
                                       "largest_color_changes": [], "status": "ok", "reason": ""}
         })).unwrap();
-        (stats, colors)
+        let motion = serde_json::from_value(serde_json::json!({
+            "duration_s": 4.0,
+            "parameters": {"threshold": 10, "first_frame": "excluded"},
+            "samples": [
+                {"start_frame": 0, "end_frame": 24, "video_time_s": 0.0, "motion": 0.0},
+                {"start_frame": 24, "end_frame": 48, "video_time_s": 1.0, "motion": 0.2}
+            ],
+            "shots": [
+                {"shot_id": "a", "shot_number": 1, "start_frame": 0, "end_frame_exclusive": 24,
+                 "start_time_s": 0.0, "end_time_s": 1.0, "duration_s": 1.0, "motion": 0.0, "motion_samples": 23},
+                {"shot_id": "b", "shot_number": 2, "start_frame": 24, "end_frame_exclusive": 96,
+                 "start_time_s": 1.0, "end_time_s": 4.0, "duration_s": 3.0, "motion": 0.2, "motion_samples": 71}
+            ]
+        })).unwrap();
+        (stats, colors, motion)
     }
 
     #[test]
     fn all_topics_render_with_scoped_payload_without_panicking() {
-        let (stats, colors) = payloads();
+        let (stats, colors, motion) = payloads();
         let thumbs = HashMap::new();
         let mut workspace = Workspace::default();
-        for topic in [Topic::Duration, Topic::Rhythm, Topic::Colors] {
+        for topic in [Topic::Duration, Topic::Rhythm, Topic::Colors, Topic::Motion] {
             workspace.topic = topic;
             let ctx = egui::Context::default();
             let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let actions = workspace.show(ui, "clip", Some(&stats), Some(&colors), &thumbs, "stem", false);
+                    let actions = workspace.show(ui, "clip", Some(&stats), Some(&colors), Some(&motion), &thumbs, "stem", false, false);
                     assert!(actions.len() <= 1);
                 });
             });

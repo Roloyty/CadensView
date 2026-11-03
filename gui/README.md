@@ -70,7 +70,9 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 | 检测 | TransNetV2 切镜（GPU DirectML/CPU 自适应、可取消、进度、失败自动 CPU 重试） |
 | 编辑 | 拆分/合并、共享边界精确校正（输入帧号、逐帧预览、应用/取消）、笔记、撤销重做、保存/另存为（SQLite；默认拒绝覆盖，确认后临时文件校验再替换） |
 | 缩略图 | 镜头列表行内缩略图（串行 worker+磁盘缓存+虚拟滚动） |
-| 分析 | 独立工作区（F11）：剪辑 / 节奏 / 色彩三主题，左指标右图表；柱、折线、色带可点击回看镜头与源帧；范围可选“全片已完成镜头”或“已标记镜头” |
+| 分析 | 独立工作区（F11）：剪辑 / 节奏 / 色彩 / 运动四主题，左指标右图表；柱、折线、色带可点击回看镜头与源帧；范围可选“全片已完成镜头”或“已标记镜头” |
+| 运动 | 逐帧 RGB 差（阈值 10/255）→ 镜头平均运动量、逐帧曲线、最高运动镜头；可导出运动指纹 PNG（横轴源时间+切镜线） |
+| 电影计量导出 | 镜头 slit-scan 扫描条网格（每镜头逐帧取中列）、范围内均匀 100 静帧（JPEG） |
 | 统计 | ASL/MSL/σ/CV/百分位、时长直方图、切镜密度、滑动平均 ASL、最密集切镜窗口、快切连击、分段节奏表（编辑后自动失效重算） |
 | 色彩 | 选中镜头五主色、全片秒级色带与代表帧（可取消后台任务）、当前范围镜头色板与相邻切换色差 |
 | 景别 | MobileNetV3 ONNX 五类识别（特写/大特写/全景/远景/中景），列表徽章显示 |
@@ -116,6 +118,8 @@ cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
 - 逐帧取帧走 ffmpeg 单次启动，约 50–150ms/次；连续播放不受影响
 - 景别模型在真人电影数据（MovieShots）上训练，动画泛化未验证，置信度仅供参考；模型与训练数据条款需分别核实，不能一概称“可商用”
 - 分析工作区范围只支持“全片已完成镜头 / 已标记镜头”；时间范围与 OP/ED 排除尚未暴露
+- 运动分析与扫描条会解码范围内全部帧，长片/大量镜头耗时明显；取消会中止并保留项目不变
+- 运动与扫描条算法参考 freder/cinemetrics，但该仓库未声明许可证，因此只借鉴方法与参数，代码为本项目独立实现；未移植章节色板、NLTK 英文字幕情感、cv2 旧版交互脚本
 - `.shotlab` 项目格式与官方 exe 兼容（v1 schema + settings 扩展字段）
 - 尚未逐套主题截图验收、未做所有分辨率/密集点击的完整 GUI 验收
 
@@ -127,14 +131,19 @@ cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
 ..\.venv\Scripts\python -m shotlab.cli shots   <p.shotlab>
 ..\.venv\Scripts\python -m shotlab.cli stats   <p.shotlab> [--shots 1,3]
 ..\.venv\Scripts\python -m shotlab.cli detect  <video.mkv> --save <p.shotlab> --device auto
+..\.venv\Scripts\python -m shotlab.cli motion  <p.shotlab> [--shots 1,3] [--spectrum out.png]
+..\.venv\Scripts\python -m shotlab.cli export slit   <out.png> --project <p.shotlab> [--shots 1,3]
+..\.venv\Scripts\python -m shotlab.cli export stills <dir>     --project <p.shotlab> --count 100
+..\.venv\Scripts\python -m shotlab.cli export motion <out.png> --project <p.shotlab>
 ..\.venv\Scripts\python -m shotlab.cli scale   <p.shotlab>
 ..\.venv\Scripts\python -m shotlab.cli palette <p.shotlab> --frame 120
 ..\.venv\Scripts\python -m shotlab.cli tags    <p.shotlab> set --shot 1 --tags 对话,夜景
-..\.venv\Scripts\python -m shotlab.cli export  csv|sheet|pdf|gif|frame --project <p.shotlab> [--shots 1,3] ...
+..\.venv\Scripts\python -m shotlab.cli export  csv|sheet|pdf|slit|stills|motion|gif|frame --project <p.shotlab> [--shots 1,3] ...
 ```
 
-**MCP**（stdio，13 个工具：cv_shots/cv_stats/cv_detect/cv_palette/cv_scale/cv_tags/
-cv_analysis/cv_export_csv/cv_contact_sheet/cv_export_pdf/cv_export_gif/cv_export_frame/cv_subtitles）：
+**MCP**（stdio，17 个工具：cv_shots/cv_stats/cv_detect/cv_palette/cv_scale/cv_tags/
+cv_analysis/cv_motion/cv_motion_spectrum/cv_export_slit/cv_export_stills/
+cv_export_csv/cv_contact_sheet/cv_export_pdf/cv_export_gif/cv_export_frame/cv_subtitles）：
 
 - 项目根目录 `.mcp.json` 已注册（绝对脚本 + `-I`，从任意 cwd 启动；已实测 initialize/tools.list）
 - `cv_stats` / `cv_analysis` / CSV / 长图 / PDF 支持可选 `shot_ids`（取自 `cv_shots`）；省略=全部已完成镜头，空列表被拒绝
