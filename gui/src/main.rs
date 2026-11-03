@@ -2556,7 +2556,8 @@ impl App {
 
     fn player_panel(&mut self, ui: &mut egui::Ui) {
         let frames = self.index.as_ref().map(|i| i.frames()).unwrap_or(1).max(1);
-        let reserve = 210.0;
+        // 控制条约 210px；开着 A/B 对照时再给对照图让出高度（最多六成），否则对照图会被裁掉。
+        let reserve = 210.0 + self.ab_height(ui.available_width(), ui.available_height() - 210.0);
         // 画面区：滚轮缩放（1×–16×，1.25×/步，以光标为中心）、拖拽平移、双击复位。
         let texture_id = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
         match texture_id {
@@ -2959,7 +2960,37 @@ impl App {
         });
     }
 
+    /// 对照区想要的高度：图按宽度铺满时的自然高度，最多占 `space` 的六成。
+    fn ab_height(&self, width: f32, space: f32) -> f32 {
+        if !self.ab_show {
+            return 0.0;
+        }
+        let (Some(a), Some(b)) = (&self.ab_textures[0], &self.ab_textures[1]) else {
+            return 24.0;
+        };
+        let natural = if self.ab_overlay {
+            let size = self.ab_blend.as_ref().unwrap_or(a).size_vec2();
+            width * size.y / size.x + 28.0
+        } else {
+            [a, b]
+                .iter()
+                .map(|t| (width / 2.0 - 4.0) * t.size_vec2().y / t.size_vec2().x)
+                .fold(0.0, f32::max)
+        };
+        natural.min((space * 0.6).max(120.0)) + 8.0
+    }
+
     fn ab_view(&mut self, ui: &mut egui::Ui) {
+        // 滚动区里的可用高度是无限的，先在外面量好；窗口很矮时画面区有 140px 下限，
+        // 对照图仍可能放不下，留滚动兜底。
+        let max_h = ui.available_height().max(120.0);
+        egui::ScrollArea::vertical()
+            .id_salt("ab_view")
+            .auto_shrink([false, true])
+            .show(ui, |ui| self.ab_images(ui, max_h));
+    }
+
+    fn ab_images(&mut self, ui: &mut egui::Ui, max_h: f32) {
         let (Some(a), Some(b)) = (&self.ab_textures[0], &self.ab_textures[1]) else {
             ui.label("先设好 A 和 B 两帧");
             return;
@@ -2980,7 +3011,7 @@ impl App {
                 let size = blend.size_vec2();
                 ui.add(
                     egui::Image::new(egui::load::SizedTexture::new(blend.id(), size))
-                        .max_width(avail)
+                        .max_size(egui::vec2(avail, (max_h - 28.0).max(96.0)))
                         .maintain_aspect_ratio(true),
                 );
             }
@@ -2991,7 +3022,7 @@ impl App {
                     let size = texture.size_vec2();
                     ui.add(
                         egui::Image::new(egui::load::SizedTexture::new(texture.id(), size))
-                            .max_width(avail / 2.0 - 4.0)
+                            .max_size(egui::vec2(avail / 2.0 - 4.0, max_h))
                             .maintain_aspect_ratio(true),
                     );
                 }
