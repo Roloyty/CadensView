@@ -731,7 +731,7 @@ impl App {
                         // 范围或项目已经变化：迟到结果不得冒充当前选择。
                         self.stats_stale = true;
                         self.status = "色彩结果已过期，未应用".into();
-                        return;
+                        continue; // 只丢这条结果；同批消息与后续纹理上传照常处理
                     }
                     let stats = value.get("shot_statistics").cloned()
                         .and_then(|v| serde_json::from_value::<StatsData>(v).ok());
@@ -876,6 +876,11 @@ impl App {
                     } else {
                         format!("索引失败: {message}")
                     };
+                    // 边车只在成功时替换会话；旧视频仍在，把播放器和索引接回来。
+                    if self.state.has_index && !self.index_recovering {
+                        self.index_recovering = true;
+                        self.restore_index();
+                    }
                 }
                 ("analysis", "progress") => {
                     if let (Some(done), Some(total)) = (

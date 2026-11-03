@@ -10,8 +10,9 @@ from concurrent.futures import CancelledError
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
+from shotlab.fonts import ui_font
 from shotlab.statistics import AnalysisScope, build_context
 from t0.media import FrameReader
 
@@ -84,15 +85,6 @@ def analyze_motion(project, index, scope=AnalysisScope(), cancel=None, progress=
         scope=context.scope)
 
 
-def _font(size):
-    for path in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/segoeui.ttf"):
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
 def write_spectrum(result, path, width=1800, height=300, accent=(232, 163, 61)):
     """Render a motion fingerprint: source-time x motion area chart."""
     samples = result.get("samples") or []
@@ -105,13 +97,13 @@ def write_spectrum(result, path, width=1800, height=300, accent=(232, 163, 61)):
     for i in range(5):
         y = bottom - (bottom - top) * i / 4
         draw.line([(left, y), (right, y)], fill=(48, 48, 56))
-        draw.text((8, y - 7), f"{i / 4:.2f}", fill=(150, 150, 158), font=_font(11))
+        draw.text((8, y - 7), f"{i / 4:.2f}", fill=(150, 150, 158), font=ui_font(11))
     for i in range(5):
         x = left + (right - left) * i / 4
         seconds = duration * i / 4
         draw.line([(x, top), (x, bottom)], fill=(38, 38, 45))
         draw.text((x - 18, bottom + 8), f"{int(seconds) // 60:02d}:{int(seconds) % 60:02d}",
-                  fill=(150, 150, 158), font=_font(11))
+                  fill=(150, 150, 158), font=ui_font(11))
     for shot in (result.get("shots") or [])[1:]:
         x = left + (right - left) * min(1.0, max(0.0, shot["start_time_s"] / duration))
         draw.line([(x, top), (x, bottom)], fill=(70, 70, 80))
@@ -127,7 +119,7 @@ def write_spectrum(result, path, width=1800, height=300, accent=(232, 163, 61)):
                      fill=(accent[0] // 4, accent[1] // 4, accent[2] // 4))
         draw.line(points, fill=accent, width=2)
     draw.text((left, 2), "motion  |  threshold 10/255  |  first frame of Shot excluded",
-              fill=(190, 190, 198), font=_font(12))
+              fill=(190, 190, 198), font=ui_font(12))
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target, "PNG")

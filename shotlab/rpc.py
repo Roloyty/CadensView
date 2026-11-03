@@ -112,18 +112,24 @@ class Session:
         return [shot for shot in self.state()["shots"]
                 if not shot["pending"] and (selected is None or shot["id"] in selected)]
 
+    def _motion_key(self, scope):
+        # 镜头修订号覆盖撤销/重做等任何边界变化，项目 ID 和范围本身不够。
+        from shotlab.statistics import build_context
+        revision = build_context(self.project, self.index, scope).shot_revision
+        return (self.project.id, scope.kind, tuple(scope.shot_ids), revision)
+
     def motion_run(self, scope, cancel=None, progress=None):
         from shotlab.motion import analyze_motion
         result = analyze_motion(self.project, self.index, scope, cancel=cancel, progress=progress)
         self.motion = result
-        self.motion_key = (self.project.id, scope.kind, tuple(scope.shot_ids))
+        self.motion_key = self._motion_key(scope)
         return result
 
     def motion_current(self, params):
         if self.motion is None or self.project is None:
             raise ValueError("先运行运动分析")
         scope = self.analysis_scope(params)
-        if self.motion_key != (self.project.id, scope.kind, tuple(scope.shot_ids)):
+        if self.motion_key != self._motion_key(scope):
             raise ValueError("范围或镜头边界已变化，请重新运行运动分析")
         return self.motion
 
@@ -350,9 +356,7 @@ class Session:
             self.select(select_frame, record=False)
         self.project.validate()
         self.history.record(before, self.project, label, key)
-        self.stats = None  # 镜头结构/笔记变化后统计缓存失效
-        self.motion = None
-        self.motion_key = None
+        self.invalidate_results()  # 镜头结构/笔记变化后统计缓存失效
         self.dirty = True
         return self.state()
 
@@ -376,9 +380,15 @@ class Session:
             raise ValueError("分析已完成，不能覆盖已有镜头")
         ids = self.project.extend_analysis(cuts, complete=True)
         self.history.extend_analysis(cuts, complete=True, shot_ids=ids)
-        self.stats = None
+        self.invalidate_results()
         self.dirty = True
         return self.state()
+
+    def invalidate_results(self):
+        """镜头结构可能变化后，统计与运动缓存一并失效。"""
+        self.stats = None
+        self.motion = None
+        self.motion_key = None
 
 
 METHODS = {}
@@ -477,7 +487,7 @@ def _edit_select(session, params, emit=None):
 def _edit_undo(session, params, emit=None):
     session.project = session.history.restore(redo=False)
     session.project.validate()
-    session.stats = None
+    session.invalidate_results()
     session.dirty = True
     return session.state()
 
@@ -486,7 +496,7 @@ def _edit_undo(session, params, emit=None):
 def _edit_redo(session, params, emit=None):
     session.project = session.history.restore(redo=True)
     session.project.validate()
-    session.stats = None
+    session.invalidate_results()
     session.dirty = True
     return session.state()
 
@@ -591,8 +601,9 @@ def _export_contact_sheet(session, params, emit=None):
     """镜头网格长图 PNG（Pillow 渲染编号+时长）。"""
     if session.project is None or session.index is None:
         raise ValueError("先打开视频并建立索引")
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     from t0.media import FrameReader
+    from shotlab.fonts import ui_font
 
     path = Path(params["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -632,10 +643,7 @@ def _export_contact_sheet(session, params, emit=None):
 
     img = Image.new("RGB", (sheet_w, sheet_h), (24, 24, 28))
     draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("C:/Windows/Fonts/segoeui.ttf", 11)
-    except OSError:
-        font = ImageFont.load_default()
+    font = ui_font(11)
 
     for i, (thumb_arr, shot) in enumerate(thumbs):
         row, col = divmod(i, cols)
@@ -653,7 +661,7 @@ def _export_contact_sheet(session, params, emit=None):
 
 @method("export.gif_range")
 def _export_gif_range(session, params, emit=None):
-    """计算 GIF 导出所需的精确时间范围（帧号→秒）。"""
+    """计算 GIF 导出所需的精确时间范围（帧号→相对首帧的秒数，与播放器 -ss 同一坐标）。"""
     if session.index is None:
         raise ValueError("先建立索引")
     start_frame = int(params["start_frame"])
@@ -661,8 +669,9 @@ def _export_gif_range(session, params, emit=None):
     start_frame = max(0, min(start_frame, len(session.index.pts) - 1))
     end_frame = max(start_frame + 1, min(end_frame, len(session.index.pts)))
     index = session.index
-    start_s = float(index.pts[start_frame] * index.tb)
-    end_s = float(index.pts[end_frame - 1] * index.tb) + float(index.durations[end_frame - 1] * index.tb)
+    origin = index.pts[0]
+    start_s = float((index.pts[start_frame] - origin) * index.tb)
+    end_s = float((index.pts[end_frame - 1] - origin + index.durations[end_frame - 1]) * index.tb)
     return {"start_s": start_s, "duration_s": end_s - start_s, "frame_count": end_frame - start_frame}
 
 
@@ -905,12 +914,13 @@ def _export_pdf_sheet(session, params, emit=None):
     """全镜头 PDF 联系表（原版 contact_sheet.PdfSheet 移植，Pillow 渲染）。"""
     if session.project is None or session.index is None:
         raise ValueError("先打开视频并建立索引")
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     from t0.media import FrameReader
+    from shotlab.fonts import ui_font
 
     path = Path(params["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    cols = int(params.get("columns", 4))
+    cols = max(1, int(params.get("columns", 4)))
     thumb_w = int(params.get("thumb_width", 240))
     page_h = int(params.get("page_height", 2970))  # ~A4 @ 300dpi 缩小
 
@@ -928,30 +938,32 @@ def _export_pdf_sheet(session, params, emit=None):
             h, w = arr.shape[:2]
             tw = thumb_w
             th = int(h * tw / w)
+            if th == 0:
+                continue
             ys = (np.arange(th) * h // th).clip(0, h - 1)
             xs = (np.arange(tw) * w // tw).clip(0, w - 1)
             thumbs.append((arr[ys][:, xs], shot))
     finally:
         reader.close()
+    if not thumbs:
+        raise ValueError("镜头缩略图尺寸无效")
 
     import math
-    try:
-        font = ImageFont.truetype("C:/Windows/Fonts/segoeui.ttf", 11)
-        title_font = ImageFont.truetype("C:/Windows/Fonts/segoeui.ttf", 16)
-    except OSError:
-        font = ImageFont.load_default()
-        title_font = font
+    font = ui_font(11)
+    title_font = ui_font(16)
 
     label_h = 22
     cell_h = max(t[0].shape[0] for t in thumbs) + label_h + 8
-    per_page = max(1, (page_h - 80) // cell_h)
+    # 页高决定行数；每行 cols 个镜头。
+    rows_per_page = max(1, (page_h - 80) // cell_h)
+    per_page = rows_per_page * cols
     pages = math.ceil(len(thumbs) / per_page)
     sheet_w = cols * (thumb_w + 8) + 16
 
     # 全部页合到一张长图，一次性存 PDF（Pillow 多页 PDF）
     all_pages = []
     for page in range(pages):
-        img = Image.new("RGB", (sheet_w, min(page_h, (per_page) * cell_h + 80)), (255, 255, 255))
+        img = Image.new("RGB", (sheet_w, min(page_h, rows_per_page * cell_h + 80)), (255, 255, 255))
         draw = ImageDraw.Draw(img)
         draw.text((16, 16), f"CadensView 镜头联系表 — 第 {page+1}/{pages} 页", fill=(40,40,40), font=title_font)
         y_off = 60

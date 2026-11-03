@@ -4,8 +4,9 @@ from concurrent.futures import CancelledError
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
+from shotlab.fonts import ui_font
 from shotlab.statistics import AnalysisScope, build_context
 from t0.media import FrameReader
 
@@ -15,15 +16,6 @@ CHUNK = 24
 def _cancel(cancel):
     if cancel is not None and cancel.is_set():
         raise CancelledError("Slit-scan export cancelled; no project data was changed")
-
-
-def _font(size):
-    for path in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/segoeui.ttf"):
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
 
 
 def render_shot(index, shot, width=160, cancel=None, progress=None):
@@ -91,7 +83,7 @@ def build_sheet(index, shots, path, width=160, columns=6, cell_height=120,
     sheet = Image.new("RGB", (columns * (cell_width + gap) + gap,
                               rows * (cell_height + label_height + gap) + gap), (22, 22, 26))
     draw = ImageDraw.Draw(sheet)
-    font = _font(11)
+    font = ui_font(11)
     for i, (image, shot) in enumerate(cells):
         row, column = divmod(i, columns)
         x = gap + column * (cell_width + gap) + (cell_width - image.width) // 2
