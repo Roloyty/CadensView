@@ -19,6 +19,51 @@ pub struct State {
     pub can_undo: bool,
     pub can_redo: bool,
     pub shots: Vec<ShotRow>,
+    pub regions: Vec<Region>,
+    pub metadata: std::collections::BTreeMap<String, String>,
+    pub has_detection_record: bool,
+    pub review_confirmed: u64,
+}
+
+/// 内容区段（OP/ED/预告…），统计时可整体排除。
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct Region {
+    pub id: String,
+    pub label: String,
+    pub start_frame: u64,
+    pub end_frame: u64,
+}
+
+pub const REGION_LABELS: [(&str, &str); 7] = [
+    ("OP", "片头曲"), ("ED", "片尾曲"), ("preview", "下集预告"), ("recap", "前情回顾"),
+    ("eyecatch", "眼动画/幕间"), ("title", "标题卡"), ("other", "其他"),
+];
+
+/// 景别代码 → 中文；人工标注、模型、VLM 共用同一套五类。
+pub const SCALES: [(&str, &str); 5] = [("ECS", "大特写"), ("CS", "特写"), ("MS", "中景"), ("FS", "全景"), ("LS", "远景")];
+
+pub fn scale_zh(code: &str) -> &str {
+    SCALES.iter().find(|(c, _)| *c == code).map(|(_, zh)| *zh).unwrap_or(code)
+}
+
+pub fn region_zh(code: &str) -> &str {
+    REGION_LABELS.iter().find(|(c, _)| *c == code).map(|(_, zh)| *zh).unwrap_or(code)
+}
+
+/// VLM 推断层（与人工标注分开显示）。
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct VlmInfo {
+    pub shot_scale: Option<String>,
+    pub camera_movement: Option<String>,
+    pub camera_angle: Option<String>,
+    pub content_type: Option<String>,
+    pub special_segment: Option<String>,
+    pub effects: Vec<String>,
+    pub description: String,
+    pub confidence: Option<f64>,
+    pub model: String,
 }
 
 fn string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -38,6 +83,10 @@ pub struct ShotRow {
     pub duration_s: f64,
     pub tags: Vec<String>,
     pub scale: Option<ScaleInfo>,
+    pub scale_manual: Option<String>,
+    pub cut_number: String,
+    pub vlm: Option<VlmInfo>,
+    pub region: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -176,6 +225,10 @@ pub struct StatsOverview {
     pub cv: Option<f64>,
     pub longest_shots: Vec<ShotMetric>,
     pub shortest_shots: Vec<ShotMetric>,
+    pub msl_ci95_s: Option<[f64; 2]>,
+    pub iqr_s: Option<f64>,
+    pub cutting_rate_per_min: Option<f64>,
+    pub cutting_rate_ci95_per_min: Option<[f64; 2]>,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -385,6 +438,27 @@ pub struct MotionAnalysis {
     pub shots: Vec<MotionShot>,
     pub duration_s: f64,
     pub parameters: MotionParameters,
+    pub timing_summary: TimingSummary,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct TimingSummary {
+    pub shots_with_reliable_koma: u64,
+    pub koma_shot_counts: std::collections::BTreeMap<String, u64>,
+    pub mean_drawings_per_s: Option<f64>,
+    pub mean_still_share: Option<f64>,
+    pub mean_pan_share: Option<f64>,
+    pub koma_changing_shots: u64,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
+#[serde(default)]
+pub struct KomaSegment {
+    pub start_frame: u64,
+    pub end_frame: u64,
+    pub koma_label: String,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -403,6 +477,13 @@ pub struct MotionShot {
     pub shot: ShotMetric,
     pub motion: Option<f64>,
     pub motion_samples: u64,
+    pub koma_label: Option<String>,
+    pub koma_reliable: bool,
+    pub drawings_per_s: Option<f64>,
+    pub still_share: Option<f64>,
+    pub pan_share: Option<f64>,
+    pub drawn_motion: Option<f64>,
+    pub koma_segments: Vec<KomaSegment>,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -447,6 +528,43 @@ mod tests {
         assert_eq!(state.project_id, "");
         let state: State = serde_json::from_value(serde_json::json!({"project_id": "abc"})).unwrap();
         assert_eq!(state.project_id, "abc");
+    }
+
+    #[test]
+    fn research_layers_survive_rpc_payload() {
+        let state: State = serde_json::from_value(serde_json::json!({
+            "project_id": "p", "regions": [{"id": "r1", "label": "OP", "start_frame": 0, "end_frame": 120}],
+            "metadata": {"title": "片"}, "has_detection_record": true,
+            "shots": [{"id": "a", "number": 0, "start": 0, "end": 24, "scale_manual": "CS", "cut_number": "012",
+                       "region": "OP", "vlm": {"shot_scale": "MS", "camera_movement": "pan", "effects": ["glow"],
+                       "description": "对话", "confidence": 0.8}}]
+        })).unwrap();
+        assert_eq!(state.regions[0].label, "OP");
+        assert_eq!(state.metadata["title"], "片");
+        let shot = &state.shots[0];
+        assert_eq!((shot.scale_manual.as_deref(), shot.cut_number.as_str()), (Some("CS"), "012"));
+        assert_eq!(shot.vlm.as_ref().unwrap().shot_scale.as_deref(), Some("MS"));
+        assert_eq!(scale_zh("ECS"), "大特写");
+        assert_eq!(region_zh("ED"), "片尾曲");
+    }
+
+    #[test]
+    fn motion_timing_and_robust_overview_parse() {
+        let motion: MotionAnalysis = serde_json::from_value(serde_json::json!({
+            "shots": [{"shot_id": "a", "shot_number": 1, "start_frame": 0, "end_frame_exclusive": 36,
+                       "motion": 0.1, "koma_label": "一拍三", "koma_reliable": true, "drawings_per_s": 8.0,
+                       "koma_segments": [{"start_frame": 0, "end_frame": 12, "koma_label": "一拍三"}]}],
+            "timing_summary": {"shots_with_reliable_koma": 1, "koma_shot_counts": {"一拍三": 1}},
+            "warnings": ["IVTC"]
+        })).unwrap();
+        assert_eq!(motion.shots[0].koma_label.as_deref(), Some("一拍三"));
+        assert_eq!(motion.timing_summary.koma_shot_counts["一拍三"], 1);
+        let overview: StatsOverview = serde_json::from_value(serde_json::json!({
+            "msl_s": 2.0, "msl_ci95_s": [1.5, 2.5], "cutting_rate_per_min": 30.0,
+            "cutting_rate_ci95_per_min": null
+        })).unwrap();
+        assert_eq!(overview.msl_ci95_s, Some([1.5, 2.5]));
+        assert!(overview.cutting_rate_ci95_per_min.is_none());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use eframe::egui::{self, TextureHandle};
 use crate::{model::*, theme};
 
 #[derive(Clone, Copy, Default, PartialEq)]
-pub enum Topic { #[default] Duration, Rhythm, Colors, Motion }
+pub enum Topic { #[default] Duration, Rhythm, Colors, Motion, Sound, Research }
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Scope { #[default] All, Marked }
@@ -14,6 +14,8 @@ pub enum Scope { #[default] All, Marked }
 pub struct Workspace {
     pub topic: Topic,
     pub scope: Scope,
+    /// 排除已标记的 OP/ED 等内容区段（与范围取交集）。
+    pub exclude_regions: bool,
     rolling: bool,
     detail: Option<Detail>,
 }
@@ -47,7 +49,8 @@ impl Workspace {
         let previous = self.topic;
         ui.horizontal(|ui| {
             for (topic, label) in [(Topic::Duration, "剪辑"), (Topic::Rhythm, "节奏"),
-                                   (Topic::Colors, "色彩"), (Topic::Motion, "运动")] {
+                                   (Topic::Colors, "色彩"), (Topic::Motion, "运动 · 拍数"),
+                                   (Topic::Sound, "声音"), (Topic::Research, "研究")] {
                 ui.selectable_value(&mut self.topic, topic, label);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -62,13 +65,15 @@ impl Workspace {
         });
         if previous != self.topic { self.detail = None; }
         ui.add_space(12.0);
+        // 研究页与声音页由各自模块绘制，这里只负责页签栏。
+        if matches!(self.topic, Topic::Research | Topic::Sound) { return actions; }
         let height = ui.available_height();
         let rail_width = (ui.available_width() * 0.23).clamp(210.0, 280.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(egui::vec2(rail_width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_max_width(rail_width);
                 egui::ScrollArea::vertical().id_salt("analysis-rail").show(ui, |ui| {
-                    ui.monospace(match self.topic { Topic::Duration => "01 / SHOTS", Topic::Rhythm => "02 / RHYTHM", Topic::Colors => "03 / COLOR", Topic::Motion => "04 / MOTION" });
+                    ui.monospace(match self.topic { Topic::Duration => "01 / SHOTS", Topic::Rhythm => "02 / RHYTHM", Topic::Colors => "03 / COLOR", Topic::Motion | Topic::Sound | Topic::Research => "04 / MOTION" });
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(title).size(18.0).strong());
                     ui.add_space(24.0);
@@ -101,6 +106,7 @@ impl Workspace {
                         Topic::Rhythm => self.rhythm(ui, stats),
                         Topic::Colors => self.colors(ui, colors, thumbs, stem, busy, &mut actions),
                         Topic::Motion => self.motion(ui, motion, busy, motion_busy, &mut actions),
+                        Topic::Sound | Topic::Research => {}
                     }
                 });
             });
@@ -127,8 +133,17 @@ impl Workspace {
                 }
             }
             ui.add_space(16.0);
-            metric(ui, "ASL · 平均时长", overview.asl_s, "s");
+            // 镜头时长右偏：中位数与四分位距是主指标，均值只作参照（Redfern）。
             metric(ui, "MSL · 中位时长", overview.msl_s, "s");
+            if let Some([low, high]) = overview.msl_ci95_s {
+                ui.small(egui::RichText::new(format!("95% 区间 {low:.2} – {high:.2}s")).color(theme::secondary()));
+            }
+            metric(ui, "IQR · 四分位距", overview.iqr_s, "s");
+            metric(ui, "剪辑率", overview.cutting_rate_per_min, "镜头/分");
+            if let Some([low, high]) = overview.cutting_rate_ci95_per_min {
+                ui.small(egui::RichText::new(format!("95% 区间 {low:.1} – {high:.1}")).color(theme::secondary()));
+            }
+            metric(ui, "ASL · 平均时长（参照）", overview.asl_s, "s");
             metric(ui, "标准差", overview.stddev_s, "s");
             metric(ui, "变异系数", overview.cv, "");
             ui.add_space(14.0);
@@ -345,6 +360,47 @@ impl Workspace {
         ui.weak("首帧没有同镜头内前帧，按定义排除，避免把硬切当成运动。");
     }
 
+    /// 动画时间：每镜头拍数、每秒张数、静止/摇移占比与作画运动；变拍镜头列出分段。
+    fn timing_table(&mut self, ui: &mut egui::Ui, motion: &MotionAnalysis) {
+        ui.heading("动画时间（拍数）");
+        ui.weak("相邻帧几乎不变记为同一张画；整幅平移由相位相关补偿后再判断是否换画。\
+                 跟拍镜头（人物不动、背景移动）会被误读成每帧换画，摇移占比高时拍数标为“参考”。");
+        for warning in &motion.warnings {
+            ui.colored_label(theme::warning(), warning);
+        }
+        let summary = &motion.timing_summary;
+        ui.horizontal_wrapped(|ui| {
+            for (label, count) in &summary.koma_shot_counts {
+                ui.monospace(format!("{label} {count} 镜头"));
+            }
+            ui.weak(format!("· 可靠判定 {} 镜头 · 变拍镜头 {} · 平均 {:.1} 张/秒", summary.shots_with_reliable_koma,
+                            summary.koma_changing_shots, summary.mean_drawings_per_s.unwrap_or(0.0)));
+        });
+        egui::ScrollArea::vertical().id_salt("timing-table").max_height(320.0).show(ui, |ui| {
+            egui::Grid::new("timing-grid").striped(true).num_columns(7).show(ui, |ui| {
+                for head in ["镜头", "拍数", "张/秒", "静止", "摇移", "作画运动", "变拍"] { ui.weak(head); }
+                ui.end_row();
+                for row in &motion.shots {
+                    if ui.link(format!("#{:03}", row.shot.shot_number)).clicked() {
+                        self.detail = Some(Detail { title: format!("镜头 #{:03} 动画时间", row.shot.shot_number),
+                            description: format!("{} · {:.2} 张/秒 · 摇移 {:.0}%", row.koma_label.clone().unwrap_or("—".into()),
+                                row.drawings_per_s.unwrap_or(0.0), row.pan_share.unwrap_or(0.0) * 100.0),
+                            ids: vec![row.shot.shot_id.clone()], frame: Some(row.shot.start_frame) });
+                    }
+                    let koma = row.koma_label.clone().unwrap_or_else(|| "—".into());
+                    if row.koma_reliable { ui.label(koma); } else { ui.weak(format!("{koma}（参考）")); }
+                    ui.monospace(row.drawings_per_s.map(|v| format!("{v:.1}")).unwrap_or("—".into()));
+                    ui.monospace(row.still_share.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or("—".into()));
+                    ui.monospace(row.pan_share.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or("—".into()));
+                    ui.monospace(row.drawn_motion.map(|v| format!("{v:.3}")).unwrap_or("—".into()));
+                    ui.label(row.koma_segments.iter().map(|s| format!("{}@{}", s.koma_label, s.start_frame))
+                        .collect::<Vec<_>>().join(" → "));
+                    ui.end_row();
+                }
+            });
+        });
+    }
+
     fn motion(&mut self, ui: &mut egui::Ui, motion: Option<&MotionAnalysis>, busy: bool,
               motion_busy: bool, actions: &mut Vec<Action>) {
         ui.heading("运动指纹");
@@ -381,6 +437,8 @@ impl Workspace {
                 ids: shot_id, frame: Some(sample.start_frame) });
         }
         ui.weak("横轴为源视频时间；灰线为切镜点。点击曲线查看对应帧。");
+        ui.add_space(12.0);
+        self.timing_table(ui, motion);
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui.add_enabled(!motion_busy, egui::Button::new("导出运动指纹 PNG")).clicked() {

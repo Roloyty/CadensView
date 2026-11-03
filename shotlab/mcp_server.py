@@ -259,5 +259,180 @@ def cv_analysis(project: str, shot_ids: list[str] | None = None) -> str:
         return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
 
 
+def _rpc_save(project: str, method: str, params: dict):
+    """Run one RPC method on the project and write the project back."""
+    with _session(project) as session:
+        from shotlab.rpc import METHODS
+        result = METHODS[method](session, params, None)
+        _save(session)
+        return result
+
+
+def _error(error):
+    return _dump({"ok": False, "error": f"{type(error).__name__}: {error}"})
+
+
+@mcp.tool()
+def cv_review(project: str) -> str:
+    """切点审校队列：低置信度/极短镜头/两侧差异小/人工新增/疑似漏检，按优先级排序。"""
+    try:
+        with _session(project) as session:
+            from shotlab.rpc import METHODS
+            return _dump(METHODS["review.run"](session, {}, None))
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_audit(project: str) -> str:
+    """检测结果与当前人工修订后的切点对比：保留/删除/新增/移动及人工改动比例。"""
+    try:
+        return _dump(_rpc(project, "research.audit", {}))
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_regions(project: str, action: Literal["list", "add", "remove"] = "list",
+               label: str = "OP", start_frame: int = 0, end_frame: int = 0, region_id: str = "") -> str:
+    """内容区段（OP/ED/preview/recap/eyecatch/title/other）。统计时 exclude_regions=true 可排除。"""
+    try:
+        if action == "list":
+            with _session(project) as session:
+                return _dump({"regions": session.regions})
+        if action == "add":
+            state = _rpc_save(project, "regions.add",
+                              {"label": label, "start_frame": start_frame, "end_frame": end_frame})
+        else:
+            state = _rpc_save(project, "regions.remove", {"id": region_id})
+        return _dump({"regions": state["regions"]})
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_metadata(project: str, values: dict[str, str] | None = None) -> str:
+    """作品信息（title/series/episode/year/director/storyboard/episode_director/animation_director/studio/source/notes）。
+    values 省略为读取；给定则合并写入（空字符串删除该字段）。"""
+    try:
+        if not values:
+            return _dump(_rpc(project, "metadata.get", {}))
+        return _dump({"metadata": _rpc_save(project, "metadata.set", {"values": values})["metadata"]})
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_stats_robust(project: str, shot_ids: list[str] | None = None, exclude_regions: bool = False) -> str:
+    """稳健统计：MSL 与 95% 区间、四分位距、剪辑率（每分钟镜头数，Poisson 95%）。"""
+    try:
+        stats = _rpc(project, "stats.run", {**_shot_params(shot_ids), "exclude_regions": exclude_regions})
+        keys = ("shot_count", "scope_duration_s", "msl_s", "msl_ci95_s", "iqr_s", "qcd", "asl_s",
+                "cutting_rate_per_min", "cutting_rate_ci95_per_min")
+        return _dump({k: stats["overview"].get(k) for k in keys} | {"warnings": stats["metadata"]["warnings"]})
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_repeats(project: str) -> str:
+    """重复镜头（流用/bank）检测：感知哈希比对，结果写回项目以便跨集比较。"""
+    try:
+        with _session(project) as session:
+            from shotlab.rpc import _repeats_run
+            result = _repeats_run(session, {})
+            _save(session)
+            return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_compare(projects: list[str], exclude_regions: bool = True, group_by: str = "", csv_path: str = "") -> str:
+    """多片/多集比较：各片 MSL/剪辑率区间，两两 Mann-Whitney（Holm 校正）与 Cliff's delta，
+    按集数的趋势，以及共享镜头序列（OP/ED，需先 cv_repeats）。group_by 为作品信息字段名。"""
+    try:
+        from shotlab.compare import compare_projects, write_compare_csv
+        result = compare_projects(projects, exclude_regions=exclude_regions, group_by=group_by or None)
+        if csv_path:
+            result["csv"] = write_compare_csv(result, csv_path)
+        return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_research_export(project: str, out_path: str, exclude_regions: bool = False,
+                       shot_ids: list[str] | None = None) -> str:
+    """研究长表 CSV（每镜头一行，含カット编号/区段/人工与模型景别/VLM/拍数），
+    另写 .method.json（来源、检测参数、人工改动审计、稳健统计）与 .lengths.txt。"""
+    try:
+        with _session(project) as session:
+            from shotlab.rpc import METHODS
+            params = {"path": out_path, "exclude_regions": exclude_regions, **_shot_params(shot_ids)}
+            session.motion_run(session.analysis_scope(params))  # 拍数列需要运动分析
+            try:
+                session.audio_run(session.analysis_scope(params))  # 响度/静音/声画列
+            except ValueError as error:
+                if "音轨" not in str(error):
+                    raise
+            result = METHODS["research.export"](session, params, None)
+            _save(session)
+            return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_audio(project: str, shot_ids: list[str] | None = None, exclude_regions: bool = False,
+             include_cuts: bool = False) -> str:
+    """声音统计（只用 ffmpeg）：逐镜头 EBU R128 响度、LRA、静音占比；整体响度与静音占比；
+    切点处是否落在静音里、前后 400 ms 响度跳变、声音变化早于（J）/晚于（L）/同步于画面切换。
+    音频指纹写回项目，供 cv_audio_match 跨集比对。"""
+    try:
+        with _session(project) as session:
+            params = dict(_shot_params(shot_ids), exclude_regions=exclude_regions)
+            result = session.audio_run(session.analysis_scope(params))
+            _save(session)
+            payload = {k: result[k] for k in ("summary", "warnings", "offset_s", "parameters", "shots")}
+            if include_cuts:
+                payload["cuts"] = result["cuts"]
+            return _dump(payload)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_audio_match(project: str, others: list[str], add_regions: bool = False) -> str:
+    """与其他集（.shotlab）比对 Chromaprint 音频指纹，找共同的 OP/ED 等长段音频，给出区段建议；
+    若两边都跑过 cv_repeats，会标出画面上也重复的建议。add_regions=True 时直接加为区段。"""
+    try:
+        with _session(project) as session:
+            from shotlab.rpc import METHODS, _audio_match
+            result = _audio_match(session, {"paths": others})
+            if add_regions:
+                for item in result["suggestions"]:
+                    METHODS["regions.add"](session, {"label": item["label"], "start_frame": item["start_frame"],
+                                                     "end_frame": item["end_frame"]}, None)
+            _save(session)
+            return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_vlm(project: str, shot_ids: list[str] | None = None, force: bool = False) -> str:
+    """用视觉大模型标注镜头（景别/运镜/角度/内容/OP·ED/撮影效果/一句描述），结果写回项目。
+    注意：会把每个镜头的关键帧发送到 ~/.cadensview/vlm.json 配置的服务商。"""
+    try:
+        with _session(project) as session:
+            from shotlab.rpc import _vlm_run
+            result = _vlm_run(session, {**_shot_params(shot_ids), "force": force})
+            _save(session)
+            return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

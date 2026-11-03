@@ -7,7 +7,9 @@ mod boundary;
 mod detect;
 mod model;
 mod player;
+mod research;
 mod rpc;
+mod sound;
 mod theme;
 mod thumb;
 
@@ -51,6 +53,9 @@ enum UiMsg {
     ExportSaved(String),
     SubtitlesLoaded { project_id: String, cues: Vec<model::SubtitleCue> },
     Saved { state: State, note: Option<(String, String)> },
+    AuxJobStarted(u64),
+    AuxFailed(String),
+    ResearchValue { method: String, value: Value },
 }
 
 /// 右侧面板的三个页签。
@@ -156,6 +161,14 @@ struct App {
     scale_starting: bool,
     boundary_editor: Option<boundary::BoundaryEditor>,
     subtitle_cues: Vec<model::SubtitleCue>,
+    // -- 研究工作区与通用后台任务（导出/审校/重复镜头/VLM） ---------------------
+    research: research::Research,
+    sound: sound::Sound,
+    aux_job: Option<u64>,
+    aux_method: Option<String>,
+    aux_label: String,
+    cut_input: String,
+    cut_shot: String,
 }
 
 impl App {
@@ -262,6 +275,13 @@ impl App {
             scale_starting: false,
             boundary_editor: None,
             subtitle_cues: Vec::new(),
+            research: research::Research::default(),
+            sound: sound::Sound::default(),
+            aux_job: None,
+            aux_method: None,
+            aux_label: String::new(),
+            cut_input: String::new(),
+            cut_shot: String::new(),
         };
         // 缩略图 worker：消费 ThumbOutcome 后发到主消息泵。
         let (thumb_done_tx, thumb_done_rx) = std::sync::mpsc::channel::<thumb::ThumbOutcome>();
@@ -469,6 +489,7 @@ impl App {
             || self.analysis_job.is_some() || self.scale_job.is_some()
             || self.motion_job.is_some() || self.motion_starting
             || self.slit_job.is_some() || self.slit_starting
+            || self.aux_method.is_some()
     }
 
     fn stop_playback(&mut self) {
@@ -513,6 +534,7 @@ impl App {
         self.marks.clear(); self.mark_anchor = None; self.boundary_editor = None;
         self.note_draft.clear(); self.note_shot.clear(); self.note_dirty = false;
         self.subtitle_cues.clear(); self.subtitle_loaded = false; self.subtitle_text = None;
+        self.research.reset(); self.sound.reset(); self.cut_shot.clear(); self.cut_input.clear();
         self.thumbs.clear(); self.thumb_pending.clear(); self.thumb_failed.clear();
         self.ab_textures = [None, None]; self.ab_data = [None, None]; self.ab_frames = [None, None];
         self.ab_blend = None; self.ab_show = false;
@@ -601,7 +623,7 @@ impl App {
                     if structure_changed {
                         self.stats_stale = true; self.stats_loading = false; self.stats_error = None;
                         self.analysis_data = None; self.barcode.clear(); self.analysis_view.reset_results();
-                        self.motion_data = None; self.motion_key.clear();
+                        self.motion_data = None; self.motion_key.clear(); self.sound.result = None;
                         self.palette = None; self.palette_shot.clear(); self.palette_loading = false;
                         self.marks.retain(|id| state.shots.iter().any(|s| &s.id == id && !s.pending));
                     }
@@ -754,6 +776,17 @@ impl App {
                     self.analysis_job = None;
                     self.analysis_starting = false;
                     self.status = format!("色彩分析: {error}");
+                }
+                UiMsg::AuxJobStarted(job_id) if self.aux_method.is_some() => self.aux_job = Some(job_id),
+                UiMsg::AuxJobStarted(_) => {}
+                UiMsg::AuxFailed(error) => {
+                    self.aux_job = None; self.aux_method = None;
+                    self.status = format!("⚠ {}: {error}", self.aux_label);
+                }
+                UiMsg::ResearchValue { method, value } => {
+                    if method == "compare.run" { self.status = "多片比较完成".into(); }
+                    if method == "vlm.config.set" { self.status = "VLM 配置已保存".into(); }
+                    if self.accept_value(&method, value) { self.call("project.state", json!({})); }
                 }
                 UiMsg::SubtitlesLoaded { project_id, cues } => {
                     if project_id == self.state.project_id {
@@ -973,6 +1006,32 @@ impl App {
                     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
                     self.status = if kind.contains("Cancelled") { "扫描条导出已取消".into() }
                         else { format!("扫描条导出: {message}") };
+                }
+                ("export" | "review" | "repeats" | "vlm", "progress") => {
+                    if let (Some(done), Some(total)) = (
+                        event.get("done").and_then(Value::as_u64),
+                        event.get("total").and_then(Value::as_u64),
+                    ) {
+                        self.status = format!("{}… {done}/{total}", self.aux_label);
+                    }
+                }
+                (method, phase @ ("done" | "error")) if self.aux_method.as_deref() == Some(method) => {
+                    let method = method.to_string();
+                    self.aux_job = None; self.aux_method = None;
+                    if phase == "error" {
+                        let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
+                        let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+                        self.status = if kind.contains("Cancelled") { format!("{}已取消", self.aux_label) }
+                            else { format!("⚠ {}: {message}", self.aux_label) };
+                    } else {
+                        let result = event.get("result").cloned().unwrap_or(Value::Null);
+                        if let Some(path) = result.get("path").and_then(Value::as_str) {
+                            self.status = format!("已导出 {path}");
+                        } else {
+                            self.status = format!("{}完成", self.aux_label);
+                        }
+                        if self.accept_value(&method, result) { self.call("project.state", json!({})); }
+                    }
                 }
                 (_, "error") => {
                     let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
@@ -1241,6 +1300,26 @@ impl App {
             ui.selectable_value(&mut self.analysis_view.scope, analysis::Scope::All, "全片已完成镜头");
             ui.selectable_value(&mut self.analysis_view.scope, analysis::Scope::Marked,
                 format!("已标记镜头 ({})", self.marks.len()));
+            ui.separator();
+            ui.add_enabled(!self.state.regions.is_empty(),
+                egui::Checkbox::new(&mut self.analysis_view.exclude_regions,
+                    format!("排除 OP/ED 等区段 ({})", self.state.regions.len())))
+                .on_disabled_hover_text("先把片头/片尾等镜头标记为区段");
+            let marked: Vec<&model::ShotRow> = self.state.shots.iter()
+                .filter(|s| !s.pending && self.marks.contains(&s.id)).collect();
+            let span = marked.iter().map(|s| s.start).min().zip(marked.iter().map(|s| s.end).max());
+            ui.add_enabled_ui(span.is_some(), |ui| {
+                ui.menu_button("标记为区段 ▾", |ui| {
+                    for (code, label) in model::REGION_LABELS {
+                        if ui.button(format!("{label}（{code}）")).clicked() {
+                            if let Some((start, end)) = span {
+                                self.call("regions.add", json!({"label": code, "start_frame": start, "end_frame": end}));
+                            }
+                            ui.close();
+                        }
+                    }
+                }).response.on_disabled_hover_text("先在镜头列表标记属于片头/片尾等的镜头");
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("← 返回观察").clicked() { self.toggle_analysis(); }
             });
@@ -1254,6 +1333,9 @@ impl App {
         }
         if self.motion_data.is_some() && self.motion_key != self.current_stats_key() {
             self.motion_data = None;
+        }
+        if self.sound.result.is_some() && self.sound.key != self.current_stats_key() {
+            self.sound.result = None;
         }
         let key = self.current_stats_key();
         if self.stats_key != key {
@@ -1275,6 +1357,18 @@ impl App {
             || self.slit_job.is_some() || self.slit_starting;
         let actions = self.analysis_view.show(ui, &title, self.stats.as_ref(), self.analysis_data.as_ref(),
             self.motion_data.as_ref(), &self.thumbs, &stem, busy, motion_busy);
+        if self.analysis_view.topic == analysis::Topic::Research {
+            let research_busy = self.work_busy();
+            for action in self.research.show(ui, &self.state, research_busy) {
+                self.handle_research(action);
+            }
+        }
+        if self.analysis_view.topic == analysis::Topic::Sound {
+            let sound_busy = self.work_busy();
+            for action in self.sound.show(ui, &self.state, sound_busy) {
+                self.handle_sound(action);
+            }
+        }
         for action in actions {
             match action {
                 analysis::Action::RunColors => self.run_analysis(),
@@ -1373,6 +1467,10 @@ impl App {
             return;
         }
         if plain && keys.space { self.toggle_playback(); }
+        // 1–5 人工景别（大特写/特写/中景/全景/远景），0 清除。
+        let digit = ctx.input(|i| [egui::Key::Num0, egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+                                    egui::Key::Num4, egui::Key::Num5].iter().position(|k| i.key_pressed(*k)));
+        if let (true, Some(digit)) = (plain && !keys.shift, digit) { self.set_manual_scale(digit); }
         if plain && keys.left { self.step_ui(-1); }
         if plain && keys.right { self.step_ui(1); }
         if plain && keys.up { self.adjacent_shot(-1); }
@@ -1743,6 +1841,14 @@ impl App {
                     }
                 }
             }
+            if self.aux_method.is_some() {
+                ui.spinner();
+                if let Some(job_id) = self.aux_job {
+                    if ui.button(format!("取消{}", self.aux_label)).clicked() {
+                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
+                    }
+                }
+            }
             ui.separator();
             if ui.add_enabled(self.state.can_undo, egui::Button::new("↶ 撤销")).clicked() {
                 self.call("edit.undo", json!({}));
@@ -1860,9 +1966,12 @@ impl App {
                         // 文本
                         ui.vertical(|ui| {
                             let marked = self.marks.contains(&shot.id);
-                            let scale_text = shot.scale.as_ref()
-                                .map(|s| format!(" [{}]", s.label_zh))
-                                .unwrap_or_default();
+                            // 人工景别优先（✎），否则显示模型结果。
+                            let scale_text = match (&shot.scale_manual, &shot.scale) {
+                                (Some(code), _) => format!(" [✎{}]", model::scale_zh(code)),
+                                (None, Some(s)) => format!(" [{}]", s.label_zh),
+                                _ => String::new(),
+                            };
                             let label = format!(
                                 "{}{} {}帧·{:.2}s{}{}",
                                 if marked { "● " } else { "" },
@@ -1985,17 +2094,28 @@ impl App {
     }
 
     fn scope_params(&self) -> Result<Value, String> {
-        match self.analysis_scope_ids() {
-            None => Ok(json!({})),
-            Some(ids) if ids.is_empty() => Err("先标记至少一个已完成镜头，或切换到全片范围".into()),
-            Some(ids) => Ok(json!({"shot_ids": ids})),
-        }
+        let mut params = match self.analysis_scope_ids() {
+            None => json!({}),
+            Some(ids) if ids.is_empty() => return Err("先标记至少一个已完成镜头，或切换到全片范围".into()),
+            Some(ids) => json!({"shot_ids": ids}),
+        };
+        if self.excluding_regions() { params["exclude_regions"] = json!(true); }
+        Ok(params)
+    }
+
+    /// 只有项目确实有区段时排除才生效，键与参数保持一致。
+    fn excluding_regions(&self) -> bool {
+        self.analysis_view.exclude_regions && !self.state.regions.is_empty()
     }
 
     fn current_stats_key(&self) -> String {
+        let regions = if self.excluding_regions() {
+            format!("|x:{}", self.state.regions.iter().map(|r| format!("{}-{}", r.start_frame, r.end_frame))
+                .collect::<Vec<_>>().join(","))
+        } else { String::new() };
         match self.analysis_scope_ids() {
-            None => format!("{}|all", self.state.project_id),
-            Some(ids) => format!("{}|{}", self.state.project_id, ids.join(",")),
+            None => format!("{}|all{regions}", self.state.project_id),
+            Some(ids) => format!("{}|{}{regions}", self.state.project_id, ids.join(",")),
         }
     }
 
@@ -2084,14 +2204,11 @@ impl App {
 
     fn call_stats(&self) {
         let key = self.current_stats_key();
-        let scope = self.analysis_scope_ids();
-        if matches!(&scope, Some(ids) if ids.is_empty()) { return; }
+        let Ok(params) = self.scope_params() else { return; };
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
         std::thread::spawn(move || {
-            let mut params = json!({});
-            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
             let message = match rpc.call("stats.run", params) {
                 Ok(value) => match serde_json::from_value::<StatsData>(value) {
                     Ok(stats) => UiMsg::StatsReady { key, stats },
@@ -2147,11 +2264,10 @@ impl App {
         if self.work_busy() {
             return;
         }
-        let scope = self.analysis_scope_ids();
-        if matches!(&scope, Some(ids) if ids.is_empty()) {
-            self.status = "先标记至少一个已完成镜头，或切换到全片范围".into();
-            return;
-        }
+        let params = match self.scope_params() {
+            Ok(params) => params,
+            Err(error) => { self.status = error; return; }
+        };
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
@@ -2159,8 +2275,6 @@ impl App {
         self.analysis_starting = true;
         self.analysis_key = self.current_stats_key();
         std::thread::spawn(move || {
-            let mut params = json!({});
-            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
             match rpc.call("job.start", json!({"method": "analysis.run", "params": params})) {
                 Ok(value) => {
                     if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
@@ -2177,11 +2291,10 @@ impl App {
 
     fn run_motion(&mut self) {
         if self.work_busy() { return; }
-        let scope = self.analysis_scope_ids();
-        if matches!(&scope, Some(ids) if ids.is_empty()) {
-            self.status = "先标记至少一个已完成镜头，或切换到全片范围".into();
-            return;
-        }
+        let params = match self.scope_params() {
+            Ok(params) => params,
+            Err(error) => { self.status = error; return; }
+        };
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
@@ -2189,8 +2302,6 @@ impl App {
         self.motion_starting = true;
         self.motion_key = self.current_stats_key();
         std::thread::spawn(move || {
-            let mut params = json!({});
-            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
             match rpc.call("job.start", json!({"method": "motion.run", "params": params})) {
                 Ok(value) => {
                     if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
@@ -2242,15 +2353,16 @@ impl App {
             .add_filter("PNG 图片", &["png"])
             .set_file_name("镜头扫描条.png")
             .save_file() else { return; };
-        let scope = self.analysis_scope_ids();
+        let Ok(mut params) = self.scope_params() else { return; };
+        params["path"] = json!(path.to_string_lossy());
+        params["width"] = json!(160);
+        params["columns"] = json!(6);
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
         self.status = "扫描条导出启动…".into();
         self.slit_starting = true;
         std::thread::spawn(move || {
-            let mut params = json!({"path": path.to_string_lossy(), "width": 160, "columns": 6});
-            if let Some(ids) = scope { params["shot_ids"] = json!(ids); }
             match rpc.call("job.start", json!({"method": "slit.run", "params": params})) {
                 Ok(value) => {
                     if let Some(job_id) = value.get("job_id").and_then(Value::as_u64) {
@@ -2269,8 +2381,7 @@ impl App {
             Ok(mut params) => {
                 params["path"] = json!(folder.to_string_lossy());
                 params["count"] = json!(100);
-                self.status = "导出 100 静帧…".into();
-                self.call_quiet_result("export.stills", params);
+                self.start_aux_job("export.stills", params, "导出 100 静帧");
             }
             Err(error) => self.status = error,
         }
@@ -2343,6 +2454,7 @@ impl App {
                         self.tag_input.clear();
                     }
                 });
+                if !shot.pending { self.annotation_block(ui, &shot); }
                 ui.separator();
                 let current = self.player.as_ref().map(|p| p.frame()).unwrap_or(self.ui_frame);
                 let in_shot = current >= shot.start && current < shot.end;
@@ -2394,6 +2506,52 @@ impl App {
                 ui.label("（未选中镜头）");
             }
         }
+    }
+
+    /// 研究标注：カット编号、人工景别（与模型/VLM 分层显示）、所属区段。
+    fn annotation_block(&mut self, ui: &mut egui::Ui, shot: &model::ShotRow) {
+        ui.add_space(4.0);
+        if self.cut_shot != shot.id {
+            self.cut_shot = shot.id.clone();
+            self.cut_input = shot.cut_number.clone();
+        }
+        ui.horizontal(|ui| {
+            ui.strong("カット");
+            let response = ui.add(egui::TextEdit::singleline(&mut self.cut_input)
+                .hint_text("制作编号，如 C012").desired_width(90.0));
+            if response.lost_focus() && self.cut_input.trim() != shot.cut_number {
+                self.call("cut.set", json!({"shot_id": shot.id, "value": self.cut_input.trim()}));
+            }
+            if let Some(region) = &shot.region {
+                ui.colored_label(theme::warning(), format!("区段：{}", model::region_zh(region)));
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("景别");
+            for (index, (code, label)) in model::SCALES.iter().enumerate() {
+                let active = shot.scale_manual.as_deref() == Some(*code);
+                if ui.selectable_label(active, *label).on_hover_text(format!("快捷键 {}", index + 1)).clicked() {
+                    let value = if active { Value::Null } else { json!(code) };
+                    self.call("scale.set_manual", json!({"shot_id": shot.id, "label": value}));
+                }
+            }
+        });
+        let model_scale = shot.scale.as_ref().map(|s| format!("模型 {}（{:.0}%）", s.label_zh, s.confidence.unwrap_or(0.0) * 100.0));
+        let vlm_scale = shot.vlm.as_ref().and_then(|v| v.shot_scale.as_deref()).map(|s| format!("VLM {}", model::scale_zh(s)));
+        let hints: Vec<String> = model_scale.into_iter().chain(vlm_scale).collect();
+        if !hints.is_empty() { ui.weak(hints.join(" · ")); }
+        if let Some(vlm) = &shot.vlm {
+            ui.small(egui::RichText::new(format!("VLM：{} · {} · {}{}",
+                vlm.camera_movement.as_deref().unwrap_or("—"), vlm.content_type.as_deref().unwrap_or("—"),
+                vlm.description, if vlm.effects.is_empty() { String::new() } else { format!(" · {}", vlm.effects.join("/")) }))
+                .color(theme::secondary()));
+        }
+    }
+
+    fn set_manual_scale(&mut self, digit: usize) {
+        let Some(shot) = self.state.shots.iter().find(|s| s.id == self.state.selected_id && !s.pending) else { return; };
+        let label = if digit == 0 { Value::Null } else { json!(model::SCALES[digit - 1].0) };
+        self.call("scale.set_manual", json!({"shot_id": shot.id, "label": label}));
     }
 
     fn player_panel(&mut self, ui: &mut egui::Ui) {
@@ -2973,10 +3131,9 @@ impl App {
         else {
             return;
         };
-        self.status = "生成分析长图…".into();
         match self.scope_params() {
             Ok(mut params) => { params["path"] = json!(path.to_string_lossy());
-                self.call_quiet_result("export.contact_sheet", params); }
+                self.start_aux_job("export.contact_sheet", params, "生成分析长图"); }
             Err(error) => self.status = error,
         }
     }
@@ -2990,11 +3147,141 @@ impl App {
         else {
             return;
         };
-        self.status = "生成 PDF 联系表…".into();
         match self.scope_params() {
             Ok(mut params) => { params["path"] = json!(path.to_string_lossy());
-                self.call_quiet_result("export.pdf_sheet", params); }
+                self.start_aux_job("export.pdf_sheet", params, "生成 PDF 联系表"); }
             Err(error) => self.status = error,
+        }
+    }
+
+    /// 导出/审校/重复镜头/VLM 共用一个后台任务槽（边车同一时刻只跑一个任务）。
+    fn start_aux_job(&mut self, method: &str, params: Value, label: &str) {
+        if self.work_busy() {
+            self.status = "已有任务进行中，完成或取消后再试".into();
+            return;
+        }
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        self.aux_method = Some(method.to_string());
+        self.aux_label = label.to_string();
+        self.aux_job = None;
+        self.status = format!("{label}…");
+        let method = method.to_string();
+        std::thread::spawn(move || {
+            let message = match rpc.call("job.start", json!({"method": method, "params": params})) {
+                Ok(value) => match value.get("job_id").and_then(Value::as_u64) {
+                    Some(job_id) => UiMsg::AuxJobStarted(job_id),
+                    None => UiMsg::AuxFailed("任务没有返回 job_id".into()),
+                },
+                Err(error) => UiMsg::AuxFailed(error),
+            };
+            let _ = tx.send(message); wake();
+        });
+    }
+
+    /// 结果不是 State 的同步调用：原样交给研究面板。
+    fn call_value(&self, method: &str, params: Value) {
+        let method = method.to_string();
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        std::thread::spawn(move || {
+            let message = match rpc.call(&method, params) {
+                Ok(value) => UiMsg::ResearchValue { method, value },
+                Err(error) => UiMsg::RpcError(error),
+            };
+            let _ = tx.send(message); wake();
+        });
+    }
+
+    fn locate_frame(&mut self, frame: u64) {
+        self.analysis_open = false;
+        if let Some(player) = &self.player { player.show(frame); }
+        self.ui_frame = frame;
+        if let Some(shot) = self.state.shots.iter().find(|s| s.start <= frame && frame < s.end).map(|s| s.id.clone()) {
+            self.call("edit.select", json!({"shot_id": shot, "frame": frame}));
+        } else {
+            self.commit_cursor(frame);
+        }
+    }
+
+    /// 边车结果分给声音面板或研究面板；返回 true 时需要刷新项目状态。
+    fn accept_value(&mut self, method: &str, value: Value) -> bool {
+        if method.starts_with("audio.") {
+            return self.sound.accept(method, value).unwrap_or(false);
+        }
+        self.research.accept(method, value)
+    }
+
+    fn handle_sound(&mut self, action: sound::Action) {
+        match action {
+            sound::Action::Run => match self.scope_params() {
+                Ok(params) => {
+                    self.sound.key = self.current_stats_key();
+                    self.start_aux_job("audio.run", params, "声音分析");
+                }
+                Err(error) => self.status = error,
+            },
+            sound::Action::Match => {
+                let Some(paths) = rfd::FileDialog::new().add_filter("CadensView 项目", &["shotlab"]).pick_files() else { return; };
+                let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                self.start_aux_job("audio.match", json!({"paths": paths}), "跨集比对音频");
+            }
+            sound::Action::AddRegion { label, start_frame, end_frame } => {
+                self.call("regions.add", json!({"label": label, "start_frame": start_frame, "end_frame": end_frame}));
+            }
+            sound::Action::Locate(frame) => self.locate_frame(frame),
+        }
+    }
+
+    fn handle_research(&mut self, action: research::Action) {
+        match action {
+            research::Action::Rpc { method, params } => {
+                // 改变项目状态的调用直接取回 State；其余结果交给研究面板。
+                if matches!(method, "metadata.set" | "regions.add" | "regions.remove") { self.call(method, params); }
+                else { self.call_value(method, params); }
+            }
+            research::Action::Job { method, params, label } => self.start_aux_job(method, params, label),
+            research::Action::Locate(frame) => self.locate_frame(frame),
+            research::Action::Compare { group_by, include_regions } => {
+                let Some(paths) = rfd::FileDialog::new().add_filter("CadensView 项目", &["shotlab"]).pick_files() else { return; };
+                if paths.len() < 2 { self.status = "至少选择两个项目".into(); return; }
+                let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                self.status = format!("比较 {} 个项目…", paths.len());
+                self.call_value("compare.run", json!({"paths": paths, "group_by": group_by, "exclude_regions": !include_regions}));
+            }
+            research::Action::ExportResearch => {
+                let Some(path) = rfd::FileDialog::new().add_filter("CSV 表格", &["csv"])
+                    .set_file_name("研究长表.csv").save_file() else { return; };
+                match self.scope_params() {
+                    Ok(mut params) => {
+                        params["path"] = json!(path.to_string_lossy());
+                        if self.motion_data.is_none() {
+                            self.status = "提示：未运行“运动 · 拍数”，长表的拍数列为空".into();
+                        }
+                        self.call_quiet_result("research.export", params);
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            research::Action::RunVlm { force } => {
+                let Ok(mut params) = self.scope_params() else {
+                    self.status = "先标记镜头或切换到全片范围".into(); return;
+                };
+                let count = self.analysis_scope_ids().map(|ids| ids.len()).unwrap_or(self.state.completed_count as usize);
+                let target = self.research.vlm_config.as_ref()
+                    .map(|c| format!("{} · {}", c["provider"].as_str().unwrap_or(""), c["model"].as_str().unwrap_or("")))
+                    .unwrap_or_else(|| "已配置的服务商".into());
+                let confirmed = rfd::MessageDialog::new()
+                    .set_title("发送关键帧到视觉大模型")
+                    .set_description(format!("将把最多 {count} 个镜头、每个镜头约 3 张关键帧发送到 {target}，可能产生费用。\
+已标注且边界未变的镜头会跳过{}。继续？", if force { "（本次强制重新标注）" } else { "" }))
+                    .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
+                if !confirmed { return; }
+                params["force"] = json!(force);
+                self.start_aux_job("vlm.run", params, "视觉大模型标注");
+            }
         }
     }
 
@@ -3066,7 +3353,14 @@ fn main() -> eframe::Result<()> {
         "cadensview",
         options,
         Box::new(|cc| match App::new(cc) {
-            Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
+            Ok(mut app) => {
+                // 命令行/文件关联：cadensview.exe <项目.shotlab | 视频>
+                if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
+                    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("shotlab")) { app.open_project(path); }
+                    else { app.open_video(path); }
+                }
+                Ok(Box::new(app) as Box<dyn eframe::App>)
+            }
             Err(error) => Err(error.into()),
         }),
     )

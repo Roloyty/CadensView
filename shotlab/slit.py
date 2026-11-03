@@ -111,6 +111,8 @@ def export_stills(project, index, path, count=100, scope=AnalysisScope(),
         raise ValueError("范围内没有帧")
     folder = Path(path)
     folder.mkdir(parents=True, exist_ok=True)
+    if any(folder.glob("still_*.jpg")):
+        raise FileExistsError(f"{folder} 已有 still_*.jpg；请选择空文件夹，避免覆盖上一次导出")
     targets = []
     for i in range(count):
         offset = int((i + 0.5) * total_frames / count)

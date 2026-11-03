@@ -7,6 +7,7 @@ from math import sqrt
 from time import perf_counter
 
 from .model import AnalysisScope, StatisticsParameters, build_context, contiguous_blocks
+from .robust import summary as robust_summary
 
 
 def grid(end, step):
@@ -33,9 +34,13 @@ def shot_statistics(context, parameters=StatisticsParameters()):
     deviation = sqrt(float(sum((d - average) ** 2 for d in durations) / count)) if count else None
     ranks = lambda reverse: [s.to_dict() for s in sorted(records, key=lambda s: (-s.duration if reverse else s.duration, s.start))[:parameters.rank_count]]
     longest, shortest = ranks(True), ranks(False)
+    robust = robust_summary(durations) if count else {}
     overview = dict(shot_count=count, scope_duration_s=float(total), asl_s=float(average) if count else None,
                     msl_s=float(percentile(durations, 50)) if count else None, stddev_s=deviation,
-                    cv=deviation / float(average) if average else None, longest_shots=longest, shortest_shots=shortest)
+                    cv=deviation / float(average) if average else None, longest_shots=longest, shortest_shots=shortest,
+                    msl_ci95_s=robust.get("msl_ci95_s"), iqr_s=robust.get("iqr_s"), qcd=robust.get("qcd"),
+                    cutting_rate_per_min=robust.get("cutting_rate_per_min"),
+                    cutting_rate_ci95_per_min=robust.get("cutting_rate_ci95_per_min"))
     bin_width = Fraction(str(parameters.histogram_bin_s))
     histogram = []
     if durations:
@@ -114,6 +119,7 @@ def shot_statistics(context, parameters=StatisticsParameters()):
                                  shot_count=len(group), duration_s=float(group[-1].end - group[0].start), shot_ids=[s.shot_id for s in group]))
             group = []
     methods = dict(asdict(parameters), percentiles="Hyndman-Fan type 7 (linear)", standard_deviation="population",
+                   median_interval="order-statistic binomial 95%", cutting_rate="shots per minute, Byar Poisson 95%",
                    even_rolling_window="extra sample after center", density_denominator="covered time inside window",
                    segment_shot_assignment="full Shot by midpoint", dense_candidates="source-time grid, every exact cut, and final full window")
     return dict(metadata=context.metadata(methods), status="ok" if records else "empty", shots=[s.to_dict() for s in records],

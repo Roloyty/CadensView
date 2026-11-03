@@ -77,7 +77,31 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 | 色彩 | 选中镜头五主色、全片秒级色带与代表帧（可取消后台任务）、当前范围镜头色板与相邻切换色差 |
 | 景别 | MobileNetV3 ONNX 五类识别（特写/大特写/全景/远景/中景），列表徽章显示 |
 | 标签 | 镜头标签 chips（Enter 添加、点击删除），随项目持久化，CSV 含标签列 |
-| 导出 | 当前帧 PNG、镜头 GIF（palettegen 高质量）、镜头 CSV、全片分析长图、PDF 联系表（分页） |
+| 导出 | 当前帧 PNG、镜头 GIF（palettegen 高质量）、镜头 CSV、全片分析长图、PDF 联系表（分页）；长图/PDF/静帧走后台任务，可取消 |
+
+### 计量电影学 / 动画研究扩展
+
+| 模块 | 功能 |
+|---|---|
+| 稳健统计 | MSL 为主指标并给出次序统计量 95% 区间、IQR、剪辑率（镜头/分，Poisson 95%）；ASL 降为参照（Redfern 的口径） |
+| 内容区段 | 把已标记镜头标为 OP/ED/预告/回顾/眼动画/标题卡；分析页勾选“排除区段”后，统计、运动、导出都不计这些镜头 |
+| 动画时间（拍数） | 与运动分析同一遍解码：保持帧判定 → 每镜头一拍一/二/三/四以上、张/秒、静止占比、变拍分段；相位相关拆出整幅平移（摇移/拖动）与作画运动；30/60 帧源提示先做 IVTC |
+| 切点审校 | 审校队列按“检测置信度低 / 相邻镜头极短 / 两侧画面差异小 / 人工新增 / 检测分数次峰（疑似漏检）”排序，可逐个标“已核对”；人工改动审计给出保留/删除/新增/移动与改动比例 |
+| 标注层 | カット编号（多个镜头可共用）、人工景别（1–5 快捷键，与模型/VLM 分层显示）、作品信息（片名/系列/集数/分镜/演出/作监…）；标签、カット、人工景别、区段都进撤销链 |
+| 重复镜头 | 每镜头三帧感知哈希找流用镜头（相邻镜头不计）；哈希存进项目，供跨集比较找共享片段（OP/ED/回顾） |
+| 多片比较 | 选多个 .shotlab：各片 MSL/剪辑率区间、两两 Mann-Whitney（Holm 校正）+ Cliff's delta、按集数趋势、按作品信息分组、共享镜头序列 |
+| 一致性 | 人工景别 vs 模型、人工 vs VLM 的 Cohen's κ 与混淆矩阵 |
+| 视觉大模型 | 可选：每镜头约 3 张关键帧 → 景别/运镜/角度/内容类型/是否 OP·ED·眼动画/撮影效果/一句描述；单独的“VLM 推断”层，边界改动后自动失效；可从标注一键建议区段 |
+| 声音 | 只用自带 ffmpeg，一遍解码（24 分钟约 3–4 秒）：逐镜头 EBU R 128 响度（镜头内按 BS.1770 门限重新积分）、峰值瞬时响度、LRA（3 秒以上镜头）、静音占比；每个切点是否落在静音里、前后 400 ms 响度跳变、频谱变化比画面切换早（J-cut）/晚（L-cut）/同步；整体响度曲线 |
+| 跨集 OP/ED | 每个项目保存 Chromaprint 音频指纹；选其他集 .shotlab 比对，找出 ≥15 秒的共同音频，按位置建议片头曲/片尾曲区段（方法参照 Jellyfin Intro Skipper，独立实现）；两边都跑过重复镜头时标出“画面也重复” |
+| 研究导出 | 长表 CSV（每镜头一行，所有标注层并列）+ `.method.json`（来源、帧率/时间基、检测参数、人工改动审计、稳健统计、各标注层说明）+ `.lengths.txt`（每行一个镜头时长） |
+
+视觉大模型支持两类服务商（配置保存在 `~/.cadensview/vlm.json`，密钥不写进项目文件）：
+
+- **Anthropic Claude**：官方 `anthropic` SDK，默认 `claude-opus-5-5`、推理强度 low、JSON Schema 结构化输出，并开启服务端拒答回退（`fallbacks: "default"`）。可不填密钥而用 `ANTHROPIC_API_KEY`。
+- **OpenAI 兼容接口**：任何接受 `image_url` data URI 的 `/chat/completions`，例如通义千问 VL（DashScope compatible-mode）、智谱 GLM-4V、本地 Ollama / LM Studio。
+
+运行前会弹窗确认镜头数和服务商；关键帧会离开本机，版权片源请先确认服务商的数据条款。
 
 ## 主题（移植原版 Theme.qml）
 
@@ -99,7 +123,9 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 | Ctrl+A / Ctrl+Shift+A | 全选标记/清除标记 | Ctrl+O | 打开视频 |
 | Shift/Ctrl+点击镜头 | 范围标记 / 切换单个标记 | Alt+Enter | 视频模式 |
 | Ctrl+Shift+C | A/B 对照开关 | F11 | 分析工作区 |
-| Esc | 关闭弹窗/退出分析或视频模式/清标记 | | |
+| Esc | 关闭弹窗/退出分析或视频模式/清标记 | 1–5 / 0 | 人工景别（大特写…远景）/ 清除 |
+
+命令行：`cadensview.exe <项目.shotlab | 视频>` 启动后直接打开（可用于文件关联）。
 
 ## 测试
 
@@ -117,8 +143,12 @@ cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
 - 音频/字幕已接入，但长片音画漂移、暂停/seek 后的音画对齐仍缺真人长片验收；字幕仅实现 SRT，ASS 未解析
 - 逐帧取帧走 ffmpeg 单次启动，约 50–150ms/次；连续播放不受影响
 - 景别模型在真人电影数据（MovieShots）上训练，动画泛化未验证，置信度仅供参考；模型与训练数据条款需分别核实，不能一概称“可商用”
-- 分析工作区范围只支持“全片已完成镜头 / 已标记镜头”；时间范围与 OP/ED 排除尚未暴露
-- 运动分析与扫描条会解码范围内全部帧，长片/大量镜头耗时明显；取消会中止并保留项目不变
+- 分析范围支持“全片 / 已标记镜头”并可排除已标记区段；按时间段截取（不完整镜头）尚未暴露；OP/ED 可由音频指纹、VLM 或共享镜头序列给出建议，采纳仍需人工确认
+- 运动与拍数分析在不超过 320 像素宽的缩小画面上计算，长片仍需解码全部帧；取消会中止并保留项目不变
+- 拍数判定的已知局限：跟拍镜头（人物不动、背景移动）会被读成每帧换画，摇移占比 ≥30% 的镜头只标“参考”；3:2 下拉的 30/60 帧源需先 IVTC；只用合成片验证过，尚无真实动画的人工时间表对照
+- 声音分析只用合成音轨验证过（响度与 ffmpeg 自身的 R128 表一致到 0.1 LU 内）；静音阈值 −50 dBFS、频谱变化 6 dB、同步容差 2 帧都是起始值。J/L 判定只看频谱变化点，对白开口、音效起落同样会形成变化点，结果是供听辨的候选。指纹比对的区段首尾误差约 1 秒；没有用真实番剧多集验收过
+- 审校队列的阈值（置信度 0.7、6 帧、差异 0.08、次峰 0.25）是起始值，没有用真实片标定
+- 视觉大模型的标注没有用真实片做过准确率评估；Claude 后端只用模拟客户端测过请求格式，没有用真实密钥调用过
 - 运动与扫描条算法参考 freder/cinemetrics，但该仓库未声明许可证，因此只借鉴方法与参数，代码为本项目独立实现；未移植章节色板、NLTK 英文字幕情感、cv2 旧版交互脚本
 - `.shotlab` 项目格式与官方 exe 兼容（v1 schema + settings 扩展字段）
 - 尚未逐套主题截图验收、未做所有分辨率/密集点击的完整 GUI 验收
@@ -139,11 +169,25 @@ cargo test   # 设 CV_TEST_VIDEO/CV_TEST_INDEX/CV_TEST_FFMPEG 可跑播放精度
 ..\.venv\Scripts\python -m shotlab.cli palette <p.shotlab> --frame 120
 ..\.venv\Scripts\python -m shotlab.cli tags    <p.shotlab> set --shot 1 --tags 对话,夜景
 ..\.venv\Scripts\python -m shotlab.cli export  csv|sheet|pdf|slit|stills|motion|gif|frame --project <p.shotlab> [--shots 1,3] ...
+# 研究扩展（stats/motion 也接受 --exclude-regions）
+..\.venv\Scripts\python -m shotlab.cli regions  <p.shotlab> add --label OP --start 0 --end 2160
+..\.venv\Scripts\python -m shotlab.cli meta     <p.shotlab> --set title=片名 --set episode=3 --set storyboard=某某
+..\.venv\Scripts\python -m shotlab.cli review   <p.shotlab>
+..\.venv\Scripts\python -m shotlab.cli audit    <p.shotlab>
+..\.venv\Scripts\python -m shotlab.cli repeats  <p.shotlab>
+..\.venv\Scripts\python -m shotlab.cli compare  ep01.shotlab ep02.shotlab ep03.shotlab --group-by storyboard --csv 比较.csv
+..\.venv\Scripts\python -m shotlab.cli audio    <p.shotlab> [--cuts] [--exclude-regions]
+..\.venv\Scripts\python -m shotlab.cli audio-match ep02.shotlab ep01.shotlab ep03.shotlab [--add]
+..\.venv\Scripts\python -m shotlab.cli research 长表.csv --project <p.shotlab> --exclude-regions [--no-motion] [--no-audio]
+..\.venv\Scripts\python -m shotlab.cli vlm-config --provider openai_compatible --base-url https://dashscope.aliyuncs.com/compatible-mode/v1 --model qwen-vl-max --api-key-env DASHSCOPE_API_KEY
+..\.venv\Scripts\python -m shotlab.cli vlm      <p.shotlab> --exclude-regions
 ```
 
-**MCP**（stdio，17 个工具：cv_shots/cv_stats/cv_detect/cv_palette/cv_scale/cv_tags/
+**MCP**（stdio，28 个工具：cv_shots/cv_stats/cv_detect/cv_palette/cv_scale/cv_tags/
 cv_analysis/cv_motion/cv_motion_spectrum/cv_export_slit/cv_export_stills/
-cv_export_csv/cv_contact_sheet/cv_export_pdf/cv_export_gif/cv_export_frame/cv_subtitles）：
+cv_export_csv/cv_contact_sheet/cv_export_pdf/cv_export_gif/cv_export_frame/cv_subtitles，
+以及 cv_stats_robust/cv_regions/cv_metadata/cv_review/cv_audit/cv_repeats/cv_compare/
+cv_research_export/cv_vlm/cv_audio/cv_audio_match）：
 
 - 项目根目录 `.mcp.json` 已注册（绝对脚本 + `-I`，从任意 cwd 启动；已实测 initialize/tools.list）
 - `cv_stats` / `cv_analysis` / CSV / 长图 / PDF 支持可选 `shot_ids`（取自 `cv_shots`）；省略=全部已完成镜头，空列表被拒绝

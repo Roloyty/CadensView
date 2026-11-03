@@ -61,10 +61,14 @@ def _session(project=None):
 
 def _save(session):
     if session.store is not None:
-        session.settings['shot_tags'] = session.shot_tags
-        session.settings['scale_labels'] = session.scale_labels
+        session.settings = session.settings_snapshot()
         session.store.save(session.project, session.settings)
         session.dirty = False
+
+
+def _relative_seconds(index, frame):
+    """Seconds from the first indexed frame: the coordinate ffmpeg -ss uses for the source."""
+    return float((index.pts[frame] - index.pts[0]) * index.tb)
 
 
 def _cli_index(video: str, limit=None):
@@ -135,8 +139,8 @@ def _cli_export_gif(project: str, shot_number: int, out: str):
         if shot is None:
             raise CliError(f"镜头 {shot_number} 不存在或未完成")
         index = session.index
-        start_s = float(index.pts[shot["start"]] * index.tb)
-        end_s = float(index.pts[shot["end"] - 1] * index.tb) + float(index.durations[shot["end"] - 1] * index.tb)
+        start_s = _relative_seconds(index, shot["start"])
+        end_s = _relative_seconds(index, shot["end"] - 1) + float(index.durations[shot["end"] - 1] * index.tb)
         duration = end_s - start_s
         output = subprocess.run(
             [str(FFMPEG), "-nostdin", "-loglevel", "error",
@@ -157,7 +161,7 @@ def _cli_export_frame(project: str, frame: int, out: str):
     with _session(project) as session:
         index = session.index
         frame = max(0, min(frame, len(index.pts) - 1))
-        seconds = float(index.pts[frame] * index.tb)
+        seconds = _relative_seconds(index, frame)
         output = subprocess.run(
             [str(FFMPEG), "-nostdin", "-loglevel", "error",
              "-ss", f"{seconds:.6f}", "-i", index.path,
@@ -319,6 +323,134 @@ def cmd_subtitles(args):
         return payload
 
 
+def _scope_params(session, args):
+    params = _selection_params(session, getattr(args, "shots", None))
+    if getattr(args, "exclude_regions", False):
+        params["exclude_regions"] = True
+    return params
+
+
+def cmd_review(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS
+        return METHODS["review.run"](session, {}, None)
+
+
+def cmd_audit(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS
+        return METHODS["research.audit"](session, {}, None)
+
+
+def cmd_repeats(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import _repeats_run
+        result = _repeats_run(session, _scope_params(session, args))
+        _save(session)
+        return result
+
+
+def cmd_compare(args):
+    from shotlab.compare import compare_projects, write_compare_csv
+    result = compare_projects(args.projects, exclude_regions=not args.include_regions,
+                              group_by=args.group_by)
+    if args.csv:
+        result["csv"] = write_compare_csv(result, args.csv)
+    return result
+
+
+def cmd_research(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS
+        params = dict(_scope_params(session, args), path=args.out)
+        if not args.no_motion:
+            session.motion_run(session.analysis_scope(params))
+        if not args.no_audio:
+            _try_audio(session, params)
+        result = METHODS["research.export"](session, params, None)
+        _save(session)
+        return result
+
+
+def _try_audio(session, params):
+    """Audio columns when the source has a soundtrack; a silent film simply leaves them empty."""
+    try:
+        session.audio_run(session.analysis_scope(params))
+    except ValueError as error:
+        if "音轨" not in str(error):
+            raise
+
+
+def cmd_audio(args):
+    with _session(args.project) as session:
+        result = session.audio_run(session.analysis_scope(_scope_params(session, args)))
+        _save(session)  # 指纹写回项目，供其他集比对
+        payload = dict(summary=result["summary"], warnings=result["warnings"], offset_s=result["offset_s"],
+                       parameters=result["parameters"], shots=result["shots"])
+        if args.cuts:
+            payload["cuts"] = result["cuts"]
+        return payload
+
+
+def cmd_audio_match(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS, _audio_match
+        result = _audio_match(session, {"paths": args.others})
+        if args.add:
+            for item in result["suggestions"]:
+                METHODS["regions.add"](session, {"label": item["label"], "start_frame": item["start_frame"],
+                                                 "end_frame": item["end_frame"]}, None)
+            result["regions"] = session.regions
+        _save(session)
+        return result
+
+
+def cmd_regions(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS
+        if args.action == "add":
+            METHODS["regions.add"](session, {"label": args.label, "start_frame": args.start,
+                                             "end_frame": args.end}, None)
+            _save(session)
+        elif args.action == "remove":
+            METHODS["regions.remove"](session, {"id": args.id}, None)
+            _save(session)
+        return {"regions": session.regions}
+
+
+def cmd_meta(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import METHODS
+        if args.set:
+            values = {}
+            for item in args.set:
+                key, _, value = item.partition("=")
+                values[key.strip()] = value
+            METHODS["metadata.set"](session, {"values": values}, None)
+            _save(session)
+        return {"metadata": session.metadata}
+
+
+def cmd_vlm(args):
+    with _session(args.project) as session:
+        from shotlab.rpc import _vlm_run
+        result = _vlm_run(session, dict(_scope_params(session, args), force=args.force))
+        _save(session)
+        return result
+
+
+def cmd_vlm_config(args):
+    from shotlab.vlm import public_config, save_config
+    values = {k: getattr(args, k) for k in ("provider", "model", "base_url", "effort", "concurrency", "frames")
+              if getattr(args, k) is not None}
+    if args.api_key_env:
+        import os
+        values["api_key"] = os.environ.get(args.api_key_env, "")
+        if not values["api_key"]:
+            raise CliError(f"环境变量 {args.api_key_env} 为空")
+    return save_config(values) if values else public_config()
+
+
 def cmd_version(_args):
     return {"name": "cadensview-cli", "repo": str(REPO_ROOT)}
 
@@ -346,6 +478,7 @@ def build_parser():
     p.add_argument("project")
     p.add_argument("--shots", type=_parse_shot_numbers, default=None,
                    help="选择镜头编号（1 起，逗号分隔）；省略则分析全部已完成镜头")
+    p.add_argument("--exclude-regions", action="store_true", help="排除 OP/ED 等已标记区段")
     p.set_defaults(fn=cmd_stats)
 
     p = sub.add_parser("palette", help="单帧五色调色板")
@@ -358,6 +491,7 @@ def build_parser():
     p.add_argument("--shots", type=_parse_shot_numbers, default=None,
                    help="选择镜头编号（1 起，逗号分隔）；省略则分析全部已完成镜头")
     p.add_argument("--spectrum", default=None, help="同时导出运动指纹 PNG")
+    p.add_argument("--exclude-regions", action="store_true", help="排除 OP/ED 等已标记区段")
     p.set_defaults(fn=cmd_motion)
 
     p = sub.add_parser("scale", help="逐镜头景别识别")
@@ -390,6 +524,79 @@ def build_parser():
     p.add_argument("srt")
     p.add_argument("--at", type=float, default=None, help="查询某秒的台词")
     p.set_defaults(fn=cmd_subtitles)
+
+    p = sub.add_parser("review", help="切点审校队列（低置信度/极短/差异小/疑似漏检）")
+    p.add_argument("project")
+    p.set_defaults(fn=cmd_review)
+
+    p = sub.add_parser("audit", help="检测结果 vs 人工修订：改动比例")
+    p.add_argument("project")
+    p.set_defaults(fn=cmd_audit)
+
+    p = sub.add_parser("repeats", help="重复镜头（流用）检测，哈希写回项目")
+    p.add_argument("project")
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None)
+    p.set_defaults(fn=cmd_repeats)
+
+    p = sub.add_parser("compare", help="多片/多集比较（MSL、剪辑率、Mann-Whitney、Cliff's delta）")
+    p.add_argument("projects", nargs="+")
+    p.add_argument("--group-by", default=None, help="按作品信息字段分组，如 storyboard")
+    p.add_argument("--include-regions", action="store_true", help="不排除 OP/ED 等区段")
+    p.add_argument("--csv", default=None, help="同时写出各片汇总 CSV")
+    p.set_defaults(fn=cmd_compare)
+
+    p = sub.add_parser("research", help="研究长表 CSV + .method.json + .lengths.txt")
+    p.add_argument("out")
+    p.add_argument("--project", required=True)
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None)
+    p.add_argument("--exclude-regions", action="store_true")
+    p.add_argument("--no-motion", action="store_true", help="跳过运动/拍数分析（更快，但缺拍数列）")
+    p.add_argument("--no-audio", action="store_true", help="跳过声音分析（缺响度/静音/声画列）")
+    p.set_defaults(fn=cmd_research)
+
+    p = sub.add_parser("audio", help="声音统计：逐镜头响度/LRA/静音占比，切点处的静音、响度跳变与声画先后")
+    p.add_argument("project")
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None)
+    p.add_argument("--exclude-regions", action="store_true")
+    p.add_argument("--cuts", action="store_true", help="同时输出逐切点结果")
+    p.set_defaults(fn=cmd_audio)
+
+    p = sub.add_parser("audio-match", help="与其他集比对音频指纹，给出 OP/ED 区段建议")
+    p.add_argument("project")
+    p.add_argument("others", nargs="+", help="其他集的 .shotlab")
+    p.add_argument("--add", action="store_true", help="把建议直接加为区段并保存")
+    p.set_defaults(fn=cmd_audio_match)
+
+    p = sub.add_parser("regions", help="内容区段 list|add|remove")
+    p.add_argument("project")
+    p.add_argument("action", choices=("list", "add", "remove"))
+    p.add_argument("--label", default="OP", help="OP/ED/preview/recap/eyecatch/title/other")
+    p.add_argument("--start", type=int, default=0, help="起始帧（含）")
+    p.add_argument("--end", type=int, default=0, help="结束帧（不含）")
+    p.add_argument("--id", default=None)
+    p.set_defaults(fn=cmd_regions)
+
+    p = sub.add_parser("meta", help="作品信息；--set key=value 可多次")
+    p.add_argument("project")
+    p.add_argument("--set", action="append", default=[])
+    p.set_defaults(fn=cmd_meta)
+
+    p = sub.add_parser("vlm", help="视觉大模型标注镜头（会把关键帧发送给配置的服务商）")
+    p.add_argument("project")
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None)
+    p.add_argument("--exclude-regions", action="store_true")
+    p.add_argument("--force", action="store_true", help="忽略缓存重新标注")
+    p.set_defaults(fn=cmd_vlm)
+
+    p = sub.add_parser("vlm-config", help="查看/设置 VLM 服务商（密钥从环境变量读入，不出现在命令行）")
+    p.add_argument("--provider", choices=("anthropic", "openai_compatible"), default=None)
+    p.add_argument("--model", default=None)
+    p.add_argument("--base-url", dest="base_url", default=None)
+    p.add_argument("--effort", default=None)
+    p.add_argument("--concurrency", type=int, default=None)
+    p.add_argument("--frames", type=int, default=None)
+    p.add_argument("--api-key-env", default=None, help="从该环境变量读取 API key 写入用户配置")
+    p.set_defaults(fn=cmd_vlm_config)
 
     p = sub.add_parser("version", help="版本信息")
     p.set_defaults(fn=cmd_version)

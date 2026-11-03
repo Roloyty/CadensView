@@ -38,8 +38,9 @@ impl BoundaryEditor {
     }
 
     pub fn valid_for(&self, project_id: &str, shots: &[ShotRow]) -> bool {
+        // 右侧镜头被再拆分时上限会变，编辑框必须作废，不能拿旧范围预览。
         self.project_id == project_id && shots.get(self.boundary)
-            .map(|s| !s.pending && s.start == self.original).unwrap_or(false)
+            .map(|s| !s.pending && s.start == self.original && s.end == self.upper + 1).unwrap_or(false)
             && shots.get(self.boundary - 1).map(|s| !s.pending && s.start + 1 == self.lower).unwrap_or(false)
     }
 
@@ -117,6 +118,14 @@ mod tests {
         assert!(!draft.valid_for("new", &shots));
         shots[1].pending = true;
         assert!(BoundaryEditor::new("p", &shots, 0, Side::End, 0).is_none());
+        assert!(!draft.valid_for("p", &shots));
+    }
+
+    #[test]
+    fn splitting_the_right_shot_invalidates_the_editor() {
+        let mut shots = shots();
+        let draft = BoundaryEditor::new("p", &shots, 1, Side::Start, 20).unwrap();
+        shots[1].end = 30;  // 右侧镜头在 30 处被拆分，上限不再是 35
         assert!(!draft.valid_for("p", &shots));
     }
 }

@@ -3,22 +3,25 @@
 Motion is the share of channel samples whose absolute difference from the
 previous frame exceeds a fixed threshold. The first frame of each Shot has no
 in-Shot predecessor, so it is excluded from the Shot average rather than
-counting the hard cut as motion.
+counting the hard cut as motion. The same pass classifies each frame pair for
+animation timing (held drawings, camera moves, drawn motion; see animation.py).
 """
 
+from collections import Counter
 from concurrent.futures import CancelledError
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageDraw
 
+from shotlab.animation import (HOLD_MEAN, HOLD_SHARE, KOMA_LABELS, PAN_MIN_PX, THRESHOLD,
+                               PairClassifier, rate_warning, summarize_shot)
 from shotlab.fonts import ui_font
 from shotlab.statistics import AnalysisScope, build_context
 from t0.media import FrameReader
 
-THRESHOLD = 10
 CHUNK = 24
 MAX_CURVE_POINTS = 3000
+ANALYSIS_WIDTH = 320  # 运动与拍数在缩小画面上算：抗压缩噪声，也让长片可行
 
 
 def _cancel(cancel):
@@ -30,8 +33,16 @@ def _mean(values):
     return float(sum(values) / len(values)) if values else None
 
 
+def analysis_frame(frame, width=ANALYSIS_WIDTH):
+    """RGB array no wider than `width`; small sources are used as decoded."""
+    if frame.width > width:
+        height = max(2, round(frame.height * width / frame.width / 2) * 2)
+        return frame.reformat(width=width, height=height, format="rgb24").to_ndarray()
+    return frame.to_ndarray(format="rgb24")
+
+
 def analyze_motion(project, index, scope=AnalysisScope(), cancel=None, progress=None):
-    """Decode the selected completed Shots and measure per-frame motion."""
+    """Decode the selected completed Shots; measure motion, holds (koma) and camera moves."""
     context = build_context(project, index, scope)
     shots = context.records
     if not shots:
@@ -40,10 +51,11 @@ def analyze_motion(project, index, scope=AnalysisScope(), cancel=None, progress=
     done = 0
     curve = []  # (frame, motion)
     rows = []
+    classifier = PairClassifier()
     reader = FrameReader(index, sequential=True)
     try:
         for shot in shots:
-            values = []
+            values, kinds, shifts, locals_ = [], [], [], []
             previous = None
             position = shot.start_frame
             while position < shot.end_frame_exclusive:
@@ -52,18 +64,21 @@ def analyze_motion(project, index, scope=AnalysisScope(), cancel=None, progress=
                 frames = reader.read_range(position, end)
                 for offset, frame in enumerate(frames):
                     number = position + offset
-                    rgb = frame.to_ndarray(format="rgb24")
+                    rgb = analysis_frame(frame)
                     if previous is not None and previous.shape == rgb.shape:
-                        difference = np.abs(rgb.astype(np.int16) - previous.astype(np.int16))
-                        value = float(np.count_nonzero(difference > THRESHOLD)) / float(rgb.size)
-                        values.append(value)
-                        curve.append((number, value))
+                        pair = classifier.classify(previous, rgb)
+                        values.append(pair["motion"])
+                        curve.append((number, pair["motion"]))
+                        kinds.append(pair["kind"]); shifts.append(pair["shift"]); locals_.append(pair["local"])
                     previous = rgb
                     done += 1
                 position = end
                 if progress is not None:
                     progress(done, total)
-            rows.append(dict(shot.to_dict(), motion=_mean(values), motion_samples=len(values)))
+            fps = (shot.end_frame_exclusive - shot.start_frame) / float(shot.duration) if shot.duration else None
+            timing = summarize_shot(shot.start_frame, kinds, shifts, locals_, fps,
+                                    previous.shape[1] if previous is not None else None)
+            rows.append(dict(shot.to_dict(), motion=_mean(values), motion_samples=len(values), **timing))
     finally:
         reader.close()
     _cancel(cancel)
@@ -77,10 +92,23 @@ def analyze_motion(project, index, scope=AnalysisScope(), cancel=None, progress=
             start_frame=part[0][0], end_frame=part[-1][0] + 1,
             video_time_s=float((index.pts[part[0][0]] - index.pts[0]) * index.tb),
             motion=round(_mean([value for _, value in part]), 6)))
+    timed = [row for row in rows if row.get("koma")]
+    koma_counts = Counter(row["koma"] for row in timed if row["koma_reliable"])
+    warnings = [w for w in [rate_warning(index.metadata.get("average_rate"))] if w]
     return dict(
         samples=binned, shots=rows, duration_s=float(context.duration),
+        timing_summary=dict(
+            shots_with_reliable_koma=sum(koma_counts.values()),
+            koma_shot_counts={KOMA_LABELS[k]: koma_counts[k] for k in sorted(koma_counts)},
+            mean_drawings_per_s=_mean([r["drawings_per_s"] for r in timed if r.get("drawings_per_s")]),
+            mean_still_share=_mean([r["still_share"] for r in timed if r.get("still_share") is not None]),
+            mean_pan_share=_mean([r["pan_share"] for r in timed if r.get("pan_share") is not None]),
+            koma_changing_shots=sum(1 for r in timed if r.get("koma_segments"))),
+        warnings=warnings,
         parameters=dict(threshold=THRESHOLD, first_frame="excluded",
                         definition="share of RGB channel samples with |delta| > threshold",
+                        analysis_width=ANALYSIS_WIDTH, hold_share=HOLD_SHARE, hold_mean=HOLD_MEAN,
+                        pan_min_px=PAN_MIN_PX, koma="mode of inner exposure lengths (1/2/3/4+)",
                         curve_points=len(binned)),
         scope=context.scope)
 
