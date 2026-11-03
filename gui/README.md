@@ -64,7 +64,7 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 
 | 模块 | 功能 |
 |---|---|
-| 播放 | 连续播放/暂停、逐帧步进、滑块跳转（PTS 精确）、局部循环（镜头区间）、缩放平移（滚轮 1–8×/拖拽/双击复位）、音频播放（cpal+ffmpeg，音量/静音）、SRT 字幕、A/B 对照（并排+叠加混合） |
+| 播放 | 连续播放/暂停、逐帧步进、帧轨 scrub（Ctrl+滚轮缩放/滚轮平移）、局部循环、缩放平移（1–16×，1.25×/步，光标锚定）、音频（音量/静音）、SRT 字幕叠层、A/B 对照 |
 | 检测 | TransNetV2 切镜（GPU DirectML/CPU 自适应、可取消、进度、失败自动 CPU 重试） |
 | 编辑 | 拆分/合并/移边界、笔记、撤销重做、保存/另存为（SQLite，官方 exe 兼容） |
 | 缩略图 | 镜头列表行内缩略图（串行 worker+磁盘缓存+虚拟滚动） |
@@ -73,6 +73,27 @@ shotlab/rpc.py      新增边车：index.build / project.* / edit.* / undo / app
 | 景别 | MobileNetV3 ONNX 五类识别（特写/大特写/全景/远景/中景），列表徽章显示 |
 | 标签 | 镜头标签 chips（Enter 添加、点击删除），随项目持久化，CSV 含标签列 |
 | 导出 | 当前帧 PNG、镜头 GIF（palettegen 高质量）、镜头 CSV、全片分析长图、PDF 联系表（分页） |
+
+## 主题（移植原版 Theme.qml）
+
+设置菜单可切换 6 套配色：影院琥珀（二开版）/ 深灰 ink / 浅色 paper / 暖灰 warm /
+中性纯色 graphite / 横向渐变 dusk。全部取自原版调色板，运行时即时生效。
+
+## 快捷键（对齐原版 Main.qml）
+
+| 键 | 功能 | 键 | 功能 |
+|---|---|---|---|
+| Space | 播放/暂停 | ← / → | 逐帧 |
+| ↑ / ↓、Ctrl+←/→ | 上一/下一镜头 | L | 局部循环 |
+| B | 显示/隐藏镜头列表 | I | 显示/隐藏笔记面板 |
+| M | 静音 | + / - | 音量 ±5% |
+| F | 跳到帧 | G | 跳到时间 |
+| Ctrl+K | 在此帧拆分 | Ctrl+J | 与下一镜头合并 |
+| Ctrl+Z / Ctrl+Shift+Z | 撤销/重做 | Ctrl+S | 保存 |
+| Ctrl+E | 截帧 PNG | Ctrl+Shift+E | 分析长图 |
+| Ctrl+A / Ctrl+Shift+A | 全选标记/清除标记 | Ctrl+O | 打开视频 |
+| Shift/Ctrl+点击镜头 | 范围标记 / 切换单个标记 | Alt+Enter | 视频模式 |
+| F11 | 全屏 | Esc | 关闭弹窗/退出模式/清标记 |
 
 ## 测试
 

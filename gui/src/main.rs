@@ -115,6 +115,18 @@ struct App {
     volume: f32,
     muted: bool,
     last_frame: u64,
+    // -- 原版对齐：视图模式、帧轨、标记、跳转 --------------------------------
+    video_only: bool,
+    fullscreen: bool,
+    list_open: bool,
+    info_open: bool,
+    marks: HashSet<String>,
+    mark_anchor: Option<usize>,
+    track_zoom: f64,
+    track_start: f64,
+    jump_open: bool,
+    jump_time_mode: bool,
+    jump_text: String,
 }
 
 impl App {
@@ -192,6 +204,17 @@ impl App {
             volume: 0.8,
             muted: false,
             last_frame: 0,
+            video_only: false,
+            fullscreen: false,
+            list_open: true,
+            info_open: true,
+            marks: HashSet::new(),
+            mark_anchor: None,
+            track_zoom: 1.0,
+            track_start: 0.0,
+            jump_open: false,
+            jump_time_mode: false,
+            jump_text: String::new(),
         };
         // 缩略图 worker：消费 ThumbOutcome 后发到主消息泵。
         let (thumb_done_tx, thumb_done_rx) = std::sync::mpsc::channel::<thumb::ThumbOutcome>();
@@ -859,27 +882,457 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
-        egui::Panel::top("topbar").show(ui, |ui| self.topbar(ui));
+        self.handle_shortcuts(&ctx);
+        self.jump_window(&ctx);
+
+        if self.video_only {
+            // 视频模式（原版 Alt+Enter）：只留画面与控制条。
+            egui::CentralPanel::default().show(ui, |ui| self.player_panel(ui));
+            return;
+        }
+
+        egui::Panel::top("topbar")
+            .frame(egui::Frame::new().fill(theme::top()).inner_margin(egui::Margin::symmetric(10, 6)))
+            .show(ui, |ui| self.topbar(ui));
         egui::Panel::bottom("statusbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.state.dirty {
-                    ui.colored_label(theme::ACCENT, "● 未保存");
+                    ui.colored_label(theme::accent(), "● 未保存");
                 }
-                // 语义色：⚠ 开头为错误（红），完成/导出为通过（绿），其余常规。
                 let status_text = egui::RichText::new(&self.status);
                 let colored = if self.status.starts_with('⚠') {
-                    status_text.color(theme::BAD)
+                    status_text.color(theme::error())
                 } else if self.status.starts_with("已导出") || self.status.ends_with("完成") {
-                    status_text.color(theme::OK)
+                    status_text.color(theme::accent())
                 } else {
                     status_text
                 };
                 ui.label(colored);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (clock, total) = self.clock_labels();
+                    ui.monospace(format!("{clock} / {total}"));
+                });
             });
         });
-        egui::Panel::left("shots").default_size(230.0).show(ui, |ui| self.shot_list(ui));
-        egui::Panel::right("notes").default_size(320.0).show(ui, |ui| self.right_panel(ui));
+        if self.list_open {
+            egui::Panel::left("shots").default_size(230.0).show(ui, |ui| self.shot_list(ui));
+        }
+        if self.info_open {
+            egui::Panel::right("notes").default_size(320.0).show(ui, |ui| self.right_panel(ui));
+        }
         egui::CentralPanel::default().show(ui, |ui| self.player_panel(ui));
+    }
+}
+
+impl App {
+    /// 当前时间码 "mm:ss" 与总时长（原版 clockLabel 语义）。
+    fn clock_labels(&self) -> (String, String) {
+        let Some(index) = &self.index else {
+            return ("00:00".into(), "00:00".into());
+        };
+        let seconds = index.seconds(self.ui_frame.min(index.frames().saturating_sub(1)));
+        let total = index
+            .metadata
+            .duration_us
+            .map(|us| us / 1_000_000.0)
+            .unwrap_or_else(|| index.seconds(index.frames().saturating_sub(1)));
+        (clock_text(seconds), clock_text(total))
+    }
+
+    /// 原版快捷键表（Main.qml:681-709）。
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // 文本输入/弹窗聚焦时不抢键。
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if typing {
+            return;
+        }
+        let keys = ctx.input(|i| ShortcutKeys {
+            space: i.key_pressed(egui::Key::Space),
+            left: i.key_pressed(egui::Key::ArrowLeft),
+            right: i.key_pressed(egui::Key::ArrowRight),
+            up: i.key_pressed(egui::Key::ArrowUp),
+            down: i.key_pressed(egui::Key::ArrowDown),
+            l: i.key_pressed(egui::Key::L),
+            b: i.key_pressed(egui::Key::B),
+            i: i.key_pressed(egui::Key::I),
+            m: i.key_pressed(egui::Key::M),
+            f: i.key_pressed(egui::Key::F),
+            g: i.key_pressed(egui::Key::G),
+            plus: i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
+            minus: i.key_pressed(egui::Key::Minus),
+            k: i.key_pressed(egui::Key::K),
+            j: i.key_pressed(egui::Key::J),
+            z: i.key_pressed(egui::Key::Z),
+            s: i.key_pressed(egui::Key::S),
+            e: i.key_pressed(egui::Key::E),
+            a: i.key_pressed(egui::Key::A),
+            o: i.key_pressed(egui::Key::O),
+            escape: i.key_pressed(egui::Key::Escape),
+            f11: i.key_pressed(egui::Key::F11),
+            enter: i.key_pressed(egui::Key::Enter),
+            ctrl: i.modifiers.ctrl,
+            shift: i.modifiers.shift,
+            alt: i.modifiers.alt,
+        });
+        if keys.escape {
+            if self.jump_open {
+                self.jump_open = false;
+                return;
+            }
+            if self.video_only {
+                self.video_only = false;
+                return;
+            }
+            if !self.marks.is_empty() {
+                self.marks.clear();
+                self.mark_anchor = None;
+                return;
+            }
+        }
+        if keys.f11 {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+            return;
+        }
+        if keys.alt && keys.enter {
+            self.video_only = !self.video_only;
+            return;
+        }
+        let frames = self.index.as_ref().map(|i| i.frames()).unwrap_or(0);
+        if frames == 0 {
+            if keys.o && keys.ctrl {
+                self.pick_video();
+            }
+            return;
+        }
+
+        // 播放 / 步进 / 跳镜头
+        if keys.space {
+            self.toggle_playback();
+        }
+        if keys.left && !keys.ctrl {
+            self.step_ui(-1);
+        }
+        if keys.right && !keys.ctrl {
+            self.step_ui(1);
+        }
+        if keys.up || (keys.left && keys.ctrl) {
+            self.adjacent_shot(-1);
+        }
+        if keys.down || (keys.right && keys.ctrl) {
+            self.adjacent_shot(1);
+        }
+        if keys.l {
+            self.toggle_loop();
+        }
+        if keys.b {
+            self.commit_note();
+            self.list_open = !self.list_open;
+        }
+        if keys.i && self.state.completed_count > 0 {
+            self.toggle_info();
+        }
+        if keys.m {
+            self.muted = !self.muted;
+            if let Some(audio) = &self.audio {
+                audio.set_muted(self.muted);
+            }
+        }
+        if keys.plus {
+            self.volume = (self.volume + 0.05).min(1.0);
+            if let Some(audio) = &self.audio {
+                audio.set_volume(self.volume);
+            }
+        }
+        if keys.minus {
+            self.volume = (self.volume - 0.05).max(0.0);
+            if let Some(audio) = &self.audio {
+                audio.set_volume(self.volume);
+            }
+        }
+        if keys.f {
+            if self.index.is_some() {
+                self.jump_open = true;
+                self.jump_time_mode = false;
+                self.jump_text.clear();
+            }
+        }
+        if keys.g {
+            if self.index.is_some() {
+                self.jump_open = true;
+                self.jump_time_mode = true;
+                self.jump_text.clear();
+            }
+        }
+        // 编辑
+        if keys.ctrl && keys.k {
+            if self.state.selected_id.is_empty() {
+                return;
+            }
+            let frame = self.player.as_ref().map(|p| p.frame()).unwrap_or(self.ui_frame);
+            let within = self
+                .state
+                .shots
+                .iter()
+                .find(|s| s.id == self.state.selected_id)
+                .map(|s| frame >= s.start && frame < s.end && !s.pending)
+                .unwrap_or(false);
+            if within && frame > 0 {
+                self.call("edit.split", json!({"frame": frame}));
+            }
+        }
+        if keys.ctrl && keys.j {
+            if let Some(shot) = self
+                .state
+                .shots
+                .iter()
+                .find(|s| s.id == self.state.selected_id && !s.pending)
+                .cloned()
+            {
+                if shot.number + 1 < self.state.completed_count as usize {
+                    self.call("edit.merge", json!({"row": shot.number}));
+                }
+            }
+        }
+        if keys.ctrl && keys.z && keys.shift {
+            if self.state.can_redo {
+                self.call("edit.redo", json!({}));
+            }
+        } else if keys.ctrl && keys.z {
+            if self.state.can_undo {
+                self.call("edit.undo", json!({}));
+            }
+        }
+        if keys.ctrl && keys.s {
+            self.save_project(false);
+        }
+        if keys.ctrl && keys.e && keys.shift {
+            if self.state.completed_count > 0 {
+                self.export_contact_sheet();
+            }
+        } else if keys.ctrl && keys.e {
+            if self.index.is_some() {
+                self.export_frame();
+            }
+        }
+        if keys.ctrl && keys.a && keys.shift {
+            self.marks.clear();
+            self.mark_anchor = None;
+        } else if keys.ctrl && keys.a && self.list_open {
+            self.marks = self.state.shots.iter().filter(|s| !s.pending).map(|s| s.id.clone()).collect();
+        }
+        if keys.ctrl && keys.o {
+            if !self.index_busy {
+                self.pick_video();
+            }
+        }
+    }
+
+    fn pick_video(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("视频", &["mkv", "mp4", "avi", "mov", "webm", "ts", "m2ts", "flv"])
+            .pick_file()
+        {
+            self.open_video(path);
+        }
+    }
+
+    fn toggle_info(&mut self) {
+        self.commit_note();
+        self.info_open = !self.info_open;
+    }
+
+    fn toggle_playback(&mut self) {
+        let Some(player) = &self.player else { return };
+        let playing = player.is_playing();
+        if playing {
+            let frame = player.frame();
+            player.stop();
+            player.show(frame);
+            if let Some(audio) = &self.audio {
+                audio.stop();
+            }
+            self.loop_active = false;
+            self.commit_cursor(frame);
+        } else {
+            let frame = self.ui_frame;
+            player.play(frame);
+            self.start_audio(frame);
+        }
+    }
+
+    fn toggle_loop(&mut self) {
+        let Some(shot) = self
+            .state
+            .shots
+            .iter()
+            .find(|s| s.id == self.state.selected_id && !s.pending)
+            .cloned()
+        else {
+            return;
+        };
+        if self.loop_active {
+            self.loop_active = false;
+            if let Some(player) = &self.player {
+                player.stop();
+                player.show(self.ui_frame);
+            }
+            if let Some(audio) = &self.audio {
+                audio.stop();
+            }
+        } else {
+            self.loop_active = true;
+            if let Some(player) = &self.player {
+                player.play_loop(shot.start, shot.end);
+            }
+            self.start_audio_loop(shot.start, shot.end);
+        }
+    }
+
+    fn step_ui(&mut self, delta: i64) {
+        let frames = self.index.as_ref().map(|i| i.frames()).unwrap_or(0);
+        if frames == 0 {
+            return;
+        }
+        self.step(delta, frames);
+    }
+
+    fn adjacent_shot(&mut self, delta: i64) {
+        let index = self
+            .state
+            .shots
+            .iter()
+            .position(|s| s.id == self.state.selected_id);
+        let Some(current) = index else { return };
+        let target = (current as i64 + delta)
+            .clamp(0, self.state.shots.len() as i64 - 1) as usize;
+        if target == current {
+            return;
+        }
+        let shot = self.state.shots[target].clone();
+        if shot.pending {
+            return;
+        }
+        self.select_shot(&shot.id);
+    }
+
+    /// 跳转框（原版 F 帧号 / G 时间码）。
+    fn jump_window(&mut self, ctx: &egui::Context) {
+        if !self.jump_open {
+            return;
+        }
+        let mut open = true;
+        let title = if self.jump_time_mode { "跳转到时间" } else { "跳转到帧" };
+        let hint = if self.jump_time_mode { "mm:ss 或秒" } else { "帧号（0 起）" };
+        let mut commit = false;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(hint);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.jump_text).desired_width(180.0),
+                );
+                response.request_focus();
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("跳转").clicked() || enter {
+                    commit = true;
+                }
+            });
+        if !open {
+            self.jump_open = false;
+            return;
+        }
+        if commit {
+            if let Some(index) = &self.index {
+                let frames = index.frames();
+                let text = self.jump_text.trim();
+                let frame = if self.jump_time_mode {
+                    parse_timecode(text).map(|seconds| {
+                        let target = seconds as f64;
+                        // 找最接近的帧
+                        let mut best = 0u64;
+                        let mut best_delta = f64::MAX;
+                        for (number, _) in index.pts.iter().enumerate() {
+                            let delta = (index.seconds(number as u64) - target).abs();
+                            if delta < best_delta {
+                                best_delta = delta;
+                                best = number as u64;
+                            }
+                        }
+                        best
+                    })
+                } else {
+                    text.parse::<u64>().ok()
+                };
+                if let Some(frame) = frame {
+                    let frame = frame.min(frames.saturating_sub(1));
+                    self.ui_frame = frame;
+                    if let Some(player) = &self.player {
+                        player.show(frame);
+                    }
+                    self.commit_cursor(frame);
+                    self.jump_open = false;
+                }
+            }
+        }
+    }
+}
+
+struct ShortcutKeys {
+    space: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    l: bool,
+    b: bool,
+    i: bool,
+    m: bool,
+    f: bool,
+    g: bool,
+    plus: bool,
+    minus: bool,
+    k: bool,
+    j: bool,
+    z: bool,
+    s: bool,
+    e: bool,
+    a: bool,
+    o: bool,
+    escape: bool,
+    f11: bool,
+    enter: bool,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+}
+
+
+fn clock_text(seconds: f64) -> String {
+    let total = seconds.max(0.0) as u64;
+    format!("{:02}:{:02}", total / 60, total % 60)
+}
+
+/// 解析 "mm:ss" / "h:mm:ss" / 纯秒数。
+fn parse_timecode(text: &str) -> Option<f64> {
+    let parts: Vec<&str> = text.split(':').collect();
+    match parts.len() {
+        1 => parts[0].trim().parse::<f64>().ok(),
+        2 => {
+            let minutes = parts[0].trim().parse::<f64>().ok()?;
+            let seconds = parts[1].trim().parse::<f64>().ok()?;
+            Some(minutes * 60.0 + seconds)
+        }
+        3 => {
+            let hours = parts[0].trim().parse::<f64>().ok()?;
+            let minutes = parts[1].trim().parse::<f64>().ok()?;
+            let seconds = parts[2].trim().parse::<f64>().ok()?;
+            Some(hours * 3600.0 + minutes * 60.0 + seconds)
+        }
+        _ => None,
     }
 }
 
@@ -957,13 +1410,47 @@ impl App {
                 self.call("edit.redo", json!({}));
             }
             if self.state.pending_start.is_some() && self.index.is_some() {
-                ui.colored_label(theme::MUTED, "（有待分析尾段：先跑检测）");
+                ui.colored_label(theme::warning(), "（有待分析尾段：先跑检测）");
             }
+            // 右侧：主题 / 视频模式 / 全屏（原版「设置」菜单语义）
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.selectable_label(self.fullscreen, "全屏").clicked() {
+                    self.fullscreen = !self.fullscreen;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                }
+                if ui.selectable_label(self.video_only, "视频模式").clicked() {
+                    self.video_only = !self.video_only;
+                }
+                ui.menu_button(format!("🎨 {}", theme::current_title()), |ui| {
+                    let current = theme::current_index();
+                    ui.label(egui::RichText::new(theme::current_key()).small().weak());
+                    for (index, (key, title)) in theme::THEME_KEYS.iter().enumerate() {
+                        let _ = key;
+                        if ui
+                            .selectable_label(current == index, *title)
+                            .clicked()
+                        {
+                            theme::set_current(index);
+                            theme::install(ui.ctx());
+                            ui.ctx().request_repaint();
+                            ui.close();
+                        }
+                    }
+                });
+            });
         });
     }
 
     fn shot_list(&mut self, ui: &mut egui::Ui) {
-        ui.heading("镜头");
+        ui.horizontal(|ui| {
+            ui.heading("镜头");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.marks.is_empty() {
+                    ui.colored_label(theme::accent(), format!("已标记 {}", self.marks.len()));
+                }
+                ui.weak(format!("{:03}", self.state.shots.len()));
+            });
+        });
         let mut follow = None;
         let row_height = 64.0;
         let total = self.state.shots.len();
@@ -994,29 +1481,31 @@ impl App {
                                 texture.id(),
                                 egui::Rect::from_min_size(origin, fitted),
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                theme::INK,
+                                theme::ink(),
                             );
                             ui.painter_at(thumb_rect).rect_stroke(
                                 thumb_rect, 1.0,
-                                if selected { egui::Stroke::new(2.0, theme::ACCENT) }
+                                if selected { egui::Stroke::new(2.0, theme::accent()) }
                                 else { egui::Stroke::NONE },
                                 egui::StrokeKind::Inside,
                             );
                         } else {
                             self.request_thumb(&shot, &key);
                             ui.painter_at(thumb_rect).rect_filled(
-                                thumb_rect, 0.0, theme::GROUND);
+                                thumb_rect, 0.0, theme::matte());
                             ui.painter_at(thumb_rect).text(
                                 thumb_rect.center(), egui::Align2::CENTER_CENTER, "…",
-                                egui::FontId::proportional(14.0), theme::MUTED);
+                                egui::FontId::proportional(14.0), theme::secondary());
                         }
                         // 文本
                         ui.vertical(|ui| {
+                            let marked = self.marks.contains(&shot.id);
                             let scale_text = shot.scale.as_ref()
                                 .map(|s| format!(" [{}]", s.label_zh))
                                 .unwrap_or_default();
                             let label = format!(
-                                "#{} {}帧·{:.2}s{}{}",
+                                "{}{} {}帧·{:.2}s{}{}",
+                                if marked { "● " } else { "" },
                                 shot.number + 1,
                                 shot.end - shot.start,
                                 shot.duration_s,
@@ -1024,13 +1513,34 @@ impl App {
                                 if shot.pending { " ·待分析" } else { "" },
                             );
                             let text = if shot.pending {
-                                egui::RichText::new(label).color(theme::MUTED)
+                                egui::RichText::new(label).color(theme::secondary())
                             } else {
                                 egui::RichText::new(label)
                             };
                             let response = ui.selectable_label(selected, text);
                             if response.clicked() {
-                                follow = Some(shot.id.clone());
+                                let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+                                if ctrl {
+                                    if self.marks.contains(&shot.id) {
+                                        self.marks.remove(&shot.id);
+                                    } else {
+                                        self.marks.insert(shot.id.clone());
+                                    }
+                                    self.mark_anchor = Some(row);
+                                } else if shift {
+                                    let anchor = self.mark_anchor.unwrap_or(row);
+                                    let (low, high) = if anchor <= row { (anchor, row) } else { (row, anchor) };
+                                    for candidate in &self.state.shots[low..=high] {
+                                        if !candidate.pending {
+                                            self.marks.insert(candidate.id.clone());
+                                        }
+                                    }
+                                    self.mark_anchor = Some(row);
+                                } else {
+                                    follow = Some(shot.id.clone());
+                                    self.marks.clear();
+                                    self.mark_anchor = Some(row);
+                                }
                             }
                             if !shot.note.is_empty() {
                                 ui.small(egui::RichText::new(truncate(&shot.note, 40)).weak());
@@ -1042,7 +1552,7 @@ impl App {
                                         ui.label(
                                             egui::RichText::new(format!(" [{tag}]"))
                                                 .small()
-                                                .color(theme::ACCENT),
+                                                .color(theme::accent()),
                                         );
                                     }
                                 });
@@ -1209,11 +1719,11 @@ impl App {
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height), egui::Sense::hover());
         let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)),
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()),
                             egui::StrokeKind::Inside);
         if points.len() < 2 {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), theme::MUTED);
+                egui::FontId::proportional(12.0), theme::secondary());
             return;
         }
         let max_t = points.last().map(|p| p.0).unwrap_or(1.0).max(0.001);
@@ -1223,16 +1733,16 @@ impl App {
             inner.left() + (t / max_t) as f32 * inner.width(),
             inner.bottom() - (v / max_v) as f32 * (inner.height() - 10.0),
         );
-        let stroke = egui::Stroke::new(1.5, theme::ACCENT);
+        let stroke = egui::Stroke::new(1.5, theme::accent());
         for pair in points.windows(2) {
             painter.line_segment([to_pos(pair[0].0, pair[0].1), to_pos(pair[1].0, pair[1].1)], stroke);
         }
         painter.text(egui::pos2(inner.left(), inner.top() - 2.0),
             egui::Align2::LEFT_BOTTOM, format!("峰值 {max_v:.1}{unit}"),
-            egui::FontId::proportional(9.0), theme::MUTED);
+            egui::FontId::proportional(9.0), theme::secondary());
         painter.text(egui::pos2(inner.right(), inner.bottom() + 8.0),
             egui::Align2::RIGHT_TOP, format!("{max_t:.0}s"),
-            egui::FontId::proportional(9.0), theme::MUTED);
+            egui::FontId::proportional(9.0), theme::secondary());
     }
 
     fn call_stats(&self) {
@@ -1262,10 +1772,10 @@ impl App {
             egui::Sense::hover(),
         );
         let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
         let Some(max_count) = bins.iter().map(|b| b.count).max().filter(|m| *m > 0) else {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), theme::MUTED);
+                egui::FontId::proportional(12.0), theme::secondary());
             return;
         };
         let inner = rect.shrink(4.0);
@@ -1278,14 +1788,14 @@ impl App {
                 egui::pos2(x0 + 1.0, inner.bottom() - bar_h),
                 egui::vec2((bar_w - 2.0).max(1.0), bar_h),
             );
-            painter.rect_filled(bar, 1.0, theme::ACCENT);
+            painter.rect_filled(bar, 1.0, theme::accent());
             if bin.count > 0 && bar_w > 14.0 {
                 painter.text(
                     egui::pos2(bar.center().x, bar.top() - 7.0),
                     egui::Align2::CENTER_CENTER,
                     bin.count,
                     egui::FontId::proportional(9.0),
-                    theme::MUTED,
+                    theme::secondary(),
                 );
             }
         }
@@ -1296,7 +1806,7 @@ impl App {
                 egui::Align2::RIGHT_TOP,
                 format!("{:.0}s", last.end_s),
                 egui::FontId::proportional(9.0),
-                theme::MUTED,
+                theme::secondary(),
             );
         }
     }
@@ -1309,14 +1819,14 @@ impl App {
             egui::Sense::hover(),
         );
         let painter = ui.painter_at(rect);
-        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
         let values: Vec<(f64, f64)> = points
             .iter()
             .filter_map(|p| p.cuts_per_minute.map(|v| (p.video_time_s, v)))
             .collect();
         if values.len() < 2 {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER, "无数据",
-                egui::FontId::proportional(12.0), theme::MUTED);
+                egui::FontId::proportional(12.0), theme::secondary());
             return;
         }
         let max_t = values.last().map(|v| v.0).unwrap_or(1.0).max(0.001);
@@ -1329,7 +1839,7 @@ impl App {
                 inner.bottom() - (v / max_v) as f32 * (inner.height() - 10.0),
             )
         };
-        let stroke = egui::Stroke::new(1.5, theme::ACCENT);
+        let stroke = egui::Stroke::new(1.5, theme::accent());
         for pair in values.windows(2) {
             let (t0, v0) = pair[0];
             let (t1, v1) = pair[1];
@@ -1340,14 +1850,14 @@ impl App {
             egui::Align2::RIGHT_TOP,
             format!("{max_t:.0}s"),
             egui::FontId::proportional(9.0),
-            theme::MUTED,
+            theme::secondary(),
         );
         painter.text(
             egui::pos2(inner.left(), inner.top() - 2.0),
             egui::Align2::LEFT_BOTTOM,
             format!("峰值 {max_v:.1}/分"),
             egui::FontId::proportional(9.0),
-            theme::MUTED,
+            theme::secondary(),
         );
     }
 
@@ -1377,7 +1887,7 @@ impl App {
                             ui.painter_at(rect).rect_filled(
                                 rect, 3.0, egui::Color32::from_rgb(r, g, b));
                             ui.painter_at(rect).rect_stroke(
-                                rect, 3.0, egui::Stroke::new(1.0, theme::GROUND),
+                                rect, 3.0, egui::Stroke::new(1.0, theme::matte()),
                                 egui::StrokeKind::Inside);
                         }
                     });
@@ -1415,7 +1925,7 @@ impl App {
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), height), egui::Sense::hover());
             let painter = ui.painter_at(rect);
-            painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 58)), egui::StrokeKind::Inside);
+            painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
             let n = self.barcode.len().max(1) as f32;
             let inner = rect.shrink(2.0);
             let slice = inner.width() / n;
@@ -1533,7 +2043,7 @@ impl App {
                     for tag in &shot.tags {
                         let chip = egui::Button::new(format!("✕ {tag}"))
                             .small()
-                            .fill(theme::ACCENT_DIM);
+                            .fill(theme::accent_wash());
                         if ui.add(chip).clicked() {
                             remove = Some(tag.clone());
                         }
@@ -1606,12 +2116,13 @@ impl App {
 
     fn player_panel(&mut self, ui: &mut egui::Ui) {
         let frames = self.index.as_ref().map(|i| i.frames()).unwrap_or(1).max(1);
-        // 画面区：滚轮缩放（1×–8×）、拖拽平移、双击复位。
+        let reserve = 210.0;
+        // 画面区：滚轮缩放（1×–16×，1.25×/步，以光标为中心）、拖拽平移、双击复位。
         let texture_id = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
         match texture_id {
             Some((id, image_size)) => {
                 let avail_w = ui.available_width().max(64.0);
-                let avail_h = (ui.available_height() - 150.0).max(140.0);
+                let avail_h = (ui.available_height() - reserve).max(140.0);
                 let fit = (avail_w / image_size.x).min(avail_h / image_size.y);
                 let display = image_size * fit;
                 let (rect, response) =
@@ -1620,7 +2131,14 @@ impl App {
                 if response.hovered() {
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 0.5 {
-                        self.zoom = (self.zoom * (1.0 + scroll * 0.0015)).clamp(1.0, 8.0);
+                        let steps = scroll / 120.0;
+                        let next = (self.zoom * 1.25f32.powf(steps)).clamp(1.0, 16.0);
+                        if let Some(pointer) = response.hover_pos() {
+                            // 保持光标下的画面点不动（原版 zoomAt 语义）
+                            let rel = (pointer - rect.min) / display - egui::vec2(0.5, 0.5);
+                            self.pan += rel * (1.0 / self.zoom - 1.0 / next);
+                        }
+                        self.zoom = next;
                         clamp_pan(&mut self.pan, self.zoom);
                     }
                 }
@@ -1639,6 +2157,23 @@ impl App {
                 let center = egui::pos2(0.5 + self.pan.x, 0.5 + self.pan.y);
                 let uv = egui::Rect::from_center_size(center, egui::vec2(2.0 * half, 2.0 * half));
                 ui.painter_at(rect).image(id, rect, uv, egui::Color32::WHITE);
+                // 字幕叠层（原版 subtitleOverlay：画面底部居中、描边）
+                if let Some(text) = self.subtitle_text.as_ref().filter(|t| !t.is_empty()) {
+                    let font = egui::FontId::proportional((display.y / 22.0).clamp(14.0, 26.0));
+                    let anchor = egui::pos2(rect.center().x, rect.bottom() - 14.0);
+                    for offset in [
+                        egui::vec2(-1.5, 0.0), egui::vec2(1.5, 0.0),
+                        egui::vec2(0.0, -1.5), egui::vec2(0.0, 1.5),
+                        egui::vec2(1.5, 1.5), egui::vec2(-1.5, -1.5),
+                    ] {
+                        ui.painter_at(rect).text(
+                            anchor + offset, egui::Align2::CENTER_BOTTOM, text,
+                            font.clone(), egui::Color32::from_black_alpha(210));
+                    }
+                    ui.painter_at(rect).text(
+                        anchor, egui::Align2::CENTER_BOTTOM, text, font,
+                        egui::Color32::WHITE);
+                }
                 if self.zoom > 1.001 {
                     ui.painter_at(rect).text(
                         rect.right_top() + egui::vec2(-8.0, 6.0),
@@ -1648,87 +2183,94 @@ impl App {
                         egui::Color32::from_white_alpha(200),
                     );
                 }
+                if self.video_only {
+                    ui.painter_at(rect).text(
+                        rect.left_top() + egui::vec2(8.0, 6.0),
+                        egui::Align2::LEFT_TOP,
+                        "Alt+Enter 退出视频模式",
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_white_alpha(160),
+                    );
+                }
             }
             None => {
-                ui.centered_and_justified(|ui| ui.label("打开视频后在此播放（静音分析模式）"));
+                ui.centered_and_justified(|ui| ui.colored_label(theme::faint(), "打开视频后在此播放（分析模式静音或含音轨）"));
             }
         }
-        // 字幕行（加载 SRT 后显示当前帧时间对应的台词）
-        if self.subtitle_loaded {
-            let text = self.subtitle_text.clone().unwrap_or_default();
-            if !text.is_empty() {
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.weak("字幕:");
-                    ui.label(egui::RichText::new(text).color(theme::INK).size(13.0));
-                });
-            }
-        }
-        ui.add_space(6.0);
+
+        // -- 帧轨（原版 FrameTrack：细线 + 刻度 + 播放头；拖动 scrub） ----------
+        self.frame_track(ui, frames);
+        ui.add_space(2.0);
+
+        // -- 传输条（原版 TransportBar：计数左 / 居中控制 / 工具右） ------------
         ui.horizontal(|ui| {
-            let playing = self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
-            let play_label = if playing { "⏸" } else { "▶" };
-            if ui.add_enabled(self.player.is_some(), egui::Button::new(play_label)).clicked() {
-                if let Some(player) = &self.player {
-                    if playing {
-                        let frame = player.frame();
-                        player.stop();
-                        player.show(frame);
-                        if let Some(audio) = &self.audio {
-                            audio.stop();
-                        }
-                        self.loop_active = false;
-                        self.commit_cursor(frame);
-                    } else {
-                        let frame = self.ui_frame.min(frames - 1);
-                        player.play(frame);
-                        // 音频与视频用同一时间点起播（静音视频自动跳过）
-                        self.start_audio(frame);
+            let total = ui.available_width();
+            let section = (total / 3.0).max(140.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(section, 26.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.monospace(format!("{} / {} f", self.ui_frame, frames));
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(section, 26.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let playing = self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
+                    let ready = self.player.is_some();
+                    if ui.add_enabled(ready, egui::Button::new("⏮").min_size(egui::vec2(26.0, 24.0))).clicked() {
+                        self.adjacent_shot(-1);
                     }
-                }
-            }
-            if ui
-                .add_enabled(self.player.is_some(), egui::Button::new("◀ 1帧"))
-                .clicked()
-            {
-                self.step(-1, frames);
-            }
-            if ui
-                .add_enabled(self.player.is_some(), egui::Button::new("1帧 ▶"))
-                .clicked()
-            {
-                self.step(1, frames);
-            }
-            // 局部循环：选中镜头范围内反复播放
-            let in_shot = self.state.shots.iter()
-                .find(|s| s.id == self.state.selected_id && !s.pending)
-                .map(|s| (s.start, s.end));
-            if let Some((loop_start, loop_end)) = in_shot {
-                let loop_label = if self.loop_active { "🔁 循环中" } else { "🔁 循环" };
-                if ui
-                    .add_enabled(self.player.is_some(), egui::Button::new(loop_label))
-                    .clicked()
-                {
-                    if self.loop_active {
-                        self.loop_active = false;
-                        if let Some(player) = &self.player {
-                            player.stop();
-                            player.show(self.ui_frame);
-                        }
-                        if let Some(audio) = &self.audio {
-                            audio.stop();
-                        }
-                    } else {
-                        self.loop_active = true;
-                        if let Some(player) = &self.player {
-                            player.play_loop(loop_start, loop_end);
-                        }
-                        self.start_audio_loop(loop_start, loop_end);
+                    if ui.add_enabled(ready, egui::Button::new("◁").min_size(egui::vec2(26.0, 24.0))).clicked() {
+                        self.step(-1, frames);
                     }
-                }
-            }
-            // 字幕加载
-            if ui.button("💬 字幕").clicked() {
+                    let play_label = if playing { "⏸" } else { "▶" };
+                    let play_button = egui::Button::new(
+                        egui::RichText::new(play_label).color(theme::on_accent()),
+                    )
+                    .fill(theme::accent())
+                    .min_size(egui::vec2(52.0, 26.0));
+                    if ui.add_enabled(ready, play_button).clicked() {
+                        self.toggle_playback();
+                    }
+                    if ui.add_enabled(ready, egui::Button::new("▷").min_size(egui::vec2(26.0, 24.0))).clicked() {
+                        self.step(1, frames);
+                    }
+                    if ui.add_enabled(ready, egui::Button::new("⏭").min_size(egui::vec2(26.0, 24.0))).clicked() {
+                        self.adjacent_shot(1);
+                    }
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width().max(120.0), 26.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let in_shot = self.state.shots.iter()
+                        .any(|s| s.id == self.state.selected_id && !s.pending);
+                    let loop_label = if self.loop_active { "🔁 循环中" } else { "🔁 循环 · L" };
+                    if ui
+                        .add_enabled(self.player.is_some() && in_shot, egui::Button::new(loop_label))
+                        .clicked()
+                    {
+                        self.toggle_loop();
+                    }
+                    if ui.button("📷").on_hover_text("截帧 PNG · Ctrl+E").clicked() {
+                        self.export_frame();
+                    }
+                    let both = self.ab_textures[0].is_some() && self.ab_textures[1].is_some();
+                    if ui
+                        .add_enabled(both, egui::Button::new(if self.ab_show { "对照中" } else { "A/B 对照" }))
+                        .clicked()
+                    {
+                        self.ab_show = !self.ab_show;
+                    }
+                },
+            );
+        });
+        // 字幕 / 音量 / 缩放信息行
+        ui.horizontal(|ui| {
+            if ui.button("💬 字幕").on_hover_text("加载 SRT").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("SRT 字幕", &["srt", "ass"])
                     .pick_file()
@@ -1737,12 +2279,11 @@ impl App {
                     self.subtitle_loaded = true;
                 }
             }
-            // 音量（无音频设备或无音轨时禁用）
             let has_audio = self.audio.is_some()
                 && self.index.as_ref().map(|i| i.metadata.audio_tracks.unwrap_or(0) > 0).unwrap_or(false);
             if has_audio {
                 let mute_label = if self.muted { "🔇" } else { "🔊" };
-                if ui.button(mute_label).clicked() {
+                if ui.button(mute_label).on_hover_text("静音 · M").clicked() {
                     self.muted = !self.muted;
                     if let Some(audio) = &self.audio {
                         audio.set_muted(self.muted);
@@ -1757,27 +2298,13 @@ impl App {
                     }
                 }
             }
-            ui.separator();
-            let mut slider = self.ui_frame.min(frames - 1) as i64;
-            let response = ui.add(
-                egui::Slider::new(&mut slider, 0..=(frames as i64 - 1))
-                    .show_value(true)
-                    .text("帧"),
-            );
-            if response.changed() {
-                self.ui_frame = slider.max(0) as u64;
-                if let Some(player) = &self.player {
-                    player.show(self.ui_frame);
-                }
-            }
-            if response.drag_stopped() {
-                self.commit_cursor(self.ui_frame);
-            }
-            let seconds = self.index.as_ref().map(|i| i.seconds(self.ui_frame)).unwrap_or(0.0);
-            ui.monospace(format!("{:.2}s", seconds));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!("缩放 {:.0}% · 双击复位", self.zoom * 100.0));
+            });
         });
+
         // -- A/B 对照与导出 -----------------------------------------------------
-        ui.add_space(4.0);
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.weak("A/B:");
             if ui.button("设为 A").clicked() {
@@ -1787,43 +2314,41 @@ impl App {
                 self.capture_ab(1);
             }
             let both = self.ab_textures[0].is_some() && self.ab_textures[1].is_some();
-            if ui.add_enabled(both, egui::Button::new(if self.ab_show { "关闭对照" } else { "对照" }))
+            if ui
+                .add_enabled(both, egui::Button::new(if self.ab_show { "关闭对照" } else { "对照" }))
                 .clicked()
             {
                 self.ab_show = !self.ab_show;
             }
             ui.separator();
-            if ui.button("📷 截帧 PNG").clicked() {
-                self.export_frame();
-            }
             let has_selection = self
                 .state
                 .shots
                 .iter()
                 .any(|s| s.id == self.state.selected_id && !s.pending);
-            if ui
-                .add_enabled(has_selection, egui::Button::new("🎬 镜头 GIF"))
-                .clicked()
-            {
+            if ui.add_enabled(has_selection, egui::Button::new("🎬 GIF")).clicked() {
                 self.export_gif();
             }
             if ui
-                .add_enabled(self.state.completed_count > 0, egui::Button::new("📋 镜头 CSV"))
+                .add_enabled(self.state.completed_count > 0, egui::Button::new("📋 CSV"))
                 .clicked()
             {
                 self.export_shots_csv();
             }
             if ui
-                .add_enabled(self.state.completed_count > 0, egui::Button::new("🖼 分析长图"))
+                .add_enabled(self.state.completed_count > 0, egui::Button::new("🖼 长图"))
                 .clicked()
             {
                 self.export_contact_sheet();
             }
             if ui
-                .add_enabled(self.state.completed_count > 0, egui::Button::new("📄 PDF 联系表"))
+                .add_enabled(self.state.completed_count > 0, egui::Button::new("📄 PDF"))
                 .clicked()
             {
                 self.export_pdf_sheet();
+            }
+            if self.state.completed_count > 0 {
+                ui.weak(format!("已标记 {} · Ctrl+A", self.marks.len()));
             }
         });
         // A/B 帧信息行
@@ -1836,24 +2361,135 @@ impl App {
                     }
                 }
                 if self.ab_show && self.ab_textures[0].is_some() && self.ab_textures[1].is_some() {
-                    if ui
-                        .selectable_label(!self.ab_overlay, "并排")
-                        .clicked()
-                    {
+                    if ui.selectable_label(!self.ab_overlay, "并排").clicked() {
                         self.ab_overlay = false;
                     }
-                    if ui
-                        .selectable_label(self.ab_overlay, "叠加")
-                        .clicked()
-                    {
+                    if ui.selectable_label(self.ab_overlay, "叠加").clicked() {
                         self.ab_overlay = true;
                     }
                 }
             });
         }
-        // A/B 显示区（替代主画面区域下方追加一块）
         if self.ab_show {
             self.ab_view(ui);
+        }
+    }
+
+    /// 原版 FrameTrack：2px 横线、最多 13 刻度、播放头；拖动 scrub，
+    /// Ctrl+滚轮缩放，普通滚轮平移，双击复位。
+    fn frame_track(&mut self, ui: &mut egui::Ui, frames: u64) {
+        let height = 30.0;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::click_and_drag(),
+        );
+        if frames < 2 {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let inset = 8.0;
+        let span = (rect.width() - inset * 2.0).max(1.0);
+        let count = frames as f64;
+        let max_zoom = ((count - 1.0) / 4.0).max(1.0);
+        self.track_zoom = self.track_zoom.clamp(1.0, max_zoom);
+        let view_span = ((count - 1.0) / self.track_zoom).max(1.0);
+        let max_start = (count - 1.0 - view_span).max(0.0);
+        self.track_start = self.track_start.clamp(0.0, max_start);
+        let start = self.track_start;
+        let position = move |frame: f64| -> f32 {
+            rect.left() + inset + ((frame - start) / view_span) as f32 * span
+        };
+        let frame_at = move |x: f32| -> u64 {
+            let fraction = ((x - rect.left() - inset) / span).clamp(0.0, 1.0) as f64;
+            let frame = start + fraction * view_span;
+            (frame.round() as i64).clamp(0, frames as i64 - 1) as u64
+        };
+        let line_color = theme::line();
+        let progress_color = theme::selected();
+        let accent_color = theme::accent();
+        let baseline = rect.center().y + 1.0;
+        painter.line_segment(
+            [egui::pos2(rect.left() + inset, baseline), egui::pos2(rect.left() + inset + span, baseline)],
+            egui::Stroke::new(2.0, line_color),
+        );
+        let head = position(self.ui_frame as f64);
+        if head > rect.left() + inset {
+            painter.line_segment(
+                [egui::pos2(rect.left() + inset, baseline), egui::pos2(head, baseline)],
+                egui::Stroke::new(2.0, progress_color.gamma_multiply(0.6)),
+            );
+        }
+        let tick_count = (view_span.floor() as i64 + 1).clamp(2, 13) as usize;
+        for index in 0..tick_count {
+            let fraction = index as f64 / (tick_count - 1).max(1) as f64;
+            let frame = start + fraction * view_span;
+            let x = position(frame);
+            let long = index == 0 || index == tick_count - 1;
+            let color = if self.loop_active && (frame.round() as i64 == 0 || (frame.round() as i64) + 1 == frames as i64) {
+                accent_color
+            } else {
+                line_color
+            };
+            painter.line_segment(
+                [egui::pos2(x, baseline - if long { 5.0 } else { 3.0 }), egui::pos2(x, baseline - 11.0)],
+                egui::Stroke::new(1.0, color),
+            );
+        }
+        painter.line_segment(
+            [egui::pos2(head, baseline - 9.0), egui::pos2(head, baseline + 9.0)],
+            egui::Stroke::new(2.0, progress_color),
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(head - 3.0, baseline - 12.0), egui::vec2(6.0, 3.0)),
+            1.0,
+            progress_color,
+        );
+        if response.dragged() || response.clicked() {
+            if let Some(pointer) = response.interact_pointer_pos() {
+                let frame = frame_at(pointer.x);
+                if frame != self.ui_frame {
+                    self.ui_frame = frame;
+                    if let Some(player) = &self.player {
+                        player.show(frame);
+                    }
+                }
+            }
+        }
+        if response.drag_stopped() || response.clicked() {
+            self.commit_cursor(self.ui_frame);
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.5 {
+                let ctrl = ui.input(|i| i.modifiers.ctrl);
+                if ctrl {
+                    let steps = scroll / 120.0;
+                    let anchor_fraction = response
+                        .hover_pos()
+                        .map(|pointer| ((pointer.x - rect.left() - inset) / span).clamp(0.0, 1.0) as f64)
+                        .unwrap_or(0.5);
+                    let anchor = self.track_start + anchor_fraction * view_span;
+                    self.track_zoom = (self.track_zoom * 1.25f64.powf(steps as f64)).clamp(1.0, max_zoom);
+                    let new_span = ((count - 1.0) / self.track_zoom).max(1.0);
+                    self.track_start =
+                        (anchor - anchor_fraction * new_span).clamp(0.0, (count - 1.0 - new_span).max(0.0));
+                } else if self.track_zoom > 1.0 {
+                    self.track_start = (self.track_start
+                        - (scroll as f64 / 120.0) * view_span * 0.15)
+                        .clamp(0.0, max_start);
+                }
+            }
+            if let Some(pointer) = response.hover_pos() {
+                let frame = frame_at(pointer.x);
+                response.clone().on_hover_text(format!(
+                    "帧 {frame} · Ctrl+滚轮缩放{}",
+                    if self.track_zoom > 1.0 { " · 滚轮平移" } else { "" }
+                ));
+            }
+        }
+        if response.double_clicked() {
+            self.track_zoom = 1.0;
+            self.track_start = 0.0;
         }
     }
 
