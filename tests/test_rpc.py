@@ -458,6 +458,7 @@ class CliTests(unittest.TestCase):
 
     def test_cli_shots_and_tags(self):
         import subprocess
+        import os
         session = Session()
         session.build_index(str(self.video_path))
         session.new_project()
@@ -466,10 +467,11 @@ class CliTests(unittest.TestCase):
         session.save_as(str(proj))
         session.close_project()
         venv_py = sys.executable
+        environment = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
         run = lambda *argv: subprocess.run(
             [venv_py, "-m", "shotlab.cli", *argv],
             cwd=str(Path(__file__).resolve().parent.parent),
-            capture_output=True, text=True, encoding="utf-8", timeout=120)
+            capture_output=True, text=True, encoding="utf-8", timeout=120, env=environment)
         # shots
         r = json.loads(run("shots", str(proj)).stdout)
         self.assertEqual(len(r["shots"]), 2)
@@ -489,10 +491,12 @@ class CliTests(unittest.TestCase):
 
     def test_cli_error_contract(self):
         import subprocess
+        import os
+        environment = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
         run = lambda *argv: subprocess.run(
             [sys.executable, "-m", "shotlab.cli", *argv],
             cwd=str(Path(__file__).resolve().parent.parent),
-            capture_output=True, text=True, encoding="utf-8", timeout=120)
+            capture_output=True, text=True, encoding="utf-8", timeout=120, env=environment)
         missing = Path(self.directory.name) / "nope.shotlab"
         result = run("shots", str(missing))
         self.assertNotEqual(result.returncode, 0)

@@ -124,6 +124,10 @@ def decode(path, duration_s=None, cancel=None, progress=None, ffmpeg=FFMPEG):
         finally:
             if process.poll() is None:
                 process.kill()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
         _cancel(cancel)
         if process.returncode != 0:
             message = " | ".join(tail[-4:]) or f"exit {process.returncode}"
@@ -224,12 +228,22 @@ class Soundtrack:
         self.momentary = raw["momentary"]
         self.short_term = raw["short_term"]
         self.fingerprint = raw["fingerprint"]
+        self.pcm = raw["pcm"]
         frames = frames if frames is not None else frame_features(raw["pcm"])
         self.rms_db = frames["rms_db"]
         self.novelty = frames["novelty"]
         self.hop_s = frames["hop_s"]
         self.silent = silence_mask(self.rms_db, self.hop_s)
         self.duration_s = raw["pcm"].size / SAMPLE_RATE
+        # PCM peak envelope, independent of Shot boundaries and loudness gating.
+        # Store bounded min/max bins rather than retaining the full decoded PCM.
+        pcm = raw["pcm"]
+        stride = max(1, int(np.ceil(pcm.size / 6000)))
+        self.waveform = [dict(time_s=round(i / SAMPLE_RATE + self.offset_s, 5),
+                              end_s=round(min(i + stride, pcm.size) / SAMPLE_RATE + self.offset_s, 5),
+                              low=round(float(pcm[i:i + stride].min()), 5),
+                              high=round(float(pcm[i:i + stride].max()), 5))
+                         for i in range(0, pcm.size, stride)]
 
     def _blocks(self, values, length, start, end):
         """Meter values whose whole window [t-length, t] lies inside [start, end)."""
@@ -397,6 +411,7 @@ def fingerprint_only(path, ffmpeg=FFMPEG, cancel=None):
             except subprocess.TimeoutExpired:
                 pass
         error = process.stderr.read().decode("utf-8", "replace").strip()
+        process.stderr.close()
         if process.returncode != 0 or not target.exists():
             raise RuntimeError(f"ffmpeg 计算音频指纹失败: {error or process.returncode}")
         return np.frombuffer(target.read_bytes(), dtype="<u4").astype(np.uint32)

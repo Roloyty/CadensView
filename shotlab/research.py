@@ -143,6 +143,7 @@ def _blank(value):
 
 def research_rows(session, params):
     """One row per completed Shot in scope, with every annotation layer side by side."""
+    from shotlab.study import coverage, sound_review
     state = session.state()
     rows = session.scoped_shots(params)
     meta = session.metadata
@@ -165,6 +166,8 @@ def research_rows(session, params):
             cut = {}
         vlm = shot.get("vlm") or {}
         scale = shot.get("scale") or {}
+        annotated = coverage(session, shot["start"], shot["end"])
+        reviewed_sound = sound_review(session, shot["start"])
         out.append({
             "title": meta.get("title", ""), "series": meta.get("series", ""), "episode": meta.get("episode", ""),
             "shot_number": shot["number"] + 1, "shot_id": shot["id"], "cut_number": shot.get("cut_number", ""),
@@ -176,6 +179,10 @@ def research_rows(session, params):
             "scale_model": scale.get("label", ""), "scale_model_confidence": scale.get("confidence", ""),
             "vlm_scale": vlm.get("shot_scale", ""), "vlm_camera": vlm.get("camera_movement", ""),
             "vlm_content": vlm.get("content_type", ""), "vlm_description": vlm.get("description", ""),
+            "vlm_evidence_frames": "; ".join(str(f) for f in vlm.get("evidence_frames", []) or []),
+            "vlm_evidence_times_s": "; ".join(str(t) for t in vlm.get("evidence_times_s", []) or []),
+            "vlm_evidence_count": vlm.get("evidence_count", ""),
+            "vlm_evidence_sampling": vlm.get("sampling", ""),
             "motion": timing.get("motion", ""), "koma": timing.get("koma_label") or "",
             "koma_reliable": timing.get("koma_reliable", ""), "drawings_per_s": timing.get("drawings_per_s", ""),
             "still_share": timing.get("still_share", ""), "pan_share": timing.get("pan_share", ""),
@@ -184,6 +191,12 @@ def research_rows(session, params):
             "lra_lu": _blank(loud.get("lra_lu")), "silence_share": _blank(loud.get("silence_share")),
             "cut_in_silence": _blank(cut.get("in_silence")), "cut_loudness_jump_lu": _blank(cut.get("loudness_jump_lu")),
             "cut_sound_relation": cut.get("relation", ""), "cut_sound_offset_s": _blank(cut.get("sound_offset_s")),
+            "cut_sound_relation_candidate": cut.get("relation", ""),
+            "cut_sound_relation_manual": reviewed_sound.get("relation", ""),
+            "cut_sound_review_status": reviewed_sound.get("status", "unreviewed"),
+            "scene_labels": "; ".join(annotated["scenes"]),
+            "dialogue_coverage_share": annotated["dialogue_share"],
+            "music_coverage_share": annotated["music_share"],
             "note": shot.get("note", ""),
         })
     return out, state
@@ -191,6 +204,7 @@ def research_rows(session, params):
 
 def export_research(session, params):
     """Long-table CSV + method sidecar JSON (+ plain shot-length list) for statistics software."""
+    from shotlab.study import SOFTWARE_VERSION, STUDY_VERSION, provenance
     path = Path(params["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
     rows, state = research_rows(session, params)
@@ -206,7 +220,9 @@ def export_research(session, params):
     scope = session.analysis_scope(params)
     context = build_context(session.project, index, scope)
     method = dict(
-        software="CadensView", exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        software="CadensView", software_version=SOFTWARE_VERSION,
+        exported_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        provenance=provenance(session),
         source=dict(path=index.path, size=index.size, frame_count=len(index.pts), time_base=index.time_base,
                     average_rate=index.metadata.get("average_rate"), width=index.metadata.get("width"),
                     height=index.metadata.get("height")),
@@ -222,7 +238,12 @@ def export_research(session, params):
             vlm=(session.vlm_meta or {}) or None,
             motion=(session.motion or {}).get("parameters"),
             audio=(session.audio or {}).get("parameters")),
-        columns=list(rows[0]))
+        columns=list(rows[0]),
+        study_schema_version=STUDY_VERSION,
+        evidence_note="VLM evidence_frames are source display-frame numbers; evidence_times_s is relative to the first frame",
+        sound_relation_note="cut_sound_relation is an acoustic candidate; only the manual column is reviewed",
+        coverage_note="Union duration of annotated source-frame intervals; unannotated does not mean absent",
+        exposure_note="drawings_per_s and koma are visible-change estimates, not production drawing counts")
     sidecar = path.with_suffix(".method.json")
     sidecar.write_text(json.dumps(method, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     return {"path": str(path.resolve()), "method": str(sidecar.resolve()), "lengths": str(lengths.resolve()),

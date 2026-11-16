@@ -8,7 +8,7 @@ use crate::model::{self, State};
 use crate::theme;
 
 #[derive(Clone, Copy, Default, PartialEq)]
-pub enum Tab { #[default] Review, Annotate, Compare, Vlm }
+pub enum Tab { #[default] Review, Annotate, Compare, Vlm, Lapian }
 
 #[derive(Default)]
 pub struct Research {
@@ -22,11 +22,19 @@ pub struct Research {
     pending_config: Option<Value>,
     pub vlm_report: Option<Value>,
     pub suggestions: Option<Value>,
+    pub narrative: Option<Value>,
+    narrative_project: String,
+    narrative_loaded: bool,
     show_confirmed: bool,
     meta_form: BTreeMap<String, String>,
     meta_project: String,
     compare_group: String,
     compare_include_regions: bool,
+    compare_inference_unit: String,
+    compare_query_id: String,
+    compare_alignment: String,
+    compare_alignment_note: String,
+    compare_alignment_name: String,
     vlm_form: VlmForm,
     vlm_loaded: bool,
 }
@@ -45,9 +53,33 @@ pub enum Action {
     Rpc { method: &'static str, params: Value },
     Job { method: &'static str, params: Value, label: &'static str },
     Locate(u64),
-    Compare { group_by: String, include_regions: bool },
+    Compare {
+        group_by: String,
+        include_regions: bool,
+        inference_unit: String,
+        saved_query_id: String,
+        alignment: Vec<Value>,
+        alignment_note: String,
+    },
     ExportResearch,
     RunVlm { force: bool },
+    ExportLapianPackage,
+    ImportLapian,
+    ExportLapianSheet,
+}
+
+/// Parse strictly increasing manual anchors; unparsable lines are ignored.
+fn parse_anchors(text: &str) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+        if parts.len() < 3 { continue; }
+        let (Ok(first), Ok(second)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) else { continue };
+        let kind = parts[2];
+        if first == 0 || second == 0 || !matches!(kind, "composition_similarity" | "material_reuse") { continue; }
+        rows.push(json!([first, second, kind, parts[3..].join(", ")]));
+    }
+    rows
 }
 
 pub const META_FIELDS: [(&str, &str); 11] = [
@@ -82,7 +114,8 @@ impl Research {
         let mut actions = Vec::new();
         ui.horizontal(|ui| {
             for (tab, label) in [(Tab::Review, "切点审校"), (Tab::Annotate, "作品与区段"),
-                                 (Tab::Compare, "重复镜头 · 多片比较"), (Tab::Vlm, "视觉大模型")] {
+                                 (Tab::Compare, "重复镜头 · 多片比较"), (Tab::Vlm, "视觉大模型"),
+                                 (Tab::Lapian, "AI 拉片")] {
                 ui.selectable_value(&mut self.tab, tab, label);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -99,6 +132,7 @@ impl Research {
                 Tab::Annotate => self.annotate_tab(ui, state, &mut actions),
                 Tab::Compare => self.compare_tab(ui, state, busy, &mut actions),
                 Tab::Vlm => self.vlm_tab(ui, state, busy, &mut actions),
+                Tab::Lapian => self.lapian_tab(ui, state, &mut actions),
             }
         });
         actions
@@ -245,11 +279,65 @@ impl Research {
                     for (key, label) in META_FIELDS { ui.selectable_value(&mut self.compare_group, key.to_string(), label); }
                 });
             ui.checkbox(&mut self.compare_include_regions, "包含 OP/ED 等区段");
+            if self.compare_inference_unit.is_empty() { self.compare_inference_unit = "film".into(); }
+            egui::ComboBox::from_id_salt("inference-unit").selected_text(match self.compare_inference_unit.as_str() {
+                "shot" => "镜头", "scene" => "场景", "episode" => "集", _ => "影片",
+            }).show_ui(ui, |ui| {
+                for (code, label) in [("shot", "镜头"), ("scene", "场景"), ("episode", "集"), ("film", "影片")] {
+                    ui.selectable_value(&mut self.compare_inference_unit, code.into(), label);
+                }
+            });
+            ui.label("保存的查询");
+            egui::ComboBox::from_id_salt("compare-query").selected_text(
+                state.study.saved_queries.iter().find(|q| s(q, "id") == self.compare_query_id)
+                    .map(|q| s(q, "name")).unwrap_or("全部镜头")).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.compare_query_id, String::new(), "全部镜头");
+                for query in &state.study.saved_queries {
+                    ui.selectable_value(&mut self.compare_query_id, s(query, "id").into(), s(query, "name"));
+                }
+            });
             if ui.add_enabled(!busy, egui::Button::new("选择项目并比较…")).clicked() {
-                actions.push(Action::Compare { group_by: self.compare_group.clone(), include_regions: self.compare_include_regions });
+                actions.push(Action::Compare { group_by: self.compare_group.clone(),
+                    include_regions: self.compare_include_regions,
+                    inference_unit: self.compare_inference_unit.clone(),
+                    saved_query_id: self.compare_query_id.clone(),
+                    alignment: parse_anchors(&self.compare_alignment),
+                    alignment_note: self.compare_alignment_note.clone() });
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("人工锚点（每行：第一版镜头, 第二版镜头, 类型, 备注）");
+            ui.add(egui::TextEdit::multiline(&mut self.compare_alignment).desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("1, 1, composition_similarity, 构图相似\n3, 4, material_reuse, OP 复用"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("版本说明"); ui.add(egui::TextEdit::singleline(&mut self.compare_alignment_note).desired_width(220.0));
+            ui.label("对齐名称"); ui.add(egui::TextEdit::singleline(&mut self.compare_alignment_name).desired_width(130.0));
+            if ui.add_enabled(!parse_anchors(&self.compare_alignment).is_empty(), egui::Button::new("保存到当前项目")).clicked() {
+                actions.push(Action::Rpc { method: "study.alignment.put", params: json!({
+                    "name": self.compare_alignment_name, "version_note": self.compare_alignment_note,
+                    "first_label": "第一版", "second_label": "第二版",
+                    "anchors": parse_anchors(&self.compare_alignment)})});
+            }
+            ui.weak("当前项目的首条已保存锚点会在未另填时对比较结果生效");
+        });
         let Some(result) = &self.compare else { return; };
+        ui.small(format!("推断单位：{} · 每片等权：{} · 明确分层 {} 组 · 共享哈希只标为可能素材复用",
+            s(result, "inference_unit"), result["equal_weight"]["per_film_equal_weight"].as_bool().unwrap_or(false),
+            result["equal_weight"]["strata"].as_array().map(|s| s.len()).unwrap_or(0)));
+        if let Some(query) = result.get("query_summary").filter(|q| !q.is_null()) {
+            ui.strong(format!("组合查询「{}」逐片命中 {} / {}", s(query, "name"), u(query, "matched"), u(query, "total")));
+            for film in query["films"].as_array().cloned().unwrap_or_default() {
+                ui.small(format!("{}：{} / {}", s(&film, "label"), u(&film, "matched"), u(&film, "total")));
+            }
+        }
+        if let Some(aligned) = result.get("version_alignment").filter(|a| !a.is_null()) {
+            ui.small(format!("版本对齐：构图相似 {} · 素材复用 {} · 插入/删除 {}",
+                u(aligned, "composition_similarity"), u(aligned, "material_reuse"),
+                u(aligned, "inserted_or_deleted")));
+            ui.small(s(aligned, "note"));
+        }
         egui::Grid::new("compare-films").striped(true).num_columns(7).show(ui, |ui| {
             for head in ["作品", "镜头", "MSL", "MSL 95%", "IQR", "剪辑率/分", "95%"] { ui.weak(head); }
             ui.end_row();
@@ -265,12 +353,13 @@ impl Research {
             }
         });
         ui.add_space(6.0);
-        egui::Grid::new("compare-pairs").striped(true).num_columns(5).show(ui, |ui| {
-            for head in ["A", "B", "Cliff's δ", "Mann-Whitney p", "Holm p"] { ui.weak(head); }
+        egui::Grid::new("compare-pairs").striped(true).num_columns(6).show(ui, |ui| {
+            for head in ["A", "B", "样本数 A / B", "Cliff's δ", "Mann-Whitney p", "Holm p"] { ui.weak(head); }
             ui.end_row();
             for pair in result["pairs"].as_array().cloned().unwrap_or_default() {
                 ui.label(s(&pair, "first"));
                 ui.label(s(&pair, "second"));
+                ui.label(format!("{} / {}", u(&pair, "first_n"), u(&pair, "second_n"))).on_hover_text(s(&pair, "note"));
                 let delta = &pair["cliffs_delta"];
                 ui.monospace(format!("{} ({})", number(f(delta, "delta"), 3), s(delta, "magnitude")));
                 ui.monospace(number(pair["mann_whitney"].get("p_two_sided").and_then(Value::as_f64), 4));
@@ -297,11 +386,13 @@ impl Research {
         let shared = result["shared_sequences"].as_array().cloned().unwrap_or_default();
         if !shared.is_empty() {
             ui.add_space(6.0);
-            ui.strong("共享镜头序列（可能是 OP/ED/回顾）");
+            ui.strong("共享镜头序列（possible_material_reuse；可能是 OP/ED/回顾）");
             for run in shared.iter().take(30) {
                 ui.monospace(format!("{} #{}–#{} ↔ {} #{}–#{} · {} 镜头",
                     s(run, "first_label"), run["first_shot_numbers"][0], run["first_shot_numbers"][1],
-                    s(run, "second_label"), run["second_shot_numbers"][0], run["second_shot_numbers"][1], u(run, "shots")));
+                    s(run, "second_label"), run["second_shot_numbers"][0], run["second_shot_numbers"][1],
+                    u(run, "shots")));
+                ui.small(format!("{} · {}", s(run, "classification"), s(run, "note")));
             }
         }
         for note in result["notes"].as_array().cloned().unwrap_or_default() {
@@ -413,8 +504,8 @@ impl Research {
         }
         ui.add_space(8.0);
         ui.separator();
-        egui::Grid::new("vlm-rows").striped(true).num_columns(5).show(ui, |ui| {
-            for head in ["镜头", "景别", "运镜", "内容", "描述"] { ui.weak(head); }
+        egui::Grid::new("vlm-rows").striped(true).num_columns(6).show(ui, |ui| {
+            for head in ["镜头", "景别", "运镜", "内容", "描述", "证据帧"] { ui.weak(head); }
             ui.end_row();
             for shot in state.shots.iter().filter(|s| s.vlm.is_some()).take(500) {
                 let vlm = shot.vlm.as_ref().unwrap();
@@ -423,9 +514,104 @@ impl Research {
                 ui.label(vlm.camera_movement.as_deref().unwrap_or("—"));
                 ui.label(vlm.content_type.as_deref().unwrap_or("—"));
                 ui.label(&vlm.description);
+                let frames = vlm.evidence_frames.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ");
+                ui.label(if frames.is_empty() { "—".into() } else {
+                    format!("{} 帧{}{}", vlm.evidence_count.unwrap_or(vlm.evidence_frames.len() as u64),
+                        if vlm.sampling.is_empty() { String::new() } else { format!(" · {}", vlm.sampling) },
+                        if frames.is_empty() { String::new() } else { format!(" · [{frames}]") })
+                }).on_hover_text("证据帧是源视频显示帧编号；自适应采样长镜头会取更多有界关键帧");
                 ui.end_row();
             }
         });
+    }
+
+    fn lapian_tab(&mut self, ui: &mut egui::Ui, state: &State, actions: &mut Vec<Action>) {
+        ui.weak("把镜头量测（切点/景别/VLM 标注/运动/声音/台词）打包交给多模态大模型做叙事级拉片：\
+                 场景划分、剧情线、观众情绪曲线与全片结构。结果存为独立叙事层，可整体撤销，不覆盖镜头笔记。");
+        if self.narrative_project != state.project_id { self.narrative_loaded = false; }
+        if !self.narrative_loaded {
+            self.narrative_loaded = true;
+            self.narrative_project = state.project_id.clone();
+            actions.push(Action::Rpc { method: "narrative.get", params: json!({}) });
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("刷新").clicked() {
+                actions.push(Action::Rpc { method: "narrative.get", params: json!({}) });
+            }
+            if ui.add_enabled(state.completed_count > 0, egui::Button::new("导出分析包…"))
+                .on_hover_text("prompt.md + schema.json + manifest 镜头证据表 + 画面拼图 + 字幕；交给任意多模态大模型")
+                .clicked() { actions.push(Action::ExportLapianPackage); }
+            if ui.add_enabled(state.completed_count > 0, egui::Button::new("导入 AI 结果…"))
+                .on_hover_text("大模型返回的 JSON 写回叙事层（dry run 请用 CLI/MCP）")
+                .clicked() { actions.push(Action::ImportLapian); }
+            if ui.add_enabled(true, egui::Button::new("导出拉片长图…"))
+                .on_hover_text("情绪曲线 + 剧情线泳道 + 场景表 PNG")
+                .clicked() { actions.push(Action::ExportLapianSheet); }
+        });
+        let Some(narrative) = &self.narrative else {
+            ui.add_space(8.0);
+            ui.weak("（叙事层为空）从「导出分析包」开始：把包交给 ChatGPT / GLM / Kimi 等，\
+                     用包内 prompt.md 附带的开场白提问，收到的 JSON 用「导入 AI 结果」写回。");
+            return;
+        };
+        let scenes = narrative["scenes"].as_array().cloned().unwrap_or_default();
+        if scenes.is_empty() {
+            ui.add_space(8.0);
+            ui.weak("叙事层还没有场景。");
+            return;
+        }
+        let identity = &narrative["identity"];
+        ui.add_space(6.0);
+        ui.strong(format!("{} · {} 场景 · {} 曲线点{}",
+            s(identity, "title"), scenes.len(),
+            narrative["curve_points"].as_array().map(|p| p.len()).unwrap_or(0),
+            if s(narrative, "model").is_empty() { String::new() } else { format!(" · {}", s(narrative, "model")) }));
+        let lines: Vec<String> = narrative["story_lines"].as_array().cloned().unwrap_or_default()
+            .iter().map(|l| s(l, "title").to_string()).collect();
+        if !lines.is_empty() { ui.small(format!("剧情线：{}", lines.join(" / "))); }
+        ui.add_space(6.0);
+        egui::Grid::new("lapian-scenes").striped(true).num_columns(6).show(ui, |ui| {
+            for head in ["类型", "镜头", "时间", "标题", "作用", ""] { ui.weak(head); }
+            ui.end_row();
+            for scene in &scenes {
+                ui.label(s(scene, "type"));
+                ui.monospace(format!("S{}–S{}", u(scene, "start_shot"), u(scene, "end_shot")));
+                ui.monospace(format!("{}s–{}s", number(scene.get("start_s").and_then(Value::as_f64), 1),
+                    number(scene.get("end_s").and_then(Value::as_f64), 1)));
+                ui.label(s(scene, "title")).on_hover_text(format!("{}\n{}", s(scene, "key_beats"), s(scene, "techniques")));
+                ui.small(s(scene, "function"));
+                let start_shot = u(scene, "start_shot") as usize;
+                if let Some(shot) = state.shots.get(start_shot.saturating_sub(1)) {
+                    if ui.small_button("定位").clicked() { actions.push(Action::Locate(shot.start)); }
+                }
+                ui.end_row();
+            }
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.strong("观众情绪曲线");
+        egui::Grid::new("lapian-curve").striped(true).num_columns(5).show(ui, |ui| {
+            for head in ["时间", "强度", "效价", "节奏/情绪", "说明"] { ui.weak(head); }
+            ui.end_row();
+            for point in narrative["curve_points"].as_array().cloned().unwrap_or_default() {
+                ui.monospace(number(point.get("time").and_then(Value::as_f64), 1));
+                ui.monospace(number(point.get("intensity").and_then(Value::as_f64), 0));
+                ui.monospace(number(point.get("valence").and_then(Value::as_f64), 0));
+                ui.label(format!("{} / {}", s(&point, "rhythm_role"), s(&point, "emotion_type")));
+                ui.small(format!("{} · {}", s(&point, "title"), s(&point, "why")));
+                ui.end_row();
+            }
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.strong("全片结构");
+        for (key, label) in [("overall_structure", "结构"), ("narrative_strategy", "叙事策略"),
+                             ("rhythm_pattern", "节奏"), ("information_strategy", "信息策略"),
+                             ("core_intent", "核心意图")] {
+            let text = s(&narrative["macro"], key);
+            if !text.is_empty() { ui.horizontal_wrapped(|ui| { ui.weak(format!("{label}:")); ui.label(text); }); }
+        }
     }
 
     /// 边车结果按方法名落到对应面板；返回 true 表示需要刷新项目状态。
@@ -440,6 +626,9 @@ impl Research {
             "vlm.config.get" | "vlm.config.set" => { self.pending_config = Some(value); false }
             "vlm.run" => { self.vlm_report = Some(value); true }
             "vlm.suggest_regions" => { self.suggestions = Some(value); false }
+            "narrative.get" => { self.narrative = Some(value); false }
+            "lapian.import" | "lapian.deep_import" => { self.narrative_loaded = false; true }
+            "lapian.package" | "export.lapian_sheet" => false,
             _ => true,
         }
     }
@@ -465,6 +654,18 @@ mod tests {
     }
 
     #[test]
+    fn lapian_results_update_narrative_and_refetch_after_import() {
+        let mut research = Research::default();
+        research.narrative_loaded = true;
+        assert!(!research.accept("narrative.get", json!({"scenes": [{"title": "色块对峙"}]})));
+        assert_eq!(research.narrative.as_ref().unwrap()["scenes"].as_array().unwrap().len(), 1);
+        // 导入写回项目状态（true → 刷新），并让面板下次重新拉取叙事层。
+        assert!(research.accept("lapian.import", json!({"imported": true})));
+        assert!(!research.narrative_loaded);
+        assert!(!research.accept("lapian.package", json!({"out_dir": "x"})));
+    }
+
+    #[test]
     fn reset_keeps_the_tab_but_drops_results() {
         let mut research = Research { tab: Tab::Vlm, ..Default::default() };
         research.accept("compare.run", json!({"films": []}));
@@ -478,5 +679,13 @@ mod tests {
         assert_eq!(interval(&json!({"x": [1.0, 2.5]}), "x"), "[1.00, 2.50]");
         assert_eq!(interval(&json!({"x": null}), "x"), "—");
         assert_eq!(number(None, 2), "—");
+    }
+
+    #[test]
+    fn manual_alignment_parser_rejects_invalid_rows_and_keeps_kinds() {
+        let rows = parse_anchors("1, 1, composition_similarity, 构图\n3, 4, material_reuse, OP 复用\nx, 5, other, 无效\n0, 0, material_reuse, 无效");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1][2], "material_reuse");
+        assert_eq!(rows[1][3], "OP 复用");
     }
 }

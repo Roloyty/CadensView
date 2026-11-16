@@ -57,13 +57,13 @@ impl BoundaryEditor {
                 ui.add_space(10.0);
                 let parsed = self.text.trim().parse::<u64>().ok();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(parsed.map(|f| f > self.lower).unwrap_or(false), egui::Button::new("◁")).clicked() {
+                    if ui.add_enabled(parsed.map(|f| f > self.lower).unwrap_or(false), egui::Button::new(crate::kit::icon::CARET_LEFT)).clicked() {
                         let frame = parsed.unwrap() - 1;
                         self.text = frame.to_string(); result = Some(Action::Preview(frame));
                     }
                     let input = ui.add(egui::TextEdit::singleline(&mut self.text).desired_width(180.0));
                     if self.focus { input.request_focus(); self.focus = false; }
-                    if ui.add_enabled(parsed.map(|f| f < self.upper).unwrap_or(false), egui::Button::new("▷")).clicked() {
+                    if ui.add_enabled(parsed.map(|f| f < self.upper).unwrap_or(false), egui::Button::new(crate::kit::icon::CARET_RIGHT)).clicked() {
                         let frame = parsed.unwrap() + 1;
                         self.text = frame.to_string(); result = Some(Action::Preview(frame));
                     }

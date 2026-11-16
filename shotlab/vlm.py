@@ -30,15 +30,16 @@ from pathlib import Path
 from shotlab.statistics import AnalysisScope, build_context
 from t0.media import FrameReader
 
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2
+EVIDENCE_SAMPLING_VERSION = 2
 CONFIG_PATH = Path.home() / ".cadensview" / "vlm.json"
 DEFAULTS = dict(provider="anthropic", model="claude-opus-5-5", base_url="", effort="low",
                 concurrency=2, frames=3, image_width=512, timeout_s=120)
-SCALES = ["ECS", "CS", "MS", "FS", "LS"]
-CAMERA = ["static", "pan", "tilt", "track", "zoom", "shake", "complex"]
-ANGLES = ["eye", "high", "low", "overhead", "dutch"]
+SCALES = ["ECS", "CS", "MS", "FS", "LS", "unknown"]
+CAMERA = ["static", "pan", "tilt", "track", "zoom", "shake", "complex", "unknown"]
+ANGLES = ["eye", "high", "low", "overhead", "dutch", "unknown"]
 SETTINGS = ["interior", "exterior", "abstract", "unknown"]
-CONTENT = ["dialogue", "reaction", "action", "establishing", "insert", "montage", "title_card", "text", "other"]
+CONTENT = ["dialogue", "reaction", "action", "establishing", "insert", "montage", "title_card", "text", "other", "unknown"]
 SEGMENTS = ["none", "op", "ed", "eyecatch", "preview", "recap", "title"]
 EFFECTS = ["glow", "lens_flare", "blur", "light_rays", "speed_lines", "particles", "rain_snow", "none"]
 
@@ -78,7 +79,8 @@ effects: compositing effects visible (glow, lens_flare, blur, light_rays, speed_
   rain_snow) or ["none"].
 description: one short sentence in Simplified Chinese describing what happens.
 confidence: 0-1, how sure you are of shot_scale and camera_movement.
-If frames are dark or ambiguous, still choose the closest label and lower confidence.
+If frames are dark, ambiguous, or insufficient to establish a field, choose unknown for that field.
+Do not guess movement from a single pose. Confidence is a self-estimate, not a calibrated probability.
 Return only the JSON object."""
 
 
@@ -143,6 +145,14 @@ def keyframes(reader, shot, count, width):
     return [_jpeg(reader.read(number), width) for number in picks]
 
 
+def evidence_picks(shot, base=3, maximum=6):
+    """Long shots receive a bounded number of additional evidence frames."""
+    from shotlab.study_formats import adaptive_frame_count
+    span = shot.end_frame_exclusive - shot.start_frame
+    count = adaptive_frame_count(span, base, maximum, float(shot.end - shot.start))
+    return sorted({shot.start_frame + min(span - 1, int(span * (i + 0.5) / count)) for i in range(count)})
+
+
 def parse_reply(text):
     """JSON object from a model reply; tolerates code fences and leading prose."""
     text = text.strip()
@@ -159,7 +169,7 @@ def normalize(data):
     """Keep only schema fields with valid values; unknown enums become None."""
     def pick(key, allowed):
         value = str(data.get(key, "")).strip()
-        return value if value in allowed else None
+        return value if value in allowed and value != "unknown" else None
     effects = [e for e in (data.get("effects") or []) if e in EFFECTS and e != "none"]
     try:
         subjects = max(0, int(data.get("subjects", 0)))
@@ -266,6 +276,8 @@ def annotate_shots(project, index, scope=AnalysisScope(), existing=None, force=F
         existing.get(s.shot_id, {}).get("start") == s.start_frame
         and existing.get(s.shot_id, {}).get("end") == s.end_frame_exclusive
         and existing.get(s.shot_id, {}).get("model") == config["model"]
+        and existing.get(s.shot_id, {}).get("sampling_version") == EVIDENCE_SAMPLING_VERSION
+        and existing.get(s.shot_id, {}).get("sampling_base") == config["frames"]
         and existing.get(s.shot_id, {}).get("prompt_version") == PROMPT_VERSION)]
     results, errors = {}, []
     if not todo:
@@ -278,8 +290,9 @@ def annotate_shots(project, index, scope=AnalysisScope(), existing=None, force=F
             for shot in todo:
                 if cancel is not None and cancel.is_set():
                     break
-                images = keyframes(reader, shot, config["frames"], config["image_width"])
-                futures[pool.submit(_call, backend, shot, images)] = shot
+                numbers = evidence_picks(shot, config["frames"])
+                images = [_jpeg(reader.read(number), config["image_width"]) for number in numbers]
+                futures[pool.submit(_call, backend, shot, images)] = (shot, numbers)
                 # 保持在途请求有限，取消时不至于还有一大批已发出。
                 while len([f for f in futures if not f.done()]) >= config["concurrency"] * 2:
                     time.sleep(0.05)
@@ -288,13 +301,17 @@ def annotate_shots(project, index, scope=AnalysisScope(), existing=None, force=F
                     for pending in futures:
                         pending.cancel()
                     break
-                shot = futures[future]
+                shot, evidence_numbers = futures[future]
                 done += 1
                 try:
                     label, model = future.result()
                     results[shot.shot_id] = dict(
                         label, start=shot.start_frame, end=shot.end_frame_exclusive, model=config["model"],
                         served_by=model, provider=config["provider"], prompt_version=PROMPT_VERSION,
+                        evidence_frames=evidence_numbers, evidence_count=len(evidence_numbers),
+                        evidence_times_s=[round((index.us(f) - index.us(0)) / 1e6, 6) for f in evidence_numbers],
+                        sampling="adaptive; configured base plus duration increments; maximum 6",
+                        sampling_version=EVIDENCE_SAMPLING_VERSION, sampling_base=config["frames"],
                         at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
                 except Exception as error:  # noqa: BLE001 — 单镜头失败不影响其余
                     errors.append(dict(shot_id=shot.shot_id, shot_number=shot.shot_number,
@@ -306,7 +323,9 @@ def annotate_shots(project, index, scope=AnalysisScope(), existing=None, force=F
     if cancel is not None and cancel.is_set() and not results:
         raise CancelledError("VLM 标注已取消")
     meta = dict(provider=config["provider"], model=config["model"], prompt_version=PROMPT_VERSION,
-                frames_per_shot=config["frames"], image_width=config["image_width"], requested=len(todo))
+                frames_per_shot=config["frames"], image_width=config["image_width"], requested=len(todo),
+                evidence_sampling="adaptive bounded keyframes; source-frame numbers and relative times stored per shot",
+                evidence_sampling_version=EVIDENCE_SAMPLING_VERSION, max_evidence_frames=6)
     return results, errors, meta
 
 

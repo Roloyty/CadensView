@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 use eframe::egui::{self, TextureHandle};
-use crate::{model::*, theme};
+use crate::{kit::{self, icon}, model::*, theme};
 
 #[derive(Clone, Copy, Default, PartialEq)]
-pub enum Topic { #[default] Duration, Rhythm, Colors, Motion, Sound, Research }
+pub enum Topic { #[default] Duration, Rhythm, Colors, Motion, Sound, Study, Research }
 
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum Scope { #[default] All, Marked }
@@ -48,34 +48,38 @@ impl Workspace {
         let mut actions = Vec::new();
         let previous = self.topic;
         ui.horizontal(|ui| {
-            for (topic, label) in [(Topic::Duration, "剪辑"), (Topic::Rhythm, "节奏"),
-                                   (Topic::Colors, "色彩"), (Topic::Motion, "运动 · 拍数"),
-                                   (Topic::Sound, "声音"), (Topic::Research, "研究")] {
-                ui.selectable_value(&mut self.topic, topic, label);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            kit::tabs(ui, &mut self.topic, &[
+                (Topic::Duration, kit::label(icon::SCISSORS, "剪辑")),
+                (Topic::Rhythm, kit::label(icon::CHART_BAR, "节奏")),
+                (Topic::Colors, kit::label(icon::PALETTE, "色彩")),
+                (Topic::Motion, kit::label(icon::FILM_STRIP, "运动 · 拍数")),
+                (Topic::Sound, kit::label(icon::SPEAKER_HIGH, "声音")),
+                (Topic::Study, kit::label(icon::FILM_STRIP, "视听标注")),
+                (Topic::Research, kit::label(icon::NOTE_PENCIL, "研究")),
+            ]);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 if busy { ui.spinner(); }
                 if let Some(stats) = stats {
                     let scope = &stats.metadata.scope;
                     let label = if scope.kind == "selected_shots" { "已标记镜头" }
                         else if scope.analysis_complete { "全片研究" } else { "已完成部分" };
-                    ui.weak(format!("{label} · {:.2}s", scope.scope_duration_s));
+                    ui.label(egui::RichText::new(format!("{label} · {:.2}s", scope.scope_duration_s)).small().color(theme::secondary()));
                 }
             });
         });
         if previous != self.topic { self.detail = None; }
-        ui.add_space(12.0);
+        ui.add_space(4.0);
         // 研究页与声音页由各自模块绘制，这里只负责页签栏。
-        if matches!(self.topic, Topic::Research | Topic::Sound) { return actions; }
+        if matches!(self.topic, Topic::Research | Topic::Sound | Topic::Study) { return actions; }
         let height = ui.available_height();
         let rail_width = (ui.available_width() * 0.23).clamp(210.0, 280.0);
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(egui::vec2(rail_width, height), egui::Layout::top_down(egui::Align::Min), |ui| {
                 ui.set_max_width(rail_width);
                 egui::ScrollArea::vertical().id_salt("analysis-rail").show(ui, |ui| {
-                    ui.monospace(match self.topic { Topic::Duration => "01 / SHOTS", Topic::Rhythm => "02 / RHYTHM", Topic::Colors => "03 / COLOR", Topic::Motion | Topic::Sound | Topic::Research => "04 / MOTION" });
+                    ui.monospace(match self.topic { Topic::Duration => "01 / SHOTS", Topic::Rhythm => "02 / RHYTHM", Topic::Colors => "03 / COLOR", Topic::Motion | Topic::Sound | Topic::Research | Topic::Study => "04 / MOTION" });
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new(title).size(18.0).strong());
+                    ui.label(egui::RichText::new(title).font(theme::bold(18.0)));
                     ui.add_space(24.0);
                     if let Some(stats) = stats {
                         self.metrics(ui, stats, colors, motion, busy, motion_busy, &mut actions);
@@ -106,7 +110,7 @@ impl Workspace {
                         Topic::Rhythm => self.rhythm(ui, stats),
                         Topic::Colors => self.colors(ui, colors, thumbs, stem, busy, &mut actions),
                         Topic::Motion => self.motion(ui, motion, busy, motion_busy, &mut actions),
-                        Topic::Sound | Topic::Research => {}
+                        Topic::Sound | Topic::Research | Topic::Study => {}
                     }
                 });
             });
@@ -337,7 +341,7 @@ impl Workspace {
         metric(ui, "阈值", Some(motion.parameters.threshold as f64), "/255");
         metric(ui, "曲线采样点", Some(motion.samples.len() as f64), "");
         ui.add_space(12.0);
-        if ui.add_enabled(!motion_busy, egui::Button::new("↻ 重新分析")).clicked() {
+        if ui.add_enabled(!motion_busy, egui::Button::new(kit::label(icon::ARROW_CLOCKWISE, "重新分析"))).clicked() {
             actions.push(Action::RunMotion);
         }
         if ui.button("导出运动指纹 PNG").clicked() { actions.push(Action::ExportMotion); }

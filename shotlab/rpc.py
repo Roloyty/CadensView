@@ -26,9 +26,10 @@ BUSY_ALLOWED = {"ping", "project.state", "job.cancel", "edit.select", "metadata.
 # settings JSON 里的标注层（零迁移）。按镜头 ID 存的层在保存时剔除已不存在的镜头。
 PER_SHOT_LAYERS = ("shot_tags", "scale_labels", "cut_numbers", "scale_manual", "vlm_labels", "shot_hashes")
 PROJECT_LAYERS = {"regions": list, "metadata": dict, "detection_info": dict, "review": dict, "vlm_meta": dict,
-                  "audio_fingerprint": dict}
+                  "audio_fingerprint": dict, "study": dict, "subtitle_cues": list, "narrative": dict}
 # 可撤销的人工标注（与镜头编辑同一条撤销链）。
-UNDOABLE_LAYERS = ("shot_tags", "cut_numbers", "scale_manual", "regions")
+UNDOABLE_LAYERS = ("shot_tags", "cut_numbers", "scale_manual", "regions", "study", "subtitle_cues",
+                   "narrative")
 REGION_LABELS = {"OP": "片头曲", "ED": "片尾曲", "preview": "下集预告", "recap": "前情回顾",
                  "eyecatch": "眼动画/幕间", "title": "标题卡", "other": "其他"}
 METADATA_FIELDS = ("title", "series", "episode", "year", "director", "storyboard", "episode_director",
@@ -134,7 +135,6 @@ class Session:
             setattr(self, name, copy.deepcopy(self.settings.get(name, {})))
         for name, kind in PROJECT_LAYERS.items():
             setattr(self, name, copy.deepcopy(self.settings.get(name, kind())))
-        self.subtitle_cues = []
         self.motion = None
         self.motion_key = None
         self.audio = None
@@ -164,11 +164,16 @@ class Session:
         if self.project is None:
             raise ValueError("先打开视频并建立索引")
         before = self.annotation_state()
-        mutate()
+        try:
+            mutate()
+            state = self.state()
+        except Exception:
+            self.restore_annotations(before)
+            raise
         snapshot = copy.deepcopy(self.project)
         self.history.record(snapshot, snapshot, label, key, extra=(before, self.annotation_state()))
         self.dirty = True
-        return self.state()
+        return dict(state, dirty=True, can_undo=bool(self.history.undo), can_redo=bool(self.history.redo))
 
     def region_lookup(self):
         regions = list(self.regions)
@@ -290,6 +295,11 @@ class Session:
     # -- snapshot -----------------------------------------------------------
 
     def state(self):
+        from shotlab.study import STUDY_VERSION, data, playback_cues
+        if self.study.get("version") != STUDY_VERSION:
+            # Migrate an old on-disk project once, before new undoable edits.
+            # The undo baseline then contains the same complete v2 schema.
+            self.study = data(self)
         project, index = self.project, self.index
         shots = []
         region = self.region_lookup()
@@ -334,6 +344,8 @@ class Session:
             "shots": shots,
             "regions": self.regions,
             "metadata": self.metadata,
+            "study": data(self),
+            "subtitle_cues": playback_cues(self),
             "has_detection_record": bool(self.detection_info.get("cuts") is not None),
             "review_confirmed": len(self.review.get("confirmed", [])),
         }
@@ -1044,9 +1056,26 @@ def _repeats_get(session, params, emit=None):
 @method("compare.run")
 def _compare_run(session, params, emit=None):
     from shotlab.compare import compare_projects, write_compare_csv
+    from shotlab.study import data
     paths = params.get("paths") or []
+    study = data(session)
+    query, query_id = params.get("query"), params.get("saved_query_id")
+    if query_id:
+        saved_query = next((q for q in study["saved_queries"] if q["id"] == query_id), None)
+        if saved_query is not None:
+            query, query_id = saved_query, None
+    alignment = params.get("alignment")
+    if alignment is None:
+        saved = study["version_alignments"]
+        alignment = saved[0].get("anchors") if saved else None
     result = compare_projects(paths, exclude_regions=params.get("exclude_regions", True),
-                              group_by=params.get("group_by") or None)
+                              group_by=params.get("group_by") or None,
+                              inference_unit=params.get("inference_unit") or "film",
+                              alignment=alignment, query=query, saved_query_id=query_id)
+    result["alignment_from_saved_project"] = alignment is not None and params.get("alignment") is None
+    result["notes"] = list(result["notes"]) + [
+        "版本对齐锚点来自当前项目首条保存记录" if result["alignment_from_saved_project"]
+        else "版本对齐锚点来自本次明确输入，或本次未启用对齐"]
     if params.get("csv_path"):
         result["csv"] = write_compare_csv(result, params["csv_path"])
     return result
@@ -1199,6 +1228,10 @@ JOB_RUNNERS = {
     "audio.run": ("audio", _audio_job),
     "audio.match": ("audio", _audio_match),
 }
+from shotlab.study import register as register_study
+register_study(METHODS, JOB_RUNNERS)
+from shotlab.lapian import register as register_lapian
+register_lapian(METHODS, JOB_RUNNERS)
 JOB_METHODS = {"index.build", *JOB_RUNNERS}
 
 
@@ -1363,9 +1396,10 @@ def _subtitles_load(session, params, emit=None):
                 start_s, end_s = current[index].split('-->')
                 end_s = (end_s.split() or [""])[0]  # 去掉 "X1:… Y1:…" 之类的位置参数
                 text = plain_text('\n'.join(current[index + 1:]))
-                if text:
-                    cues.append({"start_us": timestamp(start_s),
-                                 "end_us": timestamp(end_s),
+                start_us, end_us = timestamp(start_s), timestamp(end_s)
+                if text and 0 <= start_us < end_us:
+                    cues.append({"start_us": start_us,
+                                 "end_us": end_us,
                                  "text": text})
         except (ValueError, IndexError):
             pass
@@ -1378,24 +1412,29 @@ def _subtitles_load(session, params, emit=None):
         else:
             current.append(line)
     flush()  # 文件末尾没有空行时也要处理最后一条
-    session.subtitle_cues = cues
+    def mutate():
+        session.subtitle_cues = cues
+        session.study = dict(session.study, subtitles_imported=False)
+    session._annotate("加载字幕", mutate)
     return {"cues": len(cues), "entries": cues, "path": str(path.resolve())}
 
 
 @method("subtitles.clear")
 def _subtitles_clear(session, params, emit=None):
-    session.subtitle_cues = []
+    def mutate():
+        session.subtitle_cues = []
+        session.study = dict(session.study, subtitles_imported=False)
+    session._annotate("清除播放字幕", mutate)
     return {"cleared": True}
 
 
 @method("subtitles.at")
 def _subtitles_at(session, params, emit=None):
     """获取指定时间（微秒）的字幕文本。"""
+    from shotlab.study import playback_cues
     us = int(params["timestamp_us"])
-    for cue in getattr(session, 'subtitle_cues', []):
-        if cue["start_us"] <= us < cue["end_us"]:
-            return {"text": cue["text"]}
-    return {"text": None}
+    text = "\n".join(cue["text"] for cue in playback_cues(session) if cue["start_us"] <= us < cue["end_us"])
+    return {"text": text or None}
 
 
 @method("export.pdf_sheet")

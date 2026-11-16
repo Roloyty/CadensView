@@ -348,12 +348,15 @@ def cv_repeats(project: str) -> str:
 
 
 @mcp.tool()
-def cv_compare(projects: list[str], exclude_regions: bool = True, group_by: str = "", csv_path: str = "") -> str:
+def cv_compare(projects: list[str], exclude_regions: bool = True, group_by: str = "", csv_path: str = "",
+               inference_unit: str = "shot") -> str:
     """多片/多集比较：各片 MSL/剪辑率区间，两两 Mann-Whitney（Holm 校正）与 Cliff's delta，
-    按集数的趋势，以及共享镜头序列（OP/ED，需先 cv_repeats）。group_by 为作品信息字段名。"""
+    按集数的趋势，以及共享镜头序列（OP/ED，需先 cv_repeats）。group_by 为作品信息字段名。
+    inference_unit 可选 shot、scene、film、episode；每侧样本不足时只给描述统计。"""
     try:
         from shotlab.compare import compare_projects, write_compare_csv
-        result = compare_projects(projects, exclude_regions=exclude_regions, group_by=group_by or None)
+        result = compare_projects(projects, exclude_regions=exclude_regions, group_by=group_by or None,
+                                  inference_unit=inference_unit)
         if csv_path:
             result["csv"] = write_compare_csv(result, csv_path)
         return _dump(result)
@@ -430,6 +433,136 @@ def cv_vlm(project: str, shot_ids: list[str] | None = None, force: bool = False)
             result = _vlm_run(session, {**_shot_params(shot_ids), "force": force})
             _save(session)
             return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+# -- AI 拉片：分析包 / 叙事层 / 深拆 / 直连 / 长图 --------------------------------
+
+
+def _lapian_params(shot_ids, exclude_regions=False):
+    params = _shot_params(shot_ids)
+    if exclude_regions:
+        params["exclude_regions"] = True
+    return params
+
+
+@mcp.tool()
+def cv_lapian_package(project: str, out_dir: str, mode: str = "sheets", max_images: int = 360,
+                      shot_ids: list[str] | None = None, exclude_regions: bool = False) -> str:
+    """导出 AI 拉片分析包（prompt.md + schema.json + manifest.json 镜头量测证据 + 拼图或代表帧 + 字幕）。
+    mode=sheets 拼图省流量 / frames 每镜头一图；max_images 图像数上限。把包交给任意多模态大模型，
+    用返回 chat_opener 那句话开场，收到的 JSON 用 cv_lapian_import 导回。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import export_package
+            return _dump(export_package(session, {
+                "out_dir": out_dir, "mode": mode, "max_images": max_images,
+                **_lapian_params(shot_ids, exclude_regions)}))
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_lapian_import(project: str, text: str = "", path: str = "", dry_run: bool = False,
+                     write_notes: bool = False, model: str = "") -> str:
+    """导入大模型返回的拉片 JSON（text 直接给 / path 读文件）。写回叙事层（场景/剧情线/情绪曲线），
+    可整体撤销。dry_run 只给预览（场数/警告/越界统计）；write_notes 同时把场景标题写进镜头笔记。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import import_analysis
+            result = import_analysis(session, {"text": text, "path": path, "dry_run": dry_run,
+                                               "write_notes": write_notes, "model": model})
+            if not dry_run:
+                _save(session)
+            return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_narrative(project: str) -> str:
+    """读取叙事层：场景（镜头区间锚定）/剧情线/情绪曲线/全片结构。空则各列表为空。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import data
+            return _dump(data(session))
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_narrative_compare(project: str, others: list[str]) -> str:
+    """跨片叙事比较：当前项目 + others 各 .shotlab 的场景数/场长(镜头数)/类型分布/曲线特征。
+    只读其他项目文件；没有叙事层的项目会标 has_narrative=false。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import narrative_compare
+            return _dump(narrative_compare(session, {"others": others}))
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_lapian_deep(project: str, out_dir: str, scene_id: str = "", scene_index: int = -1) -> str:
+    """场景深拆包：该场景每镜头一图（480 宽）+ 台词 + 场景粗稿。scene_index 从 0 起，或给 scene_id。
+    返回 JSON 用 cv_lapian_deep_import 导回（逐镜头卡片存进叙事层）。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import export_deep
+            params = {"out_dir": out_dir}
+            if scene_id:
+                params["scene_id"] = scene_id
+            if scene_index >= 0:
+                params["scene_index"] = scene_index
+            return _dump(export_deep(session, params))
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_lapian_deep_import(project: str, text: str = "", path: str = "", scene_index: int = -1) -> str:
+    """导入场景深拆结果（shot_cards 逐镜头卡 + 场景字段更新），写回叙事层。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import deep_import
+            params = {"text": text, "path": path}
+            if scene_index >= 0:
+                params["scene_index"] = scene_index
+            result = deep_import(session, params)
+            _save(session)
+            return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_lapian_run(project: str, base_url: str = "", model: str = "", api_key: str = "",
+                  api_key_env: str = "", max_images: int = 360, timeout_s: int = 600,
+                  no_import: bool = False) -> str:
+    """API 直连全片拉片（OpenAI 兼容 /chat/completions，单条多模态消息：prompt+镜头表+字幕+拼图），
+    成功后自动导入叙事层。base_url/model/api_key 缺省取 vlm-config 的 openai_compatible 配置；
+    api_key 建议走 api_key_env 环境变量。no_import=True 只返回原文。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import run_direct
+            result = run_direct(session, {"base_url": base_url, "model": model, "api_key": api_key,
+                                          "api_key_env": api_key_env, "max_images": max_images,
+                                          "timeout_s": timeout_s, "no_import": no_import})
+            if not no_import and result.get("imported"):
+                _save(session)
+            return _dump(result)
+    except Exception as error:  # noqa: BLE001
+        return _error(error)
+
+
+@mcp.tool()
+def cv_export_lapian(project: str, out_path: str, width: int = 1600) -> str:
+    """拉片长图 PNG：情绪曲线 + 剧情线泳道 + 场景表。需要先导入叙事层。"""
+    try:
+        with _session(project) as session:
+            from shotlab.lapian import draw_sheet
+            return _dump(draw_sheet(session, {"path": out_path, "width": width}))
     except Exception as error:  # noqa: BLE001
         return _error(error)
 

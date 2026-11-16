@@ -4,6 +4,7 @@
 use eframe::egui;
 use serde_json::Value;
 use crate::model::{self, State};
+use crate::kit::{self, icon};
 use crate::theme;
 
 #[derive(Default)]
@@ -61,7 +62,7 @@ impl Sound {
             ui.heading("声音");
             ui.weak("EBU R 128 响度 · 静音 · 切点处的声音 · 跨集音频指纹");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let label = if self.result.is_some() { "↻ 重新分析" } else { "运行声音分析" };
+                let label = if self.result.is_some() { kit::label(icon::ARROW_CLOCKWISE, "重新分析") } else { kit::label(icon::PLAY, "运行声音分析") };
                 if ui.add_enabled(!busy && state.completed_count > 0, egui::Button::new(label))
                     .on_hover_text("解码一遍音轨（24 分钟约数秒），范围与分析页一致").clicked() {
                     actions.push(Action::Run);

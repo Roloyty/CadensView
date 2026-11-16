@@ -152,7 +152,7 @@ def rate_warning(average_rate):
     except (ValueError, ZeroDivisionError):  # 元数据缺失只是不给提示
         return None
     if abs(rate - 29.97) < 0.05 or abs(rate - 59.94) < 0.1 or abs(rate - 30) < 0.05 or abs(rate - 60) < 0.1:
-        return "源为 30/60 帧系：动画多为 24 帧经 3:2 下拉，拍数需先做反胶片过带（IVTC）再统计"
+        return "源为 30/60 帧系：请检查重复帧/场节奏；仅确认 3:2 下拉后再考虑 IVTC，帧率本身不能证明转制"
     if abs(rate - 25) < 0.05 or abs(rate - 50) < 0.1:
         return "源为 25/50 帧（PAL 加速或转制），拍数按源帧计，与 24 帧原画时间表不完全对应"
     return None

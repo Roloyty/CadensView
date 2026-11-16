@@ -23,6 +23,8 @@ pub struct State {
     pub metadata: std::collections::BTreeMap<String, String>,
     pub has_detection_record: bool,
     pub review_confirmed: u64,
+    pub study: crate::study::Data,
+    pub subtitle_cues: Vec<SubtitleCue>,
 }
 
 /// 内容区段（OP/ED/预告…），统计时可整体排除。
@@ -64,6 +66,12 @@ pub struct VlmInfo {
     pub description: String,
     pub confidence: Option<f64>,
     pub model: String,
+    #[serde(default)]
+    pub evidence_frames: Vec<u64>,
+    #[serde(default)]
+    pub evidence_count: Option<u64>,
+    #[serde(default)]
+    pub sampling: String,
 }
 
 fn string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -167,6 +175,15 @@ impl IndexInfo {
 
     pub fn size(&self) -> (usize, usize) {
         (self.metadata.width.unwrap_or(0) as usize, self.metadata.height.unwrap_or(0) as usize)
+    }
+
+    /// 平均帧率（"24000/1001" 或 "25"）；解析不了时为 None。
+    pub fn fps(&self) -> Option<f64> {
+        let rate = self.metadata.average_rate.as_deref()?;
+        let mut parts = rate.splitn(2, '/');
+        let num = parts.next()?.trim().parse::<f64>().ok()?;
+        let den = parts.next().map(|d| d.trim().parse::<f64>().ok()).unwrap_or(Some(1.0))?;
+        Some(num / den).filter(|fps| fps.is_finite() && *fps > 0.0)
     }
 
     pub fn cache_stem(&self) -> String {
@@ -544,8 +561,21 @@ mod tests {
         let shot = &state.shots[0];
         assert_eq!((shot.scale_manual.as_deref(), shot.cut_number.as_str()), (Some("CS"), "012"));
         assert_eq!(shot.vlm.as_ref().unwrap().shot_scale.as_deref(), Some("MS"));
+        assert!(shot.vlm.as_ref().unwrap().evidence_frames.is_empty());
         assert_eq!(scale_zh("ECS"), "大特写");
         assert_eq!(region_zh("ED"), "片尾曲");
+    }
+
+    #[test]
+    fn vlm_evidence_frames_survive_rpc_payload() {
+        let state: State = serde_json::from_value(serde_json::json!({
+            "shots": [{"id": "a", "vlm": {"evidence_frames": [4, 12, 20], "evidence_count": 3,
+                "sampling": "adaptive"}}]
+        })).unwrap();
+        let vlm = state.shots[0].vlm.as_ref().unwrap();
+        assert_eq!(vlm.evidence_frames, [4, 12, 20]);
+        assert_eq!(vlm.evidence_count, Some(3));
+        assert_eq!(vlm.sampling, "adaptive");
     }
 
     #[test]

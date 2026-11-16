@@ -8,6 +8,7 @@ use eframe::egui;
 /// 一套完整配色（对应原版 Theme.qml 的 palette 字段）。
 #[derive(Clone, Copy)]
 pub struct Palette {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub key: &'static str,
     pub title: &'static str,
     pub light: bool,
@@ -124,9 +125,6 @@ pub fn warning() -> egui::Color32 { current().warning }
 pub fn error() -> egui::Color32 { current().error }
 pub fn on_accent() -> egui::Color32 { current().on_accent }
 
-/// 主题键（设置持久化用）。
-pub fn current_key() -> &'static str { current().key }
-
 /// 当前主题标题（菜单显示）。
 pub fn current_title() -> &'static str { current().title }
 
@@ -143,14 +141,31 @@ pub fn accent_wash() -> egui::Color32 {
 
 /// 悬停底色：主色 7% 混入面板（原版 hover 语义）。
 pub fn hover() -> egui::Color32 {
-    let accent = accent();
-    let base = input();
-    egui::Color32::from_rgb(
-        ((accent.r() as u16 * 7 + base.r() as u16 * 93) / 100) as u8,
-        ((accent.g() as u16 * 7 + base.g() as u16 * 93) / 100) as u8,
-        ((accent.b() as u16 * 7 + base.b() as u16 * 93) / 100) as u8,
-    )
+    mix(input(), accent(), 0.07)
 }
+
+/// 卡片底：比面板略亮（浅色主题略暗），把右栏、工具条分成可辨认的区块。
+pub fn card() -> egui::Color32 {
+    mix(panel(), ink(), if current().light { 0.035 } else { 0.045 })
+}
+
+/// 控件描边：比分隔线淡，只用来让按钮从底色里浮出来。
+pub fn outline() -> egui::Color32 {
+    mix(panel(), line(), 0.75)
+}
+
+/// 按比例混合两种颜色（`t` = 0 取 `a`，1 取 `b`）。
+pub fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
+}
+
+/// 粗体字族（标题、镜头号）；系统没有粗体时退回常规字体。
+pub fn bold(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Name(BOLD.into()))
+}
+
+const BOLD: &str = "bold";
 
 /// 安装主题：视觉、字阶、间距。切换主题时再次调用即可。
 pub fn install(ctx: &egui::Context) {
@@ -162,32 +177,54 @@ pub fn install(ctx: &egui::Context) {
     } else {
         egui::Visuals::dark()
     };
+    let radius = egui::CornerRadius::same(6);
     visuals.panel_fill = p.panel;
     visuals.extreme_bg_color = p.input;
     visuals.faint_bg_color = p.input;
     visuals.window_fill = p.panel;
     visuals.window_stroke = egui::Stroke::new(1.0, p.line);
-    visuals.window_shadow = egui::Shadow::NONE;
-    visuals.popup_shadow = egui::Shadow::NONE;
+    visuals.window_corner_radius = egui::CornerRadius::same(10);
+    visuals.menu_corner_radius = egui::CornerRadius::same(8);
+    // 弹出菜单和窗口要有层次：一层很淡的投影，不要发光。
+    let shadow = egui::Shadow {
+        offset: [0, 6],
+        blur: 18,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(if p.light { 40 } else { 110 }),
+    };
+    visuals.window_shadow = shadow;
+    visuals.popup_shadow = shadow;
+    visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    visuals.disabled_alpha = 0.42;
+    visuals.slider_trailing_fill = true;
     {
         let w = &mut visuals.widgets;
         w.noninteractive.bg_fill = p.top;
         w.noninteractive.fg_stroke = egui::Stroke::new(1.0, p.secondary);
-        w.noninteractive.bg_stroke = egui::Stroke::NONE;
+        w.noninteractive.bg_stroke = egui::Stroke::new(1.0, p.line);
+        w.noninteractive.corner_radius = radius;
         w.inactive.bg_fill = p.input;
         w.inactive.weak_bg_fill = p.input;
         w.inactive.fg_stroke = egui::Stroke::new(1.0, p.ink);
-        w.inactive.bg_stroke = egui::Stroke::NONE;
+        w.inactive.bg_stroke = egui::Stroke::new(1.0, outline());
+        w.inactive.corner_radius = radius;
         w.hovered.bg_fill = hover();
         w.hovered.weak_bg_fill = hover();
         w.hovered.fg_stroke = egui::Stroke::new(1.0, p.ink);
-        w.hovered.bg_stroke = egui::Stroke::NONE;
+        w.hovered.bg_stroke = egui::Stroke::new(1.0, mix(p.line, p.accent, 0.35));
+        w.hovered.corner_radius = radius;
+        w.hovered.expansion = 0.0;
         w.active.bg_fill = accent_wash();
         w.active.weak_bg_fill = accent_wash();
-        w.active.fg_stroke = egui::Stroke::new(1.0, p.accent);
+        w.active.fg_stroke = egui::Stroke::new(1.0, p.ink);
         w.active.bg_stroke = egui::Stroke::new(1.0, p.accent);
+        w.active.corner_radius = radius;
+        w.active.expansion = 0.0;
+        w.open.corner_radius = radius;
+        w.open.weak_bg_fill = hover();
     }
-    visuals.selection.bg_fill = accent_wash();
+    // 选中态（selectable、分段按钮）：淡强调底 + 强调色文字，不只靠颜色——还有描边。
+    visuals.selection.bg_fill = mix(p.panel, p.accent, if p.light { 0.18 } else { 0.22 });
     visuals.selection.stroke = egui::Stroke::new(1.0, p.accent);
     visuals.hyperlink_color = p.accent;
     ctx.set_visuals(visuals);
@@ -196,14 +233,17 @@ pub fn install(ctx: &egui::Context) {
         if p.light { egui::Theme::Light } else { egui::Theme::Dark },
         |style| {
             let text = &mut style.text_styles;
-            text.insert(egui::TextStyle::Heading, egui::FontId::proportional(16.0));
-            text.insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
-            text.insert(egui::TextStyle::Small, egui::FontId::proportional(10.5));
-            text.insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-            text.insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.0));
+            text.insert(egui::TextStyle::Heading, bold(15.0));
+            text.insert(egui::TextStyle::Body, egui::FontId::proportional(13.5));
+            text.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
+            text.insert(egui::TextStyle::Button, egui::FontId::proportional(13.5));
+            text.insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.5));
             style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            style.spacing.button_padding = egui::vec2(10.0, 4.0);
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            style.spacing.interact_size = egui::vec2(28.0, 28.0);
             style.spacing.menu_margin = egui::Margin::same(6);
+            style.spacing.window_margin = egui::Margin::same(14);
+            style.spacing.menu_width = 220.0;
         },
     );
     ctx.set_theme(if p.light {
@@ -213,33 +253,44 @@ pub fn install(ctx: &egui::Context) {
     });
 }
 
-/// 注册 CJK 字体（无中文形即豆腐块）。set_fonts 幂等，重复调用安全。
+/// 图标字体（Phosphor regular，MIT，见 assets/Phosphor-LICENSE.txt）。
+const ICON_FONT: &[u8] = include_bytes!("../assets/Phosphor.ttf");
+
+/// 字体：中文 UI 字体放第一位，中英文用同一套字形；图标字体紧随其后；
+/// 另注册粗体字族给标题。set_fonts 幂等，重复调用安全。
 pub fn install_fonts(ctx: &egui::Context) {
-    let candidates = [
+    let read_first = |paths: &[&str]| paths.iter().find_map(|path| std::fs::read(path).ok());
+    let regular = read_first(&[
         "C:/Windows/Fonts/Deng.ttf",
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/msyh.ttc",
-    ];
-    let mut bytes = None;
-    for path in candidates {
-        if let Ok(data) = std::fs::read(path) {
-            bytes = Some(data);
-            break;
-        }
-    }
-    let Some(bytes) = bytes else {
-        eprintln!("警告：未找到系统中文字体，界面中文将显示为方块");
-        return;
-    };
+    ]);
+    let bold = read_first(&["C:/Windows/Fonts/Dengb.ttf", "C:/Windows/Fonts/msyhbd.ttc"]);
     let mut fonts = egui::FontDefinitions::default();
-    fonts
-        .font_data
-        .insert("system-cjk".into(), egui::FontData::from_owned(bytes).into());
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        if let Some(list) = fonts.families.get_mut(&family) {
-            list.push("system-cjk".into());
+    fonts.font_data.insert("icons".into(), egui::FontData::from_static(ICON_FONT).into());
+    let mut text_fonts: Vec<String> = Vec::new();
+    match regular {
+        Some(bytes) => {
+            fonts.font_data.insert("system-cjk".into(), egui::FontData::from_owned(bytes).into());
+            text_fonts.push("system-cjk".into());
+        }
+        None => eprintln!("警告：未找到系统中文字体，界面中文将显示为方块"),
+    }
+    if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        for (at, name) in text_fonts.iter().chain(std::iter::once(&"icons".to_string())).enumerate() {
+            list.insert(at, name.clone());
         }
     }
+    if let Some(list) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        list.extend(text_fonts.iter().cloned());
+        list.push("icons".into());
+    }
+    let mut bold_family = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    if let Some(bytes) = bold {
+        fonts.font_data.insert("system-cjk-bold".into(), egui::FontData::from_owned(bytes).into());
+        bold_family.insert(0, "system-cjk-bold".into());
+    }
+    fonts.families.insert(egui::FontFamily::Name(BOLD.into()), bold_family);
     ctx.set_fonts(fonts);
 }
 

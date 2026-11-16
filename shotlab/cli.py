@@ -299,6 +299,10 @@ def cmd_export(args):
             from shotlab.motion import write_spectrum
             result = session.motion_run(session.analysis_scope(_selection_params(session, args.shots)))
             return write_spectrum(result, args.out)
+    if args.kind == "lapian":
+        with _session(args.project) as session:
+            from shotlab.lapian import draw_sheet
+            return draw_sheet(session, {"path": args.out, "width": args.width})
     if args.shots is not None:
         raise CliError("--shots 仅适用于 csv/sheet/pdf/slit/stills/motion 导出")
     if args.kind == "gif":
@@ -353,7 +357,7 @@ def cmd_repeats(args):
 def cmd_compare(args):
     from shotlab.compare import compare_projects, write_compare_csv
     result = compare_projects(args.projects, exclude_regions=not args.include_regions,
-                              group_by=args.group_by)
+                              group_by=args.group_by, inference_unit=args.inference_unit)
     if args.csv:
         result["csv"] = write_compare_csv(result, args.csv)
     return result
@@ -439,6 +443,73 @@ def cmd_vlm(args):
         return result
 
 
+def cmd_lapian_package(args):
+    with _session(args.project) as session:
+        from shotlab.lapian import export_package
+        return export_package(session, {"out_dir": args.out, "mode": args.mode,
+                                        "max_images": args.max_images,
+                                        **_scope_params(session, args)})
+
+
+def cmd_lapian_import(args):
+    with _session(args.project) as session:
+        from shotlab.lapian import import_analysis
+        result = import_analysis(session, {"path": args.file, "text": "",
+                                           "dry_run": args.dry_run,
+                                           "write_notes": args.write_notes,
+                                           "model": args.model})
+        if not args.dry_run:
+            _save(session)
+        return result
+
+
+def cmd_lapian_narrative(args):
+    with _session(args.project) as session:
+        from shotlab.lapian import data
+        return data(session)
+
+
+def cmd_lapian_compare(args):
+    with _session(args.project) as session:
+        from shotlab.lapian import narrative_compare
+        return narrative_compare(session, {"others": args.others})
+
+
+def cmd_lapian_deep(args):
+    with _session(args.project) as session:
+        from shotlab.lapian import export_deep
+        params = {"out_dir": args.out}
+        if args.scene_id:
+            params["scene_id"] = args.scene_id
+        if args.scene_index is not None:
+            params["scene_index"] = args.scene_index
+        return export_deep(session, params)
+
+
+def cmd_lapian_deep_import(args):
+    with _session(args.project) as session:
+        from shotlab.lapian import deep_import
+        params = {"path": args.file, "text": ""}
+        if args.scene_index is not None:
+            params["scene_index"] = args.scene_index
+        result = deep_import(session, params)
+        _save(session)
+        return result
+
+
+def cmd_lapian_run(args):
+    with _session(args.project) as session:
+        from shotlab.lapian import run_direct
+        result = run_direct(session, {"base_url": args.base_url, "model": args.model,
+                                      "api_key_env": args.api_key_env,
+                                      "max_images": args.max_images,
+                                      "timeout_s": args.timeout_s,
+                                      "no_import": args.no_import})
+        if not args.no_import and result.get("imported"):
+            _save(session)
+        return result
+
+
 def cmd_vlm_config(args):
     from shotlab.vlm import public_config, save_config
     values = {k: getattr(args, k) for k in ("provider", "model", "base_url", "effort", "concurrency", "frames")
@@ -506,8 +577,8 @@ def build_parser():
     p.add_argument("--tag", default=None, help="单个标签（remove）")
     p.set_defaults(fn=cmd_tags)
 
-    p = sub.add_parser("export", help="导出 csv|sheet|pdf|slit|stills|motion|gif|frame")
-    p.add_argument("kind", choices=("csv", "sheet", "pdf", "slit", "stills", "motion", "gif", "frame"))
+    p = sub.add_parser("export", help="导出 csv|sheet|pdf|slit|stills|motion|lapian|gif|frame")
+    p.add_argument("kind", choices=("csv", "sheet", "pdf", "slit", "stills", "motion", "lapian", "gif", "frame"))
     p.add_argument("out")
     p.add_argument("--project", required=True)
     p.add_argument("--shots", type=_parse_shot_numbers, default=None,
@@ -541,6 +612,8 @@ def build_parser():
     p = sub.add_parser("compare", help="多片/多集比较（MSL、剪辑率、Mann-Whitney、Cliff's delta）")
     p.add_argument("projects", nargs="+")
     p.add_argument("--group-by", default=None, help="按作品信息字段分组，如 storyboard")
+    p.add_argument("--inference-unit", choices=("shot", "scene", "film", "episode"), default="shot",
+                   help="检验样本单位；每侧样本不足时只给描述统计")
     p.add_argument("--include-regions", action="store_true", help="不排除 OP/ED 等区段")
     p.add_argument("--csv", default=None, help="同时写出各片汇总 CSV")
     p.set_defaults(fn=cmd_compare)
@@ -597,6 +670,56 @@ def build_parser():
     p.add_argument("--frames", type=int, default=None)
     p.add_argument("--api-key-env", default=None, help="从该环境变量读取 API key 写入用户配置")
     p.set_defaults(fn=cmd_vlm_config)
+
+    p = sub.add_parser("lapian-package", help="导出 AI 拉片分析包（prompt/schema/manifest/画面/字幕）")
+    p.add_argument("out")
+    p.add_argument("--project", required=True)
+    p.add_argument("--mode", choices=("sheets", "frames"), default="sheets")
+    p.add_argument("--max-images", dest="max_images", type=int, default=360)
+    p.add_argument("--shots", type=_parse_shot_numbers, default=None)
+    p.add_argument("--exclude-regions", action="store_true")
+    p.set_defaults(fn=cmd_lapian_package)
+
+    p = sub.add_parser("lapian-import", help="导入大模型返回的拉片 JSON，写回叙事层")
+    p.add_argument("project")
+    p.add_argument("file", help="模型返回的 JSON 文件路径")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="只预览不写回")
+    p.add_argument("--write-notes", dest="write_notes", action="store_true",
+                   help="同时把场景标题写进镜头笔记")
+    p.add_argument("--model", default="", help="记录来源模型名")
+    p.set_defaults(fn=cmd_lapian_import)
+
+    p = sub.add_parser("lapian-narrative", help="读取叙事层（场景/剧情线/情绪曲线/全片结构）")
+    p.add_argument("project")
+    p.set_defaults(fn=cmd_lapian_narrative)
+
+    p = sub.add_parser("lapian-compare", help="跨片叙事比较（当前项目 + 其他 .shotlab）")
+    p.add_argument("project")
+    p.add_argument("others", nargs="*", help="其他 .shotlab 项目文件")
+    p.set_defaults(fn=cmd_lapian_compare)
+
+    p = sub.add_parser("lapian-deep", help="导出场景深拆包（scene_index 从 0 起，或 --scene-id）")
+    p.add_argument("out")
+    p.add_argument("--project", required=True)
+    p.add_argument("--scene-index", dest="scene_index", type=int, default=None)
+    p.add_argument("--scene-id", dest="scene_id", default=None)
+    p.set_defaults(fn=cmd_lapian_deep)
+
+    p = sub.add_parser("lapian-deep-import", help="导入场景深拆结果 JSON（shot_cards 写回叙事层）")
+    p.add_argument("project")
+    p.add_argument("file")
+    p.add_argument("--scene-index", dest="scene_index", type=int, default=None)
+    p.set_defaults(fn=cmd_lapian_deep_import)
+
+    p = sub.add_parser("lapian-run", help="API 直连全片拉片（OpenAI 兼容；配置缺省取 vlm-config）")
+    p.add_argument("project")
+    p.add_argument("--base-url", dest="base_url", default="")
+    p.add_argument("--model", default="")
+    p.add_argument("--api-key-env", dest="api_key_env", default="", help="API key 所在环境变量名")
+    p.add_argument("--max-images", dest="max_images", type=int, default=360)
+    p.add_argument("--timeout-s", dest="timeout_s", type=int, default=600)
+    p.add_argument("--no-import", dest="no_import", action="store_true", help="只返回原文不写回")
+    p.set_defaults(fn=cmd_lapian_run)
 
     p = sub.add_parser("version", help="版本信息")
     p.set_defaults(fn=cmd_version)

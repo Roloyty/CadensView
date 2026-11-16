@@ -5,11 +5,13 @@ mod analysis;
 mod audio;
 mod boundary;
 mod detect;
+mod kit;
 mod model;
 mod player;
 mod research;
 mod rpc;
 mod sound;
+mod study;
 mod theme;
 mod thumb;
 
@@ -23,6 +25,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use kit::{icon, Tip};
 use model::{BarcodeSample, IndexInfo, PaletteInfo, State, StatsData};
 
 enum UiMsg {
@@ -58,11 +61,18 @@ enum UiMsg {
     ResearchValue { method: String, value: Value },
 }
 
-/// 右侧面板的三个页签。
+/// 右侧面板的两个页签。
 #[derive(Clone, Copy, PartialEq)]
 enum RightTab {
     Notes,
     Colors,
+}
+
+/// 顶栏任务胶囊的取消方式：边车 job 或本地检测进程。
+#[derive(Clone, Copy)]
+enum TaskCancel {
+    Job(u64),
+    Detection,
 }
 
 struct App {
@@ -122,6 +132,7 @@ struct App {
     ab_blend_dirty: bool,
     // -- 局部循环与字幕 ----------------------------------------------------------
     loop_active: bool,
+    loop_range: Option<(u64, u64)>,
     subtitle_loaded: bool,
     subtitle_text: Option<String>,
     // -- 缩放平移 --------------------------------------------------------------
@@ -164,11 +175,20 @@ struct App {
     // -- 研究工作区与通用后台任务（导出/审校/重复镜头/VLM） ---------------------
     research: research::Research,
     sound: sound::Sound,
+    study: study::Workspace,
     aux_job: Option<u64>,
     aux_method: Option<String>,
     aux_label: String,
     cut_input: String,
     cut_shot: String,
+    // -- 界面 ------------------------------------------------------------------
+    help_open: bool,
+    /// 镜头列表：要滚到可见的行，以及上一帧的滚动位置与可视高度。
+    list_follow: Option<usize>,
+    list_offset: f32,
+    list_view_h: f32,
+    /// 当前后台任务的进度（0–1）；只有一个任务在跑时显示在顶栏胶囊里。
+    task_fraction: Option<f32>,
 }
 
 impl App {
@@ -239,6 +259,7 @@ impl App {
             ab_blend: None,
             ab_blend_dirty: false,
             loop_active: false,
+            loop_range: None,
             subtitle_loaded: false,
             subtitle_text: None,
             zoom: 1.0,
@@ -277,11 +298,17 @@ impl App {
             subtitle_cues: Vec::new(),
             research: research::Research::default(),
             sound: sound::Sound::default(),
+            study: study::Workspace::default(),
             aux_job: None,
             aux_method: None,
             aux_label: String::new(),
             cut_input: String::new(),
             cut_shot: String::new(),
+            help_open: false,
+            list_follow: None,
+            list_offset: 0.0,
+            list_view_h: 0.0,
+            task_fraction: None,
         };
         // 缩略图 worker：消费 ThumbOutcome 后发到主消息泵。
         let (thumb_done_tx, thumb_done_rx) = std::sync::mpsc::channel::<thumb::ThumbOutcome>();
@@ -473,6 +500,7 @@ impl App {
 
     fn select_shot(&mut self, shot_id: &str) {
         self.call("edit.select", json!({"shot_id": shot_id}));
+        self.list_follow = self.state.shots.iter().position(|s| s.id == shot_id);
         if let (Some(index), Some(row)) = (&self.index, self.state.shots.iter().find(|s| s.id == shot_id)) {
             if let Some(player) = &self.player {
                 player.show(row.start.min(index.frames().saturating_sub(1)));
@@ -497,6 +525,7 @@ impl App {
         if let Some(audio) = &self.audio { audio.stop(); }
         if let Some(marker) = &mut self.playback_marker { marker.set(false); }
         self.loop_active = false;
+        self.loop_range = None;
     }
 
     /// 索引失败后边车仍持有旧会话：重新取回索引，恢复播放器与项目状态。
@@ -534,7 +563,7 @@ impl App {
         self.marks.clear(); self.mark_anchor = None; self.boundary_editor = None;
         self.note_draft.clear(); self.note_shot.clear(); self.note_dirty = false;
         self.subtitle_cues.clear(); self.subtitle_loaded = false; self.subtitle_text = None;
-        self.research.reset(); self.sound.reset(); self.cut_shot.clear(); self.cut_input.clear();
+        self.research.reset(); self.sound.reset(); self.study.reset(); self.cut_shot.clear(); self.cut_input.clear();
         self.thumbs.clear(); self.thumb_pending.clear(); self.thumb_failed.clear();
         self.ab_textures = [None, None]; self.ab_data = [None, None]; self.ab_frames = [None, None];
         self.ab_blend = None; self.ab_show = false;
@@ -630,7 +659,11 @@ impl App {
                     if self.boundary_editor.as_ref().map(|b| !b.valid_for(&state.project_id, &state.shots)).unwrap_or(false) {
                         self.boundary_editor = None;
                     }
+                    if structure_changed { self.study.wave = None; }
+                    self.subtitle_cues = state.subtitle_cues.clone();
+                    self.subtitle_loaded = !self.subtitle_cues.is_empty();
                     self.state = state;
+                    self.refresh_subtitle();
                 }
                 UiMsg::Saved { state, note } => {
                     if let Some((shot, text)) = note {
@@ -656,6 +689,14 @@ impl App {
                     }
                     self.index = Some(index);
                     self.index_json_path = Some(index_json_path);
+                    // 「打开项目…」「装配项目…」这类进行中提示，到这里就该收尾了。
+                    if self.status.ends_with('…') {
+                        self.status = if self.state.pending_start.is_some() && self.state.completed_count == 0 {
+                            "视频已就绪，点「检测切镜」开始分镜".into()
+                        } else {
+                            "已就绪".into()
+                        };
+                    }
                 }
                 UiMsg::IndexJobStarted(job_id) => self.index_job = Some(job_id),
                 UiMsg::IndexJobFailed(error) => {
@@ -786,6 +827,18 @@ impl App {
                 UiMsg::ResearchValue { method, value } => {
                     if method == "compare.run" { self.status = "多片比较完成".into(); }
                     if method == "vlm.config.set" { self.status = "VLM 配置已保存".into(); }
+                    if method == "lapian.import" { self.status = "AI 拉片已导入（Ctrl+Z 可撤销）".into(); }
+                    if method == "export.lapian_sheet" {
+                        if let Some(path) = value.get("path").and_then(Value::as_str) { self.status = format!("已导出 {path}"); }
+                    }
+                    if method.starts_with("study.") { self.status = "研究数据已更新".into(); }
+                    if let Some(imported) = value.get("study_import").and_then(|v| v["imported"].as_u64()) {
+                        let format = value["study_import"]["format"].as_str().unwrap_or("研究标注");
+                        let conflicts = value["study_import"]["conflicts"].as_u64().unwrap_or(0);
+                        self.status = if conflicts == 0 {
+                            format!("已导回 {format} · 新增 {imported} 条")
+                        } else { format!("已导回 {format} · 新增 {imported} 条 · 保留本地冲突 {conflicts} 条") };
+                    }
                     if self.accept_value(&method, value) { self.call("project.state", json!({})); }
                 }
                 UiMsg::SubtitlesLoaded { project_id, cues } => {
@@ -794,6 +847,7 @@ impl App {
                         self.subtitle_loaded = true;
                         self.refresh_subtitle();
                         self.status = format!("字幕已加载 · {} 条", self.subtitle_cues.len());
+                        self.call("project.state", json!({}));
                     }
                 }
                 UiMsg::Thumb(thumb::ThumbOutcome::Ready { key, width, height, rgba }) => {
@@ -873,6 +927,9 @@ impl App {
                 .unwrap_or("");
             let phase = event.get("phase").and_then(Value::as_str).unwrap_or("progress");
             let job_id = event.get("job_id").and_then(Value::as_u64);
+            if let (Some(done), Some(total)) = (event.get("done").and_then(Value::as_u64), event.get("total").and_then(Value::as_u64)) {
+                if total > 0 { self.task_fraction = Some((done as f32 / total as f32).clamp(0.0, 1.0)); }
+            }
             match (topic, phase) {
                 ("index", "progress") => {
                     if let Some(done) = event.get("done").and_then(Value::as_u64) {
@@ -1096,11 +1153,8 @@ impl App {
             player::PlayerMsg::Frame { frame, width, height, rgba } => {
                 // 循环播放重启：帧号回跳时音频同步重起（视频流由 player 内部重启）
                 if self.loop_active && frame < self.last_frame {
-                    if let Some(shot) = self.state.shots.iter()
-                        .find(|s| s.id == self.state.selected_id && !s.pending)
-                        .cloned()
-                    {
-                        self.start_audio_loop(shot.start, shot.end);
+                    if let Some((start, end)) = self.loop_range {
+                        self.start_audio_loop(start, end);
                     }
                 }
                 self.last_frame = frame;
@@ -1140,6 +1194,7 @@ impl App {
             "progress" => {
                 let frame = event.get("frame").and_then(Value::as_u64).unwrap_or(0);
                 let total = event.get("total").and_then(Value::as_u64).unwrap_or(0);
+                if total > 0 { self.task_fraction = Some((frame as f32 / total as f32).clamp(0.0, 1.0)); }
                 self.status = format!("检测中 {frame}/{total} 帧");
             }
             "partial" => {
@@ -1240,56 +1295,82 @@ impl eframe::App for App {
         self.handle_shortcuts(&ctx);
         self.jump_window(&ctx);
         self.boundary_window(&ctx);
+        self.help_window(&ctx);
 
-        if self.analysis_open {
-            egui::Panel::top("topbar")
-                .frame(egui::Frame::new().fill(theme::top()).inner_margin(egui::Margin::symmetric(10, 6)))
-                .show(ui, |ui| self.topbar(ui));
-            egui::Panel::bottom("statusbar").show(ui, |ui| self.status_line(ui));
-            egui::CentralPanel::default().show(ui, |ui| self.analysis_workspace(ui, &ctx));
-            return;
-        }
         if self.video_only {
             // 视频模式（原版 Alt+Enter）：只留画面与控制条。
-            egui::CentralPanel::default().show(ui, |ui| self.player_panel(ui));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::matte()).inner_margin(8))
+                .show(ui, |ui| self.player_panel(ui));
             return;
         }
-
+        let bar = egui::Frame::new().fill(theme::top());
         egui::Panel::top("topbar")
-            .frame(egui::Frame::new().fill(theme::top()).inner_margin(egui::Margin::symmetric(10, 6)))
+            .frame(bar.inner_margin(egui::Margin::symmetric(12, 7)))
             .show(ui, |ui| self.topbar(ui));
-        egui::Panel::bottom("statusbar").show(ui, |ui| self.status_line(ui));
+        egui::Panel::bottom("statusbar")
+            .frame(bar.inner_margin(egui::Margin::symmetric(12, 3)))
+            .show(ui, |ui| self.status_line(ui));
+        if self.analysis_open {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::panel()).inner_margin(egui::Margin::symmetric(16, 10)))
+                .show(ui, |ui| self.analysis_workspace(ui, &ctx));
+            return;
+        }
+        let side = egui::Frame::new().fill(theme::panel()).inner_margin(egui::Margin::symmetric(10, 10));
         if self.list_open {
-            egui::Panel::left("shots").default_size(230.0).show(ui, |ui| self.shot_list(ui));
+            egui::Panel::left("shots").default_size(270.0).min_size(210.0).frame(side)
+                .show(ui, |ui| self.shot_list(ui));
         }
         if self.info_open {
-            egui::Panel::right("notes").default_size(320.0).show(ui, |ui| self.right_panel(ui));
+            egui::Panel::right("notes").default_size(340.0).min_size(280.0).frame(side)
+                .show(ui, |ui| self.right_panel(ui));
         }
-        egui::CentralPanel::default().show(ui, |ui| self.player_panel(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::matte()).inner_margin(egui::Margin::symmetric(12, 10)))
+            .show(ui, |ui| self.player_panel(ui));
     }
 }
 
 impl App {
     fn status_line(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if self.state.dirty { ui.colored_label(theme::accent(), "● 未保存"); }
-            let status_text = egui::RichText::new(&self.status);
-            let colored = if self.status.starts_with('⚠') {
-                status_text.color(theme::error())
-            } else if self.status.starts_with("已导出") || self.status.ends_with("完成") {
-                status_text.color(theme::accent())
-            } else { status_text };
-            ui.label(colored);
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let name = self.state.video_path.as_deref()
+                .and_then(|path| Path::new(path).file_name())
+                .map(|name| name.to_string_lossy().into_owned());
+            if let Some(name) = name {
+                ui.label(egui::RichText::new(kit::label(icon::FILM_STRIP, &truncate(&name, 48))).small().color(theme::secondary()));
+                if self.state.dirty {
+                    ui.label(egui::RichText::new("● 未保存").small().color(theme::warning()))
+                        .on_hover_text("Ctrl+S 保存");
+                }
+            }
+            let error = self.status.starts_with('⚠') || self.status.contains("失败") || self.status.contains("错误");
+            let done = self.status.starts_with("已导出") || self.status.ends_with("完成") || self.status.starts_with("已保存");
+            let (glyph, color) = if error { (icon::WARNING, theme::error()) }
+                else if done { (icon::CHECK_CIRCLE, theme::accent()) }
+                else { (icon::INFO, theme::secondary()) };
+            let text = self.status.trim_start_matches('⚠').trim_start();
+            ui.label(egui::RichText::new(kit::label(glyph, text)).small().color(color));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (clock, total) = self.clock_labels();
-                ui.monospace(format!("{clock} / {total}"));
+                if let Some(index) = &self.index {
+                    let (clock, total) = self.clock_labels();
+                    ui.label(egui::RichText::new(format!("{clock} / {total}")).monospace().small());
+                    let (width, height) = index.size();
+                    let fps = index.fps().map(|fps| format!(" · {} fps", (fps * 1000.0).round() / 1000.0)).unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("{width}×{height}{fps}")).small().color(theme::faint()));
+                    if self.state.completed_count > 0 {
+                        ui.label(egui::RichText::new(format!("{} 个镜头", self.state.completed_count)).small().color(theme::faint()));
+                    }
+                }
             });
         });
     }
 
     fn analysis_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(index) = &self.index else {
-            ui.centered_and_justified(|ui| ui.label("打开视频并完成切镜后查看分析"));
+            kit::empty_state(ui, icon::CHART_BAR, "还没有可分析的镜头", "打开视频并完成切镜检测后，在这里查看剪辑、节奏、色彩、运动与声音统计");
             return;
         };
         let stem = index.cache_stem();
@@ -1297,19 +1378,22 @@ impl App {
             .and_then(|path| Path::new(path).file_stem()).map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "镜头观察".into());
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.analysis_view.scope, analysis::Scope::All, "全片已完成镜头");
-            ui.selectable_value(&mut self.analysis_view.scope, analysis::Scope::Marked,
-                format!("已标记镜头 ({})", self.marks.len()));
-            ui.separator();
+            ui.label(egui::RichText::new("统计范围").color(theme::secondary()));
+            let marked_label = format!("已标记 {}", self.marks.len());
+            kit::segmented(ui, &mut self.analysis_view.scope,
+                &[(analysis::Scope::All, "全片已完成".to_string()), (analysis::Scope::Marked, marked_label)]);
+            kit::divider(ui);
             ui.add_enabled(!self.state.regions.is_empty(),
                 egui::Checkbox::new(&mut self.analysis_view.exclude_regions,
-                    format!("排除 OP/ED 等区段 ({})", self.state.regions.len())))
-                .on_disabled_hover_text("先把片头/片尾等镜头标记为区段");
+                    format!("排除 OP/ED 等区段（{}）", self.state.regions.len())))
+                .tip(if self.state.regions.is_empty() { "还没有区段：先标记片头/片尾的镜头，再用右边的「设为区段」" }
+                     else { "统计时跳过已标为片头、片尾、预告等的镜头" });
             let marked: Vec<&model::ShotRow> = self.state.shots.iter()
                 .filter(|s| !s.pending && self.marks.contains(&s.id)).collect();
             let span = marked.iter().map(|s| s.start).min().zip(marked.iter().map(|s| s.end).max());
             ui.add_enabled_ui(span.is_some(), |ui| {
-                ui.menu_button("标记为区段 ▾", |ui| {
+                ui.menu_button(kit::label(icon::FLAG, "设为区段"), |ui| {
+                    ui.label(egui::RichText::new(format!("把已标记的 {} 个镜头设为：", marked.len())).small().color(theme::secondary()));
                     for (code, label) in model::REGION_LABELS {
                         if ui.button(format!("{label}（{code}）")).clicked() {
                             if let Some((start, end)) = span {
@@ -1318,15 +1402,14 @@ impl App {
                             ui.close();
                         }
                     }
-                }).response.on_disabled_hover_text("先在镜头列表标记属于片头/片尾等的镜头");
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("← 返回观察").clicked() { self.toggle_analysis(); }
+                }).response.on_disabled_hover_text("先在镜头列表 Ctrl/Shift 点击，标记属于片头/片尾等的镜头");
             });
         });
         if matches!(self.analysis_scope_ids(), Some(ids) if ids.is_empty()) {
-            ui.colored_label(theme::warning(), "尚未标记镜头：在镜头列表用 Ctrl 点击单选、Shift 点击范围，或切换为全片。");
+            ui.add_space(4.0);
+            kit::chip(ui, &kit::label(icon::INFO, "还没有标记镜头：回到「观察」在镜头列表 Ctrl 点击单选、Shift 点击选一段，或改用全片范围"), theme::warning());
         }
+        ui.add_space(4.0);
         if self.analysis_data.is_some() && self.analysis_key != self.current_stats_key() {
             // 镜头色板/色差属于旧范围；全片色带仍有效，不清 barcode。
             self.analysis_data = None;
@@ -1368,6 +1451,12 @@ impl App {
             for action in self.sound.show(ui, &self.state, sound_busy) {
                 self.handle_sound(action);
             }
+        }
+        if self.analysis_view.topic == analysis::Topic::Study {
+            let study_busy = self.work_busy();
+            let study_actions = self.study.show(ui, &self.state, self.index.as_ref(), self.ui_frame,
+                self.texture.as_ref(), &self.thumbs, &stem, study_busy);
+            for action in study_actions { self.handle_study(action, &stem); }
         }
         for action in actions {
             match action {
@@ -1428,6 +1517,12 @@ impl App {
 
     /// 原版快捷键表（Main.qml:681-709）。组合键不与普通键互相穿透。
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let save = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.alt
+            && i.key_pressed(egui::Key::S));
+        if save {
+            self.save_project(false);
+            return;
+        }
         if ctx.egui_wants_keyboard_input() { return; }
         let keys = ctx.input(|i| ShortcutKeys {
             space: i.key_pressed(egui::Key::Space),
@@ -1441,7 +1536,7 @@ impl App {
             plus: i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals),
             minus: i.key_pressed(egui::Key::Minus),
             k: i.key_pressed(egui::Key::K), j: i.key_pressed(egui::Key::J),
-            z: i.key_pressed(egui::Key::Z), s: i.key_pressed(egui::Key::S),
+            z: i.key_pressed(egui::Key::Z),
             e: i.key_pressed(egui::Key::E), a: i.key_pressed(egui::Key::A),
             o: i.key_pressed(egui::Key::O), c: i.key_pressed(egui::Key::C),
             escape: i.key_pressed(egui::Key::Escape), f11: i.key_pressed(egui::Key::F11),
@@ -1449,6 +1544,8 @@ impl App {
             ctrl: i.modifiers.ctrl, shift: i.modifiers.shift, alt: i.modifiers.alt,
         });
         let plain = !keys.ctrl && !keys.alt;
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) { self.help_open = !self.help_open; return; }
+        if keys.escape && self.help_open { self.help_open = false; return; }
         if keys.escape {
             if self.jump_open { self.jump_open = false; return; }
             // 边界框自己处理 Esc：需要把预览帧恢复原位。
@@ -1519,7 +1616,6 @@ impl App {
         } else if keys.ctrl && keys.z {
             if self.state.can_undo { self.call("edit.undo", json!({})); }
         }
-        if keys.ctrl && keys.s { self.save_project(false); }
         if keys.ctrl && keys.e && keys.shift {
             if self.state.completed_count > 0 { self.export_contact_sheet(); }
         } else if keys.ctrl && keys.e {
@@ -1588,6 +1684,7 @@ impl App {
                 audio.stop();
             }
             self.loop_active = false;
+            self.loop_range = None;
             self.commit_cursor(frame);
         } else {
             let frame = self.ui_frame;
@@ -1608,6 +1705,7 @@ impl App {
         };
         if self.loop_active {
             self.loop_active = false;
+            self.loop_range = None;
             if let Some(player) = &self.player {
                 player.stop();
                 player.show(self.ui_frame);
@@ -1616,12 +1714,17 @@ impl App {
                 audio.stop();
             }
         } else {
-            self.loop_active = true;
-            if let Some(player) = &self.player {
-                player.play_loop(shot.start, shot.end);
-            }
-            self.start_audio_loop(shot.start, shot.end);
+            self.begin_loop(shot.start, shot.end);
         }
+    }
+
+    fn begin_loop(&mut self, start: u64, end: u64) {
+        self.loop_active = true;
+        self.loop_range = Some((start, end));
+        self.last_frame = start;
+        if let Some(player) = &self.player { player.play_loop(start, end); }
+        self.start_audio_loop(start, end);
+        if let Some(marker) = &mut self.playback_marker { marker.set(true); }
     }
 
     fn step_ui(&mut self, delta: i64) {
@@ -1720,7 +1823,6 @@ struct ShortcutKeys {
     k: bool,
     j: bool,
     z: bool,
-    s: bool,
     e: bool,
     a: bool,
     o: bool,
@@ -1762,276 +1864,388 @@ fn parse_timecode(text: &str) -> Option<f64> {
 impl App {
     fn topbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let idle = !self.index_busy;
-            if ui.add_enabled(idle, egui::Button::new("打开视频")).clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("视频", &["mkv", "mp4", "avi", "mov", "webm", "ts", "m2ts", "flv"])
-                    .pick_file()
-                {
-                    self.open_video(path);
-                }
-            }
-            if ui.add_enabled(!self.index_busy, egui::Button::new("打开项目")).clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("CadensView 项目", &["shotlab"])
-                    .pick_file()
-                {
-                    self.open_project(path);
-                }
-            }
-            ui.separator();
-            if ui.add_enabled(!self.index_busy, egui::Button::new("保存")).clicked() {
-                self.save_project(false);
-            }
-            if ui.add_enabled(!self.index_busy, egui::Button::new("另存为")).clicked() {
-                self.save_project(true);
-            }
-            ui.separator();
-            if self.index_busy {
-                if ui.button("取消索引").clicked() {
-                    if let Some(job_id) = self.index_job {
-                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
-                    }
-                }
-                ui.spinner();
-                ui.label("索引进行中…");
-            } else {
-                let ready = self.index.is_some() && self.detection.is_none() && self.state.pending_start.is_some();
-                if ui.add_enabled(ready, egui::Button::new("检测切镜")).clicked() {
-                    self.detection_cpu_retried = false;
-                    self.run_detection(false);
-                }
-            }
-            if self.detection.is_some() && ui.button("取消检测").clicked() {
-                if let Some(job) = &self.detection {
-                    job.cancel();
-                }
-            }
-            // 景别识别（走边车 job，可取消）
-            {
-                let scale_ready = self.index.is_some() && self.state.completed_count > 0
-                    && self.scale_job.is_none() && !self.index_busy;
-                if self.scale_job.is_some() {
-                    ui.spinner();
-                    if ui.button("取消景别").clicked() {
-                        if let Some(job_id) = self.scale_job {
-                            self.call_quiet("job.cancel", json!({"job_id": job_id}));
-                        }
-                    }
-                } else if ui
-                    .add_enabled(scale_ready, egui::Button::new("🎯 景别识别"))
-                    .clicked()
-                {
-                    self.run_scale();
-                }
-            }
-            if self.motion_job.is_some() || self.motion_starting {
-                ui.spinner();
-                if let Some(job_id) = self.motion_job {
-                    if ui.button("取消运动").clicked() {
-                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
-                    }
-                }
-            }
-            if self.slit_job.is_some() || self.slit_starting {
-                ui.spinner();
-                if let Some(job_id) = self.slit_job {
-                    if ui.button("取消扫描条").clicked() {
-                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
-                    }
-                }
-            }
-            if self.aux_method.is_some() {
-                ui.spinner();
-                if let Some(job_id) = self.aux_job {
-                    if ui.button(format!("取消{}", self.aux_label)).clicked() {
-                        self.call_quiet("job.cancel", json!({"job_id": job_id}));
-                    }
-                }
-            }
-            ui.separator();
-            if ui.add_enabled(self.state.can_undo, egui::Button::new("↶ 撤销")).clicked() {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(egui::RichText::new("CadensView").font(theme::bold(14.0)).color(theme::accent()));
+            ui.add_space(6.0);
+            self.file_menu(ui);
+            self.export_menu(ui);
+            kit::divider(ui);
+            if kit::icon_button(ui, icon::ARROW_COUNTER_CLOCKWISE, self.state.can_undo, "撤销 · Ctrl+Z").clicked() {
                 self.call("edit.undo", json!({}));
             }
-            if ui.add_enabled(self.state.can_redo, egui::Button::new("↷ 重做")).clicked() {
+            if kit::icon_button(ui, icon::ARROW_CLOCKWISE, self.state.can_redo, "重做 · Ctrl+Shift+Z").clicked() {
                 self.call("edit.redo", json!({}));
             }
-            if self.state.pending_start.is_some() && self.index.is_some() {
-                ui.colored_label(theme::warning(), "（有待分析尾段：先跑检测）");
+            kit::divider(ui);
+            // 流程按钮：还有没检测的片段时「检测切镜」是主按钮，检测完就退为普通按钮。
+            let detect_ready = self.index.is_some() && self.detection.is_none()
+                && self.state.pending_start.is_some() && !self.index_busy;
+            let detect_tip = if self.index.is_none() { "先打开视频" }
+                else if self.state.pending_start.is_none() { "全片已检测完毕" }
+                else { "用模型检测剩余片段的切镜点" };
+            let detect = if detect_ready {
+                kit::primary(ui, icon::SCISSORS, "检测切镜", true)
+            } else {
+                kit::button(ui, icon::SCISSORS, "检测切镜", false)
+            };
+            if detect.tip(detect_tip).clicked() {
+                self.detection_cpu_retried = false;
+                self.run_detection(false);
             }
-            // 右侧：主题 / 视频模式 / 全屏（原版「设置」菜单语义）
+            let scale_ready = self.index.is_some() && self.state.completed_count > 0
+                && self.scale_job.is_none() && !self.scale_starting && !self.index_busy;
+            if kit::button(ui, icon::CROSSHAIR, "景别识别", scale_ready)
+                .tip(if self.state.completed_count == 0 { "切镜完成后可用" } else { "用模型给每个镜头判定景别" })
+                .clicked()
+            {
+                self.run_scale();
+            }
+            self.task_pills(ui);
+            if self.state.pending_start.is_some() && self.index.is_some() && self.detection.is_none() && !self.index_busy {
+                kit::chip(ui, &kit::label(icon::WARNING, "尾段未检测"), theme::warning())
+                    .on_hover_text("视频末尾还有一段没跑切镜检测，统计只含已完成镜头");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.selectable_label(self.analysis_open, "📊 分析").on_hover_text("分析工作区 · F11").clicked() {
-                    self.toggle_analysis();
-                }
-                if ui.selectable_label(self.fullscreen, "全屏").clicked() {
-                    self.fullscreen = !self.fullscreen;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
-                }
-                if ui.selectable_label(self.video_only, "视频模式").clicked() {
-                    self.video_only = !self.video_only;
-                }
-                ui.menu_button(format!("🎨 {}", theme::current_title()), |ui| {
+                ui.menu_button(egui::RichText::new(icon::PALETTE).size(17.0), |ui| {
+                    ui.label(egui::RichText::new("界面主题").small().color(theme::secondary()));
                     let current = theme::current_index();
-                    ui.label(egui::RichText::new(theme::current_key()).small().weak());
-                    for (index, (key, title)) in theme::THEME_KEYS.iter().enumerate() {
-                        let _ = key;
-                        if ui
-                            .selectable_label(current == index, *title)
-                            .clicked()
-                        {
+                    for (index, (_, title)) in theme::THEME_KEYS.iter().enumerate() {
+                        if ui.selectable_label(current == index, *title).clicked() {
                             theme::set_current(index);
                             theme::install(ui.ctx());
                             ui.ctx().request_repaint();
                             ui.close();
                         }
                     }
-                });
+                }).response.on_hover_text(format!("界面主题：{}", theme::current_title()));
+                if kit::icon_button(ui, icon::KEYBOARD, true, "快捷键一览 · F1").clicked() {
+                    self.help_open = !self.help_open;
+                }
+                let full_icon = if self.fullscreen { icon::CORNERS_IN } else { icon::CORNERS_OUT };
+                if kit::toggle_icon(ui, full_icon, self.fullscreen, true, "全屏").clicked() {
+                    self.fullscreen = !self.fullscreen;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                }
+                if !self.analysis_open {
+                    if kit::toggle_icon(ui, icon::MONITOR_PLAY, self.video_only, true, "只看画面 · Alt+Enter").clicked() {
+                        self.video_only = !self.video_only;
+                    }
+                    if kit::toggle_icon(ui, icon::NOTE_PENCIL, self.info_open, true, "镜头信息面板 · I").clicked() {
+                        self.toggle_info();
+                    }
+                    if kit::toggle_icon(ui, icon::SIDEBAR, self.list_open, true, "镜头列表 · B").clicked() {
+                        self.commit_note();
+                        self.list_open = !self.list_open;
+                    }
+                }
+                kit::divider(ui);
+                let mut analysis = self.analysis_open;
+                if kit::segmented(ui, &mut analysis, &[(false, kit::label(icon::FILM_STRIP, "观察")), (true, kit::label(icon::CHART_BAR, "分析"))]) {
+                    self.toggle_analysis();
+                }
             });
         });
     }
 
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let idle = !self.index_busy;
+        ui.menu_button(kit::label(icon::FOLDER_OPEN, "文件"), |ui| {
+            if ui.add_enabled(idle, egui::Button::new(kit::label(icon::VIDEO, "打开视频…")).shortcut_text("Ctrl+O")).clicked() {
+                ui.close();
+                self.pick_video();
+            }
+            if ui.add_enabled(idle, egui::Button::new(kit::label(icon::FOLDER_OPEN, "打开项目…"))).clicked() {
+                ui.close();
+                if let Some(path) = rfd::FileDialog::new().add_filter("CadensView 项目", &["shotlab"]).pick_file() {
+                    self.open_project(path);
+                }
+            }
+            ui.separator();
+            let can_save = idle && self.index.is_some();
+            if ui.add_enabled(can_save, egui::Button::new(kit::label(icon::FLOPPY_DISK, "保存")).shortcut_text("Ctrl+S")).clicked() {
+                ui.close();
+                self.save_project(false);
+            }
+            if ui.add_enabled(can_save, egui::Button::new(kit::label(icon::FLOPPY_DISK, "另存为…"))).clicked() {
+                ui.close();
+                self.save_project(true);
+            }
+        });
+    }
+
+    fn export_menu(&mut self, ui: &mut egui::Ui) {
+        let done = self.state.completed_count > 0;
+        let has_selection = self.state.shots.iter().any(|s| s.id == self.state.selected_id && !s.pending);
+        ui.menu_button(kit::label(icon::EXPORT, "导出"), |ui| {
+            if let Some(ids) = self.analysis_scope_ids() {
+                ui.label(egui::RichText::new(format!("范围：已标记的 {} 个镜头", ids.len())).small().color(theme::accent()));
+            }
+            if ui.add_enabled(self.index.is_some(), egui::Button::new(kit::label(icon::CAMERA, "当前帧 PNG…")).shortcut_text("Ctrl+E")).clicked() {
+                ui.close();
+                self.export_frame();
+            }
+            if ui.add_enabled(has_selection, egui::Button::new(kit::label(icon::GIF, "选中镜头 GIF…"))).clicked() {
+                ui.close();
+                self.export_gif();
+            }
+            ui.separator();
+            if ui.add_enabled(done, egui::Button::new(kit::label(icon::FILE_CSV, "镜头表 CSV…"))).clicked() {
+                ui.close();
+                self.export_shots_csv();
+            }
+            if ui.add_enabled(done, egui::Button::new(kit::label(icon::IMAGES, "联系表长图…")).shortcut_text("Ctrl+Shift+E")).clicked() {
+                ui.close();
+                self.export_contact_sheet();
+            }
+            if ui.add_enabled(done, egui::Button::new(kit::label(icon::FILE_PDF, "联系表 PDF…"))).clicked() {
+                ui.close();
+                self.export_pdf_sheet();
+            }
+        });
+    }
+
+    /// 正在跑的后台任务：每个一枚胶囊，转圈 + 名称 + 进度 + 取消。
+    fn task_pills(&mut self, ui: &mut egui::Ui) {
+        let mut tasks: Vec<(String, Option<TaskCancel>)> = Vec::new();
+        if self.index_busy { tasks.push(("建立索引".into(), self.index_job.map(TaskCancel::Job))); }
+        if self.detection.is_some() { tasks.push(("检测切镜".into(), Some(TaskCancel::Detection))); }
+        if self.scale_job.is_some() || self.scale_starting { tasks.push(("景别识别".into(), self.scale_job.map(TaskCancel::Job))); }
+        if self.analysis_job.is_some() || self.analysis_starting { tasks.push(("色彩分析".into(), self.analysis_job.map(TaskCancel::Job))); }
+        if self.motion_job.is_some() || self.motion_starting { tasks.push(("运动分析".into(), self.motion_job.map(TaskCancel::Job))); }
+        if self.slit_job.is_some() || self.slit_starting { tasks.push(("扫描条".into(), self.slit_job.map(TaskCancel::Job))); }
+        if self.aux_method.is_some() { tasks.push((self.aux_label.clone(), self.aux_job.map(TaskCancel::Job))); }
+        if tasks.is_empty() {
+            self.task_fraction = None;
+            return;
+        }
+        let fraction = if tasks.len() == 1 { self.task_fraction } else { None };
+        for (name, cancel) in tasks {
+            egui::Frame::new()
+                .fill(theme::card())
+                .stroke(egui::Stroke::new(1.0, theme::outline()))
+                .corner_radius(14)
+                .inner_margin(egui::Margin { left: 10, right: 2, top: 1, bottom: 1 })
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.add(egui::Spinner::new().size(13.0).color(theme::accent()));
+                    ui.label(egui::RichText::new(&name).small());
+                    if let Some(fraction) = fraction {
+                        ui.add(egui::ProgressBar::new(fraction).desired_width(64.0).desired_height(4.0));
+                        ui.label(egui::RichText::new(format!("{:.0}%", fraction * 100.0)).small().color(theme::secondary()));
+                    }
+                    if let Some(cancel) = cancel {
+                        if kit::icon_button(ui, icon::X, true, &format!("取消{name}")).clicked() {
+                            match cancel {
+                                TaskCancel::Job(job_id) => self.call_quiet("job.cancel", json!({"job_id": job_id})),
+                                TaskCancel::Detection => if let Some(job) = &self.detection { job.cancel(); },
+                            }
+                        }
+                    }
+                });
+        }
+    }
+
+    /// 快捷键一览（F1 或顶栏键盘图标）。
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.help_open { return; }
+        let groups: [(&str, &[(&str, &str)]); 4] = [
+            ("播放", &[("空格", "播放 / 暂停"), ("← / →", "上一帧 / 下一帧"), ("↑ / ↓", "上一个 / 下一个镜头"),
+                      ("L", "循环播放当前镜头"), ("M", "静音"), ("+ / −", "音量"), ("F / G", "跳到帧号 / 时间")]),
+            ("镜头编辑", &[("Ctrl+K", "在当前帧拆分"), ("Ctrl+J", "与下一镜头合并"), ("1–5 / 0", "人工景别 / 清除"),
+                         ("Ctrl+Z", "撤销"), ("Ctrl+Shift+Z", "重做")]),
+            ("选择与导出", &[("Ctrl+点击", "标记 / 取消标记"), ("Shift+点击", "标记一段"), ("Ctrl+A", "全部标记"),
+                          ("Ctrl+Shift+A / Esc", "清除标记"), ("Ctrl+E", "截当前帧"), ("Ctrl+Shift+E", "联系表长图")]),
+            ("界面", &[("B", "镜头列表"), ("I", "镜头信息面板"), ("F11", "观察 / 分析"), ("Alt+Enter", "只看画面"),
+                     ("Ctrl+Shift+C", "A/B 对照"), ("Ctrl+O / Ctrl+S", "打开视频 / 保存"), ("F1", "本表")]),
+        ];
+        let mut open = true;
+        egui::Window::new(kit::label(icon::KEYBOARD, "快捷键"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    for (title, keys) in groups {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(190.0);
+                            kit::section(ui, title);
+                            egui::Grid::new(title).num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                                for (key, what) in keys {
+                                    egui::Frame::new()
+                                        .fill(theme::input())
+                                        .stroke(egui::Stroke::new(1.0, theme::outline()))
+                                        .corner_radius(4)
+                                        .inner_margin(egui::Margin::symmetric(5, 1))
+                                        .show(ui, |ui| ui.label(egui::RichText::new(*key).monospace().size(11.5)));
+                                    ui.label(*what);
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+        if !open { self.help_open = false; }
+    }
+
     fn shot_list(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("镜头");
+            ui.label(egui::RichText::new("镜头").font(theme::bold(15.0)));
+            ui.label(egui::RichText::new(format!("{}", self.state.completed_count)).small().color(theme::faint()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !self.marks.is_empty() {
-                    ui.colored_label(theme::accent(), format!("已标记 {}", self.marks.len()));
+                    if kit::icon_button(ui, icon::X, true, "清除标记 · Esc").clicked() {
+                        self.marks.clear();
+                        self.mark_anchor = None;
+                    }
+                    kit::chip(ui, &format!("已标记 {}", self.marks.len()), theme::accent());
+                } else if self.state.completed_count > 0 {
+                    ui.label(egui::RichText::new(icon::INFO).color(theme::faint()))
+                        .on_hover_text("单击选中 · Ctrl+点击标记 · Shift+点击标记一段 · Ctrl+A 全部标记\n标记的镜头可作为导出与分析的范围");
                 }
-                ui.weak(format!("{:03}", self.state.shots.len()));
             });
         });
-        let mut follow = None;
-        let row_height = 64.0;
+        ui.add_space(4.0);
+        if self.state.shots.is_empty() {
+            let (title, hint) = if self.index.is_none() {
+                ("还没有打开视频", "文件 › 打开视频（Ctrl+O），或打开已有的 .shotlab 项目")
+            } else if self.detection.is_some() || self.index_busy {
+                ("正在准备镜头…", "检测完成后镜头会出现在这里")
+            } else {
+                ("还没有镜头", "点击顶栏的「检测切镜」自动分出镜头")
+            };
+            kit::empty_state(ui, icon::FILM_STRIP, title, hint);
+            return;
+        }
+        let mut clicked: Option<(usize, String, bool, bool)> = None;
+        let row_height = 68.0;
         let total = self.state.shots.len();
-        // 虚拟滚动：只有可见行布局/请求缩略图，几百镜头也不卡。
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+        // 选中项不在可见范围时（↑/↓ 切镜头、从分析页定位）滚过去，点击可见行不跳。
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if let Some(row) = self.list_follow.take() {
+            let top = row as f32 * row_height;
+            if top < self.list_offset {
+                scroll = scroll.vertical_scroll_offset(top);
+            } else if top + row_height > self.list_offset + self.list_view_h {
+                scroll = scroll.vertical_scroll_offset(top + row_height - self.list_view_h);
+            }
+        }
+        // 虚拟滚动：只有可见行布局/请求缩略图，几百镜头也不卡。行距归零，行高即步长。
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let output = scroll
             .show_rows(ui, row_height, total, |ui, range| {
                 for row in range {
                     let Some(shot) = self.state.shots.get(row).cloned() else { continue };
                     let selected = shot.id == self.state.selected_id;
-                    ui.horizontal(|ui| {
-                        // 缩略图（懒生成，磁盘缓存）
-                        let thumb_size = egui::vec2(96.0, 54.0);
-                        let key = self.thumb_key(&shot);
-                        let (thumb_rect, thumb_response) =
-                            ui.allocate_exact_size(thumb_size, egui::Sense::click());
-                        if thumb_response.clicked() {
-                            let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
-                            if ctrl {
-                                if self.marks.contains(&shot.id) { self.marks.remove(&shot.id); }
-                                else { self.marks.insert(shot.id.clone()); }
-                                self.mark_anchor = Some(row);
-                            } else if shift {
-                                let anchor = self.mark_anchor.unwrap_or(row);
-                                let (low, high) = if anchor <= row { (anchor, row) } else { (row, anchor) };
-                                for candidate in &self.state.shots[low..=high] {
-                                    if !candidate.pending { self.marks.insert(candidate.id.clone()); }
-                                }
-                                self.mark_anchor = Some(row);
-                            } else {
-                                follow = Some(shot.id.clone());
-                                self.marks.clear();
-                                self.mark_anchor = Some(row);
-                            }
-                        }
-                        if let Some(texture) = self.thumbs.get(&key) {
-                            let size = texture.size_vec2();
-                            let fitted = fit_into(thumb_size, size);
-                            let origin = egui::pos2(
-                                thumb_rect.left() + (thumb_size.x - fitted.x) / 2.0,
-                                thumb_rect.top() + (thumb_size.y - fitted.y) / 2.0,
-                            );
-                            ui.painter_at(thumb_rect).image(
-                                texture.id(),
-                                egui::Rect::from_min_size(origin, fitted),
+                    let marked = self.marks.contains(&shot.id);
+                    // 整行是一个点击目标（原来缩略图和文字各算各的）。
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), row_height), egui::Sense::click());
+                    if response.clicked() {
+                        let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
+                        clicked = Some((row, shot.id.clone(), ctrl, shift));
+                    }
+                    let painter = ui.painter_at(rect);
+                    let body = rect.shrink2(egui::vec2(0.0, 3.0));
+                    let fill = if selected { theme::mix(theme::panel(), theme::accent(), 0.16) }
+                        else if marked { theme::mix(theme::panel(), theme::accent(), 0.07) }
+                        else if response.hovered() { theme::hover() }
+                        else { egui::Color32::TRANSPARENT };
+                    painter.rect_filled(body, 6.0, fill);
+                    if selected {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(body.min, egui::vec2(3.0, body.height())).shrink2(egui::vec2(0.0, 8.0)),
+                            1.5, theme::accent());
+                    }
+                    // 缩略图（懒生成，磁盘缓存）
+                    let thumb_rect = egui::Rect::from_min_size(
+                        body.min + egui::vec2(8.0, (body.height() - 54.0) / 2.0), egui::vec2(96.0, 54.0));
+                    painter.rect_filled(thumb_rect, 4.0, theme::matte());
+                    let key = self.thumb_key(&shot);
+                    match self.thumbs.get(&key) {
+                        Some(texture) => {
+                            let fitted = fit_into(thumb_rect.size(), texture.size_vec2());
+                            let image_rect = egui::Rect::from_center_size(thumb_rect.center(), fitted);
+                            painter.image(texture.id(), image_rect,
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                theme::ink(),
-                            );
-                            ui.painter_at(thumb_rect).rect_stroke(
-                                thumb_rect, 1.0,
-                                if selected { egui::Stroke::new(2.0, theme::accent()) }
-                                else { egui::Stroke::NONE },
-                                egui::StrokeKind::Inside,
-                            );
-                        } else {
-                            self.request_thumb(&shot, &key);
-                            ui.painter_at(thumb_rect).rect_filled(
-                                thumb_rect, 0.0, theme::matte());
-                            ui.painter_at(thumb_rect).text(
-                                thumb_rect.center(), egui::Align2::CENTER_CENTER, "…",
-                                egui::FontId::proportional(14.0), theme::secondary());
+                                if shot.pending { egui::Color32::from_gray(120) } else { egui::Color32::WHITE });
                         }
-                        // 文本
-                        ui.vertical(|ui| {
-                            let marked = self.marks.contains(&shot.id);
-                            // 人工景别优先（✎），否则显示模型结果。
-                            let scale_text = match (&shot.scale_manual, &shot.scale) {
-                                (Some(code), _) => format!(" [✎{}]", model::scale_zh(code)),
-                                (None, Some(s)) => format!(" [{}]", s.label_zh),
-                                _ => String::new(),
-                            };
-                            let label = format!(
-                                "{}{} {}帧·{:.2}s{}{}",
-                                if marked { "● " } else { "" },
-                                shot.number + 1,
-                                shot.end - shot.start,
-                                shot.duration_s,
-                                scale_text,
-                                if shot.pending { " ·待分析" } else { "" },
-                            );
-                            let text = if shot.pending {
-                                egui::RichText::new(label).color(theme::secondary())
-                            } else {
-                                egui::RichText::new(label)
-                            };
-                            let response = ui.selectable_label(selected, text);
-                            if response.clicked() {
-                                let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
-                                if ctrl {
-                                    if self.marks.contains(&shot.id) {
-                                        self.marks.remove(&shot.id);
-                                    } else {
-                                        self.marks.insert(shot.id.clone());
-                                    }
-                                    self.mark_anchor = Some(row);
-                                } else if shift {
-                                    let anchor = self.mark_anchor.unwrap_or(row);
-                                    let (low, high) = if anchor <= row { (anchor, row) } else { (row, anchor) };
-                                    for candidate in &self.state.shots[low..=high] {
-                                        if !candidate.pending {
-                                            self.marks.insert(candidate.id.clone());
-                                        }
-                                    }
-                                    self.mark_anchor = Some(row);
-                                } else {
-                                    follow = Some(shot.id.clone());
-                                    self.marks.clear();
-                                    self.mark_anchor = Some(row);
-                                }
-                            }
-                            if !shot.note.is_empty() {
-                                ui.small(egui::RichText::new(truncate(&shot.note, 40)).weak());
-                            }
-                            if !shot.tags.is_empty() {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 2.0;
-                                    for tag in &shot.tags {
-                                        ui.label(
-                                            egui::RichText::new(format!(" [{tag}]"))
-                                                .small()
-                                                .color(theme::accent()),
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                    });
+                        None => self.request_thumb(&shot, &key),
+                    }
+                    if marked {
+                        let badge = thumb_rect.left_top() + egui::vec2(10.0, 10.0);
+                        painter.circle_filled(badge, 8.0, theme::accent());
+                        painter.text(badge, egui::Align2::CENTER_CENTER, icon::CHECK,
+                            egui::FontId::proportional(11.0), theme::on_accent());
+                    }
+                    // 文字：镜头号 + 时长 / 帧数 + 景别·区段 / 笔记或标签
+                    let x = thumb_rect.right() + 10.0;
+                    let right = body.right() - 6.0;
+                    let ink = if shot.pending { theme::secondary() } else { theme::ink() };
+                    let number = painter.text(egui::pos2(x, body.top() + 8.0), egui::Align2::LEFT_TOP,
+                        format!("#{}", shot.number + 1), theme::bold(13.5), ink);
+                    painter.text(egui::pos2(number.right() + 8.0, body.top() + 9.0), egui::Align2::LEFT_TOP,
+                        format!("{:.2}s", shot.duration_s), egui::FontId::monospace(12.0), ink);
+                    painter.text(egui::pos2(right, body.top() + 9.0), egui::Align2::RIGHT_TOP,
+                        format!("{} 帧", shot.end - shot.start), egui::FontId::proportional(11.0), theme::faint());
+                    let mut chips: Vec<(String, egui::Color32)> = Vec::new();
+                    if shot.pending {
+                        chips.push(("待检测".into(), theme::warning()));
+                    }
+                    // 人工景别优先，否则显示模型结果（淡一档）。
+                    match (&shot.scale_manual, &shot.scale) {
+                        (Some(code), _) => chips.push((model::scale_zh(code).to_string(), theme::accent())),
+                        (None, Some(s)) => chips.push((s.label_zh.clone(), theme::secondary())),
+                        _ => {}
+                    }
+                    if let Some(region) = &shot.region {
+                        chips.push((model::region_zh(region).to_string(), theme::warning()));
+                    }
+                    let mut chip_x = x;
+                    let chip_y = body.top() + 29.0;
+                    for (text, color) in &chips {
+                        let galley = painter.layout_no_wrap(text.clone(), egui::FontId::proportional(11.0), *color);
+                        let chip = egui::Rect::from_min_size(egui::pos2(chip_x, chip_y),
+                            galley.size() + egui::vec2(12.0, 2.0));
+                        if chip.right() > right { break; }
+                        painter.rect_filled(chip, 8.0, theme::mix(theme::panel(), *color, 0.18));
+                        painter.galley(chip.min + egui::vec2(6.0, 1.0), galley, *color);
+                        chip_x = chip.right() + 4.0;
+                    }
+                    let detail = if !shot.note.is_empty() {
+                        truncate(&shot.note.replace('\n', " "), 40)
+                    } else if !shot.tags.is_empty() {
+                        shot.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ")
+                    } else { String::new() };
+                    if !detail.is_empty() {
+                        let galley = painter.layout_no_wrap(detail, egui::FontId::proportional(11.5), theme::secondary());
+                        let clip = egui::Rect::from_min_max(egui::pos2(x, body.bottom() - 22.0), egui::pos2(right, body.bottom() - 4.0));
+                        ui.painter_at(clip).galley(clip.min, galley, theme::secondary());
+                    }
+                    if response.hovered() {
+                        response.on_hover_text(format!(
+                            "镜头 #{} · 帧 {}–{} · {:.2}s\nCtrl+点击标记 · Shift+点击标记一段",
+                            shot.number + 1, shot.start, shot.end, shot.duration_s));
+                    }
                 }
             });
-        if let Some(id) = follow {
-            self.select_shot(&id);
+        self.list_offset = output.state.clamped_offset().y;
+        self.list_view_h = output.inner_rect.height();
+        if let Some((row, id, ctrl, shift)) = clicked {
+            if ctrl {
+                if !self.marks.remove(&id) { self.marks.insert(id); }
+            } else if shift {
+                let anchor = self.mark_anchor.unwrap_or(row);
+                let (low, high) = if anchor <= row { (anchor, row) } else { (row, anchor) };
+                for candidate in &self.state.shots[low..=high] {
+                    if !candidate.pending { self.marks.insert(candidate.id.clone()); }
+                }
+            } else {
+                self.marks.clear();
+                self.select_shot(&id);
+            }
+            self.mark_anchor = Some(row);
         }
     }
 
@@ -2067,20 +2281,17 @@ impl App {
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.right_tab, RightTab::Notes, "📝 镜头");
-            ui.selectable_value(&mut self.right_tab, RightTab::Colors, "🎨 色彩");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("分析工作区").on_hover_text("剪辑 / 节奏 / 色彩图表").clicked() {
-                    self.toggle_analysis();
-                }
+        kit::tabs(ui, &mut self.right_tab, &[
+            (RightTab::Notes, kit::label(icon::NOTE_PENCIL, "镜头")),
+            (RightTab::Colors, kit::label(icon::PALETTE, "色彩")),
+        ]);
+        egui::ScrollArea::vertical()
+            .id_salt("right-panel")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.right_tab {
+                RightTab::Notes => self.note_panel(ui),
+                RightTab::Colors => self.colors_panel(ui),
             });
-        });
-        ui.separator();
-        match self.right_tab {
-            RightTab::Notes => self.note_panel(ui),
-            RightTab::Colors => self.colors_panel(ui),
-        }
     }
 
     /// None = 全部已完成镜头；Some = 用户显式标记的稳定 ID。
@@ -2121,7 +2332,7 @@ impl App {
 
     fn colors_panel(&mut self, ui: &mut egui::Ui) {
         // -- 选中镜头调色板 -----------------------------------------------------
-        ui.heading("镜头调色板");
+        kit::section(ui, "镜头调色板");
         let selected = self.state.shots.iter()
             .find(|s| s.id == self.state.selected_id)
             .cloned();
@@ -2132,73 +2343,93 @@ impl App {
                 self.palette_shot = shot_id.clone();
                 self.call_palette(shot_id, (shot.start + shot.end) / 2);
             }
-            ui.label(format!("镜头 #{} 中点帧的五种主色", shot.number));
+            ui.label(egui::RichText::new(format!("镜头 #{} 中点帧的主色 · 点色块复制色值", shot.number + 1))
+                .small().color(theme::secondary()));
+            ui.add_space(4.0);
             match &self.palette {
                 Some(palette) if !palette.colors.is_empty() => {
-                    let width = ui.available_width();
-                    let swatch = (width / palette.colors.len() as f32).min(52.0);
-                    ui.horizontal(|ui| {
+                    let gap = 6.0;
+                    let count = palette.colors.len() as f32;
+                    let swatch = ((ui.available_width() - gap * (count - 1.0)) / count).max(24.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
                         for color in &palette.colors {
                             let [r, g, b] = color.srgb.unwrap_or([128, 128, 128]);
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(swatch, 44.0), egui::Sense::hover());
-                            ui.painter_at(rect).rect_filled(
-                                rect, 3.0, egui::Color32::from_rgb(r, g, b));
-                            ui.painter_at(rect).rect_stroke(
-                                rect, 3.0, egui::Stroke::new(1.0, theme::matte()),
-                                egui::StrokeKind::Inside);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        for color in &palette.colors {
                             let share = color.pixel_share.unwrap_or(0.0);
-                            ui.monospace(format!("{}·{}%", color.hex, (share * 100.0) as u32));
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                let (rect, response) = ui.allocate_exact_size(egui::vec2(swatch, 48.0), egui::Sense::click());
+                                ui.painter_at(rect).rect_filled(rect, 6.0, egui::Color32::from_rgb(r, g, b));
+                                ui.painter_at(rect).rect_stroke(rect, 6.0,
+                                    egui::Stroke::new(1.0, if response.hovered() { theme::ink() } else { theme::outline() }),
+                                    egui::StrokeKind::Inside);
+                                if response.clicked() {
+                                    ui.ctx().copy_text(color.hex.clone());
+                                    self.status = format!("已复制 {}", color.hex);
+                                }
+                                response.on_hover_text(format!("{} · 占画面 {:.0}% · 点击复制", color.hex, share * 100.0));
+                                ui.label(egui::RichText::new(&color.hex).monospace().size(10.5));
+                                ui.label(egui::RichText::new(format!("{:.0}%", share * 100.0)).small().color(theme::faint()));
+                            });
                         }
                     });
                 }
                 _ if self.palette_loading => { ui.spinner(); }
-                _ => { ui.label("（无数据）"); }
+                _ => { ui.label(egui::RichText::new("没有取到颜色").color(theme::faint())); }
             }
         } else {
-            ui.label("选中一个已完成镜头查看调色板");
+            ui.label(egui::RichText::new("选中一个已检测的镜头查看它的主色").color(theme::faint()));
         }
         ui.add_space(10.0);
-        ui.separator();
         // -- 全片色彩时间轴 -----------------------------------------------------
-        ui.heading("全片色带");
+        kit::section(ui, "全片色带");
         if self.barcode.is_empty() {
-            if self.analysis_job.is_some() {
-                ui.horizontal(|ui| { ui.spinner(); ui.label("分析进行中…"); });
+            if self.analysis_job.is_some() || self.analysis_starting {
+                ui.horizontal(|ui| { ui.spinner(); ui.label("色彩分析进行中…"); });
             } else {
-                ui.label("对整部视频按秒采样，生成时间轴色带与镜头色板。");
-                let ready = self.index.is_some() && self.state.completed_count > 0;
-                if ui.add_enabled(ready && !self.index_busy, egui::Button::new("▶ 运行色彩分析"))
+                ui.label(egui::RichText::new("按秒采样整部视频，生成横向时间色带；镜头色板与相邻色差在「分析 › 色彩」查看。")
+                    .small().color(theme::secondary()));
+                ui.add_space(4.0);
+                let ready = self.index.is_some() && self.state.completed_count > 0 && !self.index_busy;
+                if kit::button(ui, icon::PLAY, "运行色彩分析", ready)
+                    .tip(if ready { "后台运行，可在顶栏取消" } else { "切镜完成后可用" })
                     .clicked()
                 {
                     self.run_analysis();
                 }
             }
         } else {
-            let height = 26.0;
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), height), egui::Sense::hover());
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
             let painter = ui.painter_at(rect);
-            painter.rect_stroke(rect, 2.0, egui::Stroke::new(1.0, theme::line()), egui::StrokeKind::Inside);
             let n = self.barcode.len().max(1) as f32;
-            let inner = rect.shrink(2.0);
-            let slice = inner.width() / n;
+            let slice = rect.width() / n;
             for (index, sample) in self.barcode.iter().enumerate() {
                 let Some([r, g, b]) = sample.srgb else { continue };
                 let cell = egui::Rect::from_min_size(
-                    egui::pos2(inner.left() + index as f32 * slice, inner.top()),
-                    egui::vec2(slice.max(1.0), inner.height()),
+                    egui::pos2(rect.left() + index as f32 * slice, rect.top()),
+                    egui::vec2(slice.max(1.0), rect.height()),
                 );
                 painter.rect_filled(cell, 0.0, egui::Color32::from_rgb(r, g, b));
             }
-            ui.small(format!("{} 个采样点（横向 = 时间）", self.barcode.len()));
-            if ui.button("↻ 重新分析").clicked() {
-                self.run_analysis();
+            painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, theme::outline()), egui::StrokeKind::Inside);
+            // 悬停显示时间，点击定位到该处。
+            if let Some(pos) = response.hover_pos() {
+                let index = (((pos.x - rect.left()) / slice) as usize).min(self.barcode.len() - 1);
+                let sample = &self.barcode[index];
+                painter.vline(pos.x, rect.y_range(), egui::Stroke::new(1.5, theme::ink()));
+                let frame = sample.source_frame;
+                let response = response.on_hover_text(format!("{} · 帧 {frame} · 点击定位", clock_text(sample.video_time_s)));
+                if response.clicked() { self.locate_frame(frame); }
             }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{} 个采样点 · 横向为时间", self.barcode.len())).small().color(theme::faint()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if kit::icon_button(ui, icon::ARROW_CLOCKWISE, !self.work_busy(), "重新分析").clicked() {
+                        self.run_analysis();
+                    }
+                });
+            });
         }
     }
 
@@ -2388,163 +2619,205 @@ impl App {
     }
 
     fn note_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("镜头笔记");
-        let selected = self
-            .state
-            .shots
-            .iter()
-            .find(|s| s.id == self.state.selected_id)
-            .cloned();
-        match selected {
-            Some(shot) => {
-                if self.note_shot != shot.id {
-                    self.commit_note();
-                    self.note_shot = shot.id.clone();
-                    self.note_draft = shot.note.clone();
-                    self.note_dirty = false;
-                }
-                ui.label(format!("镜头 #{}（{}–{} 帧）", shot.number, shot.start, shot.end));
-                let response = egui::TextEdit::multiline(&mut self.note_draft)
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY)
-                    .show(ui);
-                if response.response.changed() {
-                    self.note_dirty = true;
-                }
-                if response.response.lost_focus() && self.note_dirty {
-                    self.commit_note();
-                }
-                // -- 标签区 -----------------------------------------------------
-                ui.add_space(4.0);
-                ui.strong("标签");
-                ui.horizontal_wrapped(|ui| {
-                    let mut remove = None;
-                    for tag in &shot.tags {
-                        let chip = egui::Button::new(format!("✕ {tag}"))
-                            .small()
-                            .fill(theme::accent_wash());
-                        if ui.add(chip).clicked() {
-                            remove = Some(tag.clone());
-                        }
+        let selected = self.state.shots.iter().find(|s| s.id == self.state.selected_id).cloned();
+        let Some(shot) = selected else {
+            kit::empty_state(ui, icon::NOTE_PENCIL, "没有选中镜头", "在左侧列表点一个镜头，或用 ↑ / ↓ 切换");
+            return;
+        };
+        if self.note_shot != shot.id {
+            self.commit_note();
+            self.note_shot = shot.id.clone();
+            self.note_draft = shot.note.clone();
+            self.note_dirty = false;
+        }
+        // -- 头部：镜头号、时长、状态；右侧上一个/下一个 ------------------------
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("镜头 #{}", shot.number + 1)).font(theme::bold(17.0)));
+            if shot.pending { kit::chip(ui, "待检测", theme::warning()); }
+            if let Some(region) = &shot.region { kit::chip(ui, model::region_zh(region), theme::warning()); }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let row = self.state.shots.iter().position(|s| s.id == shot.id).unwrap_or(0);
+                let next_ok = self.state.shots.get(row + 1).is_some_and(|s| !s.pending);
+                if kit::icon_button(ui, icon::CARET_RIGHT, next_ok, "下一个镜头 · ↓").clicked() { self.adjacent_shot(1); }
+                if kit::icon_button(ui, icon::CARET_LEFT, row > 0, "上一个镜头 · ↑").clicked() { self.adjacent_shot(-1); }
+            });
+        });
+        ui.label(egui::RichText::new(format!("帧 {}–{} · {} 帧 · {:.2}s", shot.start, shot.end, shot.end - shot.start, shot.duration_s))
+            .monospace().size(11.5).color(theme::secondary()));
+
+        // -- 笔记 --------------------------------------------------------------
+        kit::section(ui, "笔记");
+        let response = egui::TextEdit::multiline(&mut self.note_draft)
+            .hint_text("这一镜头的构图、运动、剪辑理由……")
+            .desired_rows(5)
+            .desired_width(ui.available_width() - 16.0)
+            .margin(egui::Margin::symmetric(8, 6))
+            .show(ui);
+        if response.response.changed() {
+            self.note_dirty = true;
+        }
+        if response.response.lost_focus() && self.note_dirty {
+            self.commit_note();
+        }
+        if self.note_dirty {
+            ui.label(egui::RichText::new("离开输入框即保存").small().color(theme::faint()));
+        }
+
+        // -- 标签 --------------------------------------------------------------
+        kit::section(ui, "标签");
+        if !shot.tags.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                let mut remove = None;
+                for tag in &shot.tags {
+                    let chip = egui::Button::new(egui::RichText::new(format!("{tag}  {}", icon::X)).small().color(theme::accent()))
+                        .fill(theme::mix(theme::panel(), theme::accent(), 0.16))
+                        .stroke(egui::Stroke::NONE)
+                        .corner_radius(10)
+                        .min_size(egui::vec2(0.0, 22.0));
+                    if ui.add(chip).on_hover_text("点击删除这个标签").clicked() {
+                        remove = Some(tag.clone());
                     }
-                    if let Some(tag) = remove {
-                        let mut tags: Vec<String> = shot.tags.clone();
-                        tags.retain(|t| t != &tag);
-                        self.call("tags.set", json!({"shot_id": shot.id, "tags": tags}));
-                    }
-                });
+                }
+                if let Some(tag) = remove {
+                    let mut tags: Vec<String> = shot.tags.clone();
+                    tags.retain(|t| t != &tag);
+                    self.call("tags.set", json!({"shot_id": shot.id, "tags": tags}));
+                }
+            });
+            ui.add_space(2.0);
+        }
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.tag_input)
+                    .hint_text("添加标签，回车确认")
+                    .desired_width(ui.available_width() - 48.0),
+            );
+            let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let has_text = !self.tag_input.trim().is_empty();
+            if kit::icon_button(ui, icon::PLUS, has_text, "添加标签").clicked() || (submit && has_text) {
+                let tag = self.tag_input.trim().to_string();
+                let mut tags = shot.tags.clone();
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                    tags.sort();
+                    self.call("tags.set", json!({"shot_id": shot.id, "tags": tags}));
+                }
+                self.tag_input.clear();
+            }
+        });
+
+        if !shot.pending { self.annotation_block(ui, &shot); }
+
+        // -- 剪辑 --------------------------------------------------------------
+        kit::section(ui, "剪辑");
+        let current = self.player.as_ref().map(|p| p.frame()).unwrap_or(self.ui_frame);
+        let in_shot = current > shot.start && current < shot.end;
+        let has_next = shot.number + 1 < self.state.completed_count as usize;
+        ui.horizontal(|ui| {
+            if kit::button(ui, icon::SCISSORS, "在当前帧拆分", in_shot && !shot.pending)
+                .tip(if in_shot { format!("在帧 {current} 处切开 · Ctrl+K") } else { "先把播放头移进这个镜头（不能在首帧）".into() })
+                .clicked()
+            {
+                self.commit_note();
+                self.call("edit.split", json!({"frame": current}));
+            }
+            if kit::button(ui, icon::ARROWS_IN_LINE_HORIZONTAL, "合并下一镜头", has_next && !shot.pending)
+                .tip(if has_next { "把下一个镜头并进来 · Ctrl+J" } else { "已经是最后一个镜头" })
+                .clicked()
+            {
+                self.commit_note();
+                self.call("edit.merge", json!({"row": shot.number}));
+            }
+        });
+        // 共享边界：起点属于本镜头，终点属于下一镜头；两者指向同一帧。
+        egui::Grid::new("boundaries").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+            if shot.number > 0 {
+                ui.label(egui::RichText::new("起点").color(theme::secondary()));
+                ui.label(egui::RichText::new(format!("帧 {}", shot.start)).monospace());
                 ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.tag_input)
-                            .hint_text("新标签…")
-                            .desired_width(120.0),
-                    );
-                    let submit = response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.button("＋").clicked() || submit {
-                        let tag = self.tag_input.trim().to_string();
-                        if !tag.is_empty() {
-                            let mut tags = shot.tags.clone();
-                            if !tags.contains(&tag) {
-                                tags.push(tag);
-                                tags.sort();
-                                self.call("tags.set", json!({"shot_id": shot.id, "tags": tags}));
-                            }
-                        }
-                        self.tag_input.clear();
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let step = if ui.input(|i| i.modifiers.shift) { 10 } else { 1 };
+                    let left_ok = !shot.pending && shot.start.saturating_sub(step) > self.state.shots[shot.number - 1].start;
+                    if kit::icon_button(ui, icon::CARET_LEFT, left_ok, &format!("起点前移 {step} 帧（按住 Shift 移 10 帧）")).clicked() {
+                        self.call("edit.move_boundary", json!({"boundary": shot.number, "frame": shot.start.saturating_sub(step)}));
                     }
-                });
-                if !shot.pending { self.annotation_block(ui, &shot); }
-                ui.separator();
-                let current = self.player.as_ref().map(|p| p.frame()).unwrap_or(self.ui_frame);
-                let in_shot = current >= shot.start && current < shot.end;
-                if ui
-                    .add_enabled(in_shot && !shot.pending, egui::Button::new("在此帧拆分"))
-                    .clicked()
-                {
-                    self.call("edit.split", json!({"frame": current}));
-                }
-                if ui
-                    .add_enabled(shot.number + 1 < self.state.completed_count as usize, egui::Button::new("与下一镜头合并"))
-                    .clicked()
-                {
-                    self.call("edit.merge", json!({"row": shot.number}));
-                }
-                // 共享边界：起点属于本镜头，终点属于下一镜头；两者指向同一帧。
-                ui.horizontal(|ui| {
-                    if shot.number > 0 && ui.add_enabled(!shot.pending, egui::Button::new("校正起点…")).clicked() {
-                        self.boundary_editor = boundary::BoundaryEditor::new(
-                            &self.state.project_id, &self.state.shots, shot.number,
-                            boundary::Side::Start, current);
+                    let right_ok = !shot.pending && shot.end > shot.start + step;
+                    if kit::icon_button(ui, icon::CARET_RIGHT, right_ok, &format!("起点后移 {step} 帧（按住 Shift 移 10 帧）")).clicked() {
+                        self.call("edit.move_boundary", json!({"boundary": shot.number, "frame": shot.start + step}));
                     }
-                    if shot.number + 1 < self.state.completed_count as usize
-                        && ui.add_enabled(!shot.pending, egui::Button::new("校正终点…")).clicked()
+                    if kit::quiet_button(ui, icon::CROSSHAIR, "逐帧校正…", !shot.pending)
+                        .tip("打开边界校正窗，对比切点前后帧").clicked()
                     {
                         self.boundary_editor = boundary::BoundaryEditor::new(
-                            &self.state.project_id, &self.state.shots, shot.number,
-                            boundary::Side::End, current);
+                            &self.state.project_id, &self.state.shots, shot.number, boundary::Side::Start, current);
                     }
                 });
-                if shot.number > 0 {
-                    ui.horizontal(|ui| {
-                        ui.weak("步进");
-                        let step = if ui.input(|i| i.modifiers.shift) { 10 } else { 1 };
-                        let left_ok = shot.start.saturating_sub(step) > self.state.shots[shot.number - 1].start;
-                        if ui.add_enabled(left_ok, egui::Button::new("◀")).clicked() {
-                            self.call("edit.move_boundary",
-                                json!({"boundary": shot.number, "frame": shot.start.saturating_sub(step)}));
-                        }
-                        if ui.add_enabled(shot.end > shot.start + step, egui::Button::new("▶")).clicked() {
-                            self.call("edit.move_boundary",
-                                json!({"boundary": shot.number, "frame": shot.start + step}));
-                        }
-                        ui.weak(format!("Shift ×10 · 共享帧 {}", shot.start));
-                    });
+                ui.end_row();
+            }
+            if has_next {
+                ui.label(egui::RichText::new("终点").color(theme::secondary()));
+                ui.label(egui::RichText::new(format!("帧 {}", shot.end)).monospace());
+                if kit::quiet_button(ui, icon::CROSSHAIR, "逐帧校正…", !shot.pending)
+                    .tip("终点就是下一个镜头的起点").clicked()
+                {
+                    self.boundary_editor = boundary::BoundaryEditor::new(
+                        &self.state.project_id, &self.state.shots, shot.number, boundary::Side::End, current);
                 }
+                ui.end_row();
             }
-            None => {
-                ui.label("（未选中镜头）");
-            }
-        }
+        });
     }
 
-    /// 研究标注：カット编号、人工景别（与模型/VLM 分层显示）、所属区段。
+    /// 研究标注：カット编号、人工景别（与模型/VLM 分层显示）。
     fn annotation_block(&mut self, ui: &mut egui::Ui, shot: &model::ShotRow) {
-        ui.add_space(4.0);
+        kit::section(ui, "研究标注");
         if self.cut_shot != shot.id {
             self.cut_shot = shot.id.clone();
             self.cut_input = shot.cut_number.clone();
         }
-        ui.horizontal(|ui| {
-            ui.strong("カット");
+        egui::Grid::new("annotation").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            ui.label(egui::RichText::new("カット").color(theme::secondary()));
             let response = ui.add(egui::TextEdit::singleline(&mut self.cut_input)
-                .hint_text("制作编号，如 C012").desired_width(90.0));
+                .hint_text("如 C012").desired_width(140.0));
             if response.lost_focus() && self.cut_input.trim() != shot.cut_number {
                 self.call("cut.set", json!({"shot_id": shot.id, "value": self.cut_input.trim()}));
             }
-            if let Some(region) = &shot.region {
-                ui.colored_label(theme::warning(), format!("区段：{}", model::region_zh(region)));
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("景别");
-            for (index, (code, label)) in model::SCALES.iter().enumerate() {
-                let active = shot.scale_manual.as_deref() == Some(*code);
-                if ui.selectable_label(active, *label).on_hover_text(format!("快捷键 {}", index + 1)).clicked() {
-                    let value = if active { Value::Null } else { json!(code) };
-                    self.call("scale.set_manual", json!({"shot_id": shot.id, "label": value}));
+            ui.end_row();
+            ui.label(egui::RichText::new("景别").color(theme::secondary()));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for (index, (code, label)) in model::SCALES.iter().enumerate() {
+                    let active = shot.scale_manual.as_deref() == Some(*code);
+                    let button = egui::Button::selectable(active, *label)
+                        .frame_when_inactive(true)
+                        .min_size(egui::vec2(0.0, 24.0));
+                    if ui.add(button).on_hover_text(format!("快捷键 {}（再点一次或按 0 清除）", index + 1)).clicked() {
+                        let value = if active { Value::Null } else { json!(code) };
+                        self.call("scale.set_manual", json!({"shot_id": shot.id, "label": value}));
+                    }
                 }
-            }
+            });
+            ui.end_row();
         });
-        let model_scale = shot.scale.as_ref().map(|s| format!("模型 {}（{:.0}%）", s.label_zh, s.confidence.unwrap_or(0.0) * 100.0));
-        let vlm_scale = shot.vlm.as_ref().and_then(|v| v.shot_scale.as_deref()).map(|s| format!("VLM {}", model::scale_zh(s)));
+        let model_scale = shot.scale.as_ref().map(|s| format!("模型判为 {}（{:.0}%）", s.label_zh, s.confidence.unwrap_or(0.0) * 100.0));
+        let vlm_scale = shot.vlm.as_ref().and_then(|v| v.shot_scale.as_deref()).map(|s| format!("VLM 判为 {}", model::scale_zh(s)));
         let hints: Vec<String> = model_scale.into_iter().chain(vlm_scale).collect();
-        if !hints.is_empty() { ui.weak(hints.join(" · ")); }
+        if !hints.is_empty() {
+            ui.label(egui::RichText::new(hints.join(" · ")).small().color(theme::faint()));
+        }
         if let Some(vlm) = &shot.vlm {
-            ui.small(egui::RichText::new(format!("VLM：{} · {} · {}{}",
-                vlm.camera_movement.as_deref().unwrap_or("—"), vlm.content_type.as_deref().unwrap_or("—"),
-                vlm.description, if vlm.effects.is_empty() { String::new() } else { format!(" · {}", vlm.effects.join("/")) }))
-                .color(theme::secondary()));
+            ui.add_space(4.0);
+            kit::card(ui, |ui| {
+                ui.label(egui::RichText::new(kit::label(icon::SPARKLE, "VLM 描述")).small().color(theme::secondary()));
+                ui.label(egui::RichText::new(&vlm.description).small());
+                let mut facts = vec![
+                    vlm.camera_movement.as_deref().unwrap_or("—").to_string(),
+                    vlm.content_type.as_deref().unwrap_or("—").to_string(),
+                ];
+                facts.extend(vlm.effects.iter().cloned());
+                ui.label(egui::RichText::new(facts.join(" · ")).small().color(theme::faint()));
+            });
         }
     }
 
@@ -2556,269 +2829,243 @@ impl App {
 
     fn player_panel(&mut self, ui: &mut egui::Ui) {
         let frames = self.index.as_ref().map(|i| i.frames()).unwrap_or(1).max(1);
-        // 控制条约 210px；开着 A/B 对照时再给对照图让出高度（最多六成），否则对照图会被裁掉。
-        let reserve = 210.0 + self.ab_height(ui.available_width(), ui.available_height() - 210.0);
-        // 画面区：滚轮缩放（1×–16×，1.25×/步，以光标为中心）、拖拽平移、双击复位。
-        let texture_id = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()));
-        match texture_id {
-            Some((id, image_size)) => {
-                let avail_w = ui.available_width().max(64.0);
-                let avail_h = (ui.available_height() - reserve).max(140.0);
-                let fit = (avail_w / image_size.x).min(avail_h / image_size.y);
-                let display = image_size * fit;
-                let (rect, response) =
-                    ui.allocate_exact_size(display, egui::Sense::click_and_drag());
+        // 最下方：A/B 对照图，分隔条可拖动调高度；初始高度按两图铺满宽度的自然高度（最多六成）。
+        if self.ab_show {
+            let default = self.ab_height(ui.available_width(), ui.available_height() - 140.0);
+            egui::Panel::bottom("ab-compare")
+                .resizable(true)
+                .default_size(default)
+                .frame(egui::Frame::new().inner_margin(egui::Margin { top: 8, ..Default::default() }))
+                .show(ui, |ui| self.ab_view(ui));
+        }
+        // 其上：帧轨 + 传输条 + A/B 工具条，高度固定。
+        egui::Panel::bottom("transport")
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().inner_margin(egui::Margin { top: 6, ..Default::default() }))
+            .show(ui, |ui| {
+                self.frame_track(ui, frames);
+                self.transport_bar(ui, frames);
+                self.ab_bar(ui);
+            });
+        self.video_view(ui);
+    }
 
-                if response.hovered() {
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll.abs() > 0.5 {
-                        let steps = scroll / 120.0;
-                        let next = (self.zoom * 1.25f32.powf(steps)).clamp(1.0, 16.0);
-                        if let Some(pointer) = response.hover_pos() {
-                            // 保持光标下的画面点不动（原版 zoomAt 语义）
-                            let rel = (pointer - rect.min) / display - egui::vec2(0.5, 0.5);
-                            self.pan += rel * (1.0 / self.zoom - 1.0 / next);
-                        }
-                        self.zoom = next;
-                        clamp_pan(&mut self.pan, self.zoom);
+    /// 画面区：在剩余空间里居中等比显示。滚轮缩放（1×–16×，1.25×/步，以光标为中心）、
+    /// 拖拽平移、双击复位。
+    fn video_view(&mut self, ui: &mut egui::Ui) {
+        let Some((id, image_size)) = self.texture.as_ref().map(|t| (t.id(), t.size_vec2())) else {
+            ui.vertical_centered(|ui| {
+                if self.index_busy {
+                    kit::empty_state(ui, icon::VIDEO, "正在建立帧索引…", "首次打开需要逐帧读一遍，进度见顶栏");
+                } else {
+                    kit::empty_state(ui, icon::VIDEO, "打开一段视频开始",
+                        "支持 mkv / mp4 / mov / avi / webm 等；也可以打开已有的 .shotlab 项目");
+                    ui.add_space(10.0);
+                    if kit::primary(ui, icon::FOLDER_OPEN, "打开视频…", true).tip("Ctrl+O").clicked() {
+                        self.pick_video();
                     }
                 }
-                if response.dragged() && self.zoom > 1.0 {
-                    let delta = response.drag_delta();
-                    self.pan.x -= delta.x * (1.0 / self.zoom) / display.x;
-                    self.pan.y -= delta.y * (1.0 / self.zoom) / display.y;
-                    clamp_pan(&mut self.pan, self.zoom);
-                }
-                if response.double_clicked() {
-                    self.zoom = 1.0;
-                    self.pan = egui::Vec2::ZERO;
-                }
+            });
+            return;
+        };
+        let area = ui.available_rect_before_wrap();
+        ui.allocate_rect(area, egui::Sense::hover());
+        let fit = (area.width().max(64.0) / image_size.x).min(area.height().max(64.0) / image_size.y);
+        let display = image_size * fit;
+        let rect = egui::Rect::from_center_size(area.center(), display);
+        let response = ui.interact(rect, ui.scope_id().with("video"), egui::Sense::click_and_drag());
 
-                let half = 0.5 / self.zoom;
-                let center = egui::pos2(0.5 + self.pan.x, 0.5 + self.pan.y);
-                let uv = egui::Rect::from_center_size(center, egui::vec2(2.0 * half, 2.0 * half));
-                ui.painter_at(rect).image(id, rect, uv, egui::Color32::WHITE);
-                // 字幕叠层（原版 subtitleOverlay：画面底部居中、描边）
-                if let Some(text) = self.subtitle_text.as_ref().filter(|t| !t.is_empty()) {
-                    let font = egui::FontId::proportional((display.y / 22.0).clamp(14.0, 26.0));
-                    let anchor = egui::pos2(rect.center().x, rect.bottom() - 14.0);
-                    for offset in [
-                        egui::vec2(-1.5, 0.0), egui::vec2(1.5, 0.0),
-                        egui::vec2(0.0, -1.5), egui::vec2(0.0, 1.5),
-                        egui::vec2(1.5, 1.5), egui::vec2(-1.5, -1.5),
-                    ] {
-                        ui.painter_at(rect).text(
-                            anchor + offset, egui::Align2::CENTER_BOTTOM, text,
-                            font.clone(), egui::Color32::from_black_alpha(210));
-                    }
-                    ui.painter_at(rect).text(
-                        anchor, egui::Align2::CENTER_BOTTOM, text, font,
-                        egui::Color32::WHITE);
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.5 {
+                let steps = scroll / 120.0;
+                let next = (self.zoom * 1.25f32.powf(steps)).clamp(1.0, 16.0);
+                if let Some(pointer) = response.hover_pos() {
+                    // 保持光标下的画面点不动（原版 zoomAt 语义）
+                    let rel = (pointer - rect.min) / display - egui::vec2(0.5, 0.5);
+                    self.pan += rel * (1.0 / self.zoom - 1.0 / next);
                 }
-                if self.zoom > 1.001 {
-                    ui.painter_at(rect).text(
-                        rect.right_top() + egui::vec2(-8.0, 6.0),
-                        egui::Align2::RIGHT_TOP,
-                        format!("{:.0}%", self.zoom * 100.0),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_white_alpha(200),
-                    );
-                }
-                if self.video_only {
-                    ui.painter_at(rect).text(
-                        rect.left_top() + egui::vec2(8.0, 6.0),
-                        egui::Align2::LEFT_TOP,
-                        "Alt+Enter 退出视频模式",
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_white_alpha(160),
-                    );
-                }
-            }
-            None => {
-                ui.centered_and_justified(|ui| ui.colored_label(theme::faint(), "打开视频后在此播放（分析模式静音或含音轨）"));
+                self.zoom = next;
+                clamp_pan(&mut self.pan, self.zoom);
             }
         }
+        if response.dragged() && self.zoom > 1.0 {
+            let delta = response.drag_delta();
+            self.pan.x -= delta.x * (1.0 / self.zoom) / display.x;
+            self.pan.y -= delta.y * (1.0 / self.zoom) / display.y;
+            clamp_pan(&mut self.pan, self.zoom);
+        }
+        if response.double_clicked() {
+            self.zoom = 1.0;
+            self.pan = egui::Vec2::ZERO;
+        }
 
-        // -- 帧轨（原版 FrameTrack：细线 + 刻度 + 播放头；拖动 scrub） ----------
-        self.frame_track(ui, frames);
-        ui.add_space(2.0);
+        let half = 0.5 / self.zoom;
+        let center = egui::pos2(0.5 + self.pan.x, 0.5 + self.pan.y);
+        let uv = egui::Rect::from_center_size(center, egui::vec2(2.0 * half, 2.0 * half));
+        let painter = ui.painter_at(rect);
+        painter.image(id, rect, uv, egui::Color32::WHITE);
+        // 字幕叠层（原版 subtitleOverlay：画面底部居中、描边）
+        if let Some(text) = self.subtitle_text.as_ref().filter(|t| !t.is_empty()) {
+            let font = egui::FontId::proportional((display.y / 22.0).clamp(14.0, 26.0));
+            let anchor = egui::pos2(rect.center().x, rect.bottom() - 14.0);
+            for offset in [
+                egui::vec2(-1.5, 0.0), egui::vec2(1.5, 0.0),
+                egui::vec2(0.0, -1.5), egui::vec2(0.0, 1.5),
+                egui::vec2(1.5, 1.5), egui::vec2(-1.5, -1.5),
+            ] {
+                painter.text(anchor + offset, egui::Align2::CENTER_BOTTOM, text,
+                    font.clone(), egui::Color32::from_black_alpha(210));
+            }
+            painter.text(anchor, egui::Align2::CENTER_BOTTOM, text, font, egui::Color32::WHITE);
+        }
+        // 角标：缩放比例（点击处即可双击复位）、视频模式提示
+        let badge = |pos: egui::Pos2, align: egui::Align2, text: String| {
+            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(11.5), egui::Color32::from_white_alpha(230));
+            let rect = align.anchor_size(pos, galley.size() + egui::vec2(12.0, 6.0));
+            painter.rect_filled(rect, 5.0, egui::Color32::from_black_alpha(150));
+            painter.galley(rect.min + egui::vec2(6.0, 3.0), galley, egui::Color32::WHITE);
+        };
+        if self.zoom > 1.001 {
+            badge(rect.right_top() + egui::vec2(-8.0, 8.0), egui::Align2::RIGHT_TOP,
+                format!("{:.0}% · 双击复位", self.zoom * 100.0));
+        }
+        if self.video_only {
+            badge(rect.left_top() + egui::vec2(8.0, 8.0), egui::Align2::LEFT_TOP, "Alt+Enter 或 Esc 退出只看画面".into());
+        }
+        if response.hovered() && self.zoom <= 1.001 {
+            response.on_hover_text("滚轮放大 · 放大后拖动平移 · 双击复位");
+        }
+    }
 
-        // -- 传输条（原版 TransportBar：计数左 / 居中控制 / 工具右） ------------
+    /// 传输条：左时间码 / 中播放控制 / 右循环、截帧、字幕、音量。
+    fn transport_bar(&mut self, ui: &mut egui::Ui, frames: u64) {
+        let ready = self.player.is_some();
+        let playing = self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
+        let total = ui.available_width();
+        let narrow = total < 600.0;
+        if narrow {
+            ui.horizontal(|ui| {
+                ui.add_space(((total - 230.0) / 2.0).max(0.0));
+                self.transport_controls(ui, frames, ready, playing);
+            });
+        }
         ui.horizontal(|ui| {
-            let total = ui.available_width();
-            let section = (total / 3.0).max(140.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(section, 26.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.monospace(format!("{} / {} f", self.ui_frame, frames));
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(section, 26.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    let playing = self.player.as_ref().map(|p| p.is_playing()).unwrap_or(false);
-                    let ready = self.player.is_some();
-                    if ui.add_enabled(ready, egui::Button::new("⏮").min_size(egui::vec2(26.0, 24.0))).clicked() {
-                        self.adjacent_shot(-1);
+            let side = if narrow { 150.0 } else { ((total - 230.0) / 2.0).max(150.0) };
+            // 左：帧号与时间
+            ui.allocate_ui_with_layout(egui::vec2(side, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new(format!("{}", self.ui_frame)).monospace().size(15.0).color(theme::ink()));
+                ui.label(egui::RichText::new(format!("/ {frames}")).monospace().size(12.0).color(theme::faint()));
+                let (clock, _) = self.clock_labels();
+                ui.label(egui::RichText::new(clock).monospace().size(12.0).color(theme::secondary()))
+                    .on_hover_text("F 跳到帧号 · G 跳到时间");
+            });
+            // 中：上一镜头 / 上一帧 / 播放 / 下一帧 / 下一镜头
+            if !narrow {
+                ui.allocate_ui_with_layout(egui::vec2(230.0, 34.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    self.transport_controls(ui, frames, ready, playing);
+                });
+            }
+            // 右：音量、字幕、截帧、循环（右到左排）
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 34.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let has_audio = self.audio.is_some()
+                    && self.index.as_ref().map(|i| i.metadata.audio_tracks.unwrap_or(0) > 0).unwrap_or(false);
+                if has_audio {
+                    let response = ui.add_sized([72.0, 20.0], egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false))
+                        .on_hover_text(format!("音量 {:.0}% · + / −", self.volume * 100.0));
+                    if response.changed() {
+                        if self.muted && self.volume > 0.0 { self.muted = false; }
+                        if let Some(audio) = &self.audio {
+                            audio.set_volume(self.volume);
+                            audio.set_muted(self.muted);
+                        }
                     }
-                    if ui.add_enabled(ready, egui::Button::new("◁").min_size(egui::vec2(26.0, 24.0))).clicked() {
-                        self.step(-1, frames);
+                    let speaker = if self.muted || self.volume == 0.0 { icon::SPEAKER_SLASH } else { icon::SPEAKER_HIGH };
+                    if kit::icon_button(ui, speaker, true, if self.muted { "取消静音 · M" } else { "静音 · M" }).clicked() {
+                        self.muted = !self.muted;
+                        if let Some(audio) = &self.audio { audio.set_muted(self.muted); }
                     }
-                    let play_label = if playing { "⏸" } else { "▶" };
-                    let play_button = egui::Button::new(
-                        egui::RichText::new(play_label).color(theme::on_accent()),
-                    )
-                    .fill(theme::accent())
-                    .min_size(egui::vec2(52.0, 26.0));
-                    if ui.add_enabled(ready, play_button).clicked() {
-                        self.toggle_playback();
+                }
+                let subtitle_tip = if self.subtitle_loaded {
+                    format!("已加载 {} 条字幕 · 点击换一个 SRT", self.subtitle_cues.len())
+                } else { "加载 SRT 字幕，叠在画面底部".into() };
+                if kit::toggle_icon(ui, icon::CLOSED_CAPTIONING, self.subtitle_loaded, self.index.is_some(), &subtitle_tip).clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("SRT 字幕", &["srt"]).pick_file() {
+                        self.load_subtitles(path);
                     }
-                    if ui.add_enabled(ready, egui::Button::new("▷").min_size(egui::vec2(26.0, 24.0))).clicked() {
-                        self.step(1, frames);
-                    }
-                    if ui.add_enabled(ready, egui::Button::new("⏭").min_size(egui::vec2(26.0, 24.0))).clicked() {
-                        self.adjacent_shot(1);
-                    }
-                },
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width().max(120.0), 26.0),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    let in_shot = self.state.shots.iter()
-                        .any(|s| s.id == self.state.selected_id && !s.pending);
-                    let loop_label = if self.loop_active { "🔁 循环中" } else { "🔁 循环 · L" };
-                    if ui
-                        .add_enabled(self.player.is_some() && in_shot, egui::Button::new(loop_label))
-                        .clicked()
-                    {
-                        self.toggle_loop();
-                    }
-                    if ui.button("📷").on_hover_text("截帧 PNG · Ctrl+E").clicked() {
-                        self.export_frame();
-                    }
-                    let both = self.ab_textures[0].is_some() && self.ab_textures[1].is_some();
-                    if ui
-                        .add_enabled(both, egui::Button::new(if self.ab_show { "对照中" } else { "A/B 对照" }))
-                        .clicked()
-                    {
-                        self.ab_show = !self.ab_show;
-                    }
-                },
-            );
-        });
-        // 字幕 / 音量 / 缩放信息行
-        ui.horizontal(|ui| {
-            if ui.button("💬 字幕").on_hover_text("加载 SRT 字幕").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("SRT 字幕", &["srt"])
-                    .pick_file()
+                }
+                if kit::icon_button(ui, icon::CAMERA, self.index.is_some(), "当前帧存为 PNG · Ctrl+E").clicked() {
+                    self.export_frame();
+                }
+                let in_shot = self.state.shots.iter().any(|s| s.id == self.state.selected_id && !s.pending);
+                if kit::toggle_icon(ui, icon::REPEAT, self.loop_active, ready && in_shot,
+                    if self.loop_active { "停止循环 · L" } else { "循环播放当前镜头 · L" }).clicked()
                 {
-                    self.load_subtitles(path);
+                    self.toggle_loop();
                 }
-            }
-            if self.subtitle_loaded {
-                ui.weak(format!("{} 条", self.subtitle_cues.len()));
-            }
-            let has_audio = self.audio.is_some()
-                && self.index.as_ref().map(|i| i.metadata.audio_tracks.unwrap_or(0) > 0).unwrap_or(false);
-            if has_audio {
-                let mute_label = if self.muted { "🔇" } else { "🔊" };
-                if ui.button(mute_label).on_hover_text("静音 · M").clicked() {
-                    self.muted = !self.muted;
-                    if let Some(audio) = &self.audio {
-                        audio.set_muted(self.muted);
-                    }
-                }
-                let response = ui.add(
-                    egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false),
-                );
-                if response.changed() {
-                    if let Some(audio) = &self.audio {
-                        audio.set_volume(self.volume);
-                    }
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(format!("缩放 {:.0}% · 双击复位", self.zoom * 100.0));
             });
         });
+    }
 
-        // -- A/B 对照与导出 -----------------------------------------------------
-        ui.add_space(2.0);
+    fn transport_controls(&mut self, ui: &mut egui::Ui, frames: u64, ready: bool, playing: bool) {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if kit::icon_button(ui, icon::SKIP_BACK, ready, "上一个镜头 · ↑").clicked() { self.adjacent_shot(-1); }
+        if kit::icon_button(ui, icon::CARET_LEFT, ready, "上一帧 · ←").clicked() { self.step(-1, frames); }
+        let play = egui::Button::new(
+            egui::RichText::new(if playing { icon::PAUSE } else { icon::PLAY }).size(20.0).color(theme::on_accent()))
+            .fill(theme::accent())
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(17)
+            .min_size(egui::vec2(52.0, 34.0));
+        if ui.add_enabled(ready, play).tip(if playing { "暂停 · 空格" } else { "播放 · 空格" }).clicked() {
+            self.toggle_playback();
+        }
+        if kit::icon_button(ui, icon::CARET_RIGHT, ready, "下一帧 · →").clicked() { self.step(1, frames); }
+        if kit::icon_button(ui, icon::SKIP_FORWARD, ready, "下一个镜头 · ↓").clicked() { self.adjacent_shot(1); }
+    }
+
+    /// A/B 对照工具条：两个槽位显示已采的帧，点击把当前帧放进去；两槽都有帧才能对照。
+    fn ab_bar(&mut self, ui: &mut egui::Ui) {
+        if self.index.is_none() { return; }
         ui.horizontal(|ui| {
-            ui.weak("A/B:");
-            if ui.button("设为 A").clicked() {
-                self.capture_ab(0);
-            }
-            if ui.button("设为 B").clicked() {
-                self.capture_ab(1);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(egui::RichText::new("A/B 对照").small().color(theme::secondary()));
+            for (slot, name) in [(0usize, "A"), (1usize, "B")] {
+                let text = match self.ab_frames[slot] {
+                    Some(frame) => format!("{name} · 帧 {frame}"),
+                    None => format!("设为 {name}"),
+                };
+                let tip = match self.ab_frames[slot] {
+                    Some(_) => format!("把当前帧换成 {name}"),
+                    None => format!("把当前帧设为 {name}"),
+                };
+                let color = if self.ab_frames[slot].is_some() { theme::accent() } else { theme::ink() };
+                let button = egui::Button::new(egui::RichText::new(text).small().color(color))
+                    .min_size(egui::vec2(0.0, 24.0));
+                if ui.add(button).tip(tip).clicked() {
+                    self.capture_ab(slot);
+                }
             }
             let both = self.ab_textures[0].is_some() && self.ab_textures[1].is_some();
-            if ui
-                .add_enabled(both, egui::Button::new(if self.ab_show { "关闭对照" } else { "对照" }))
-                .clicked()
+            if kit::toggle_icon(ui, icon::COLUMNS, self.ab_show, both,
+                if both { "显示 / 隐藏对照 · Ctrl+Shift+C" } else { "先设好 A 和 B 两帧" }).clicked()
             {
                 self.ab_show = !self.ab_show;
             }
-            ui.separator();
-            let has_selection = self
-                .state
-                .shots
-                .iter()
-                .any(|s| s.id == self.state.selected_id && !s.pending);
-            if ui.add_enabled(has_selection, egui::Button::new("🎬 GIF")).clicked() {
-                self.export_gif();
-            }
-            if ui
-                .add_enabled(self.state.completed_count > 0, egui::Button::new("📋 CSV"))
-                .clicked()
-            {
-                self.export_shots_csv();
-            }
-            if ui
-                .add_enabled(self.state.completed_count > 0, egui::Button::new("🖼 长图"))
-                .clicked()
-            {
-                self.export_contact_sheet();
-            }
-            if ui
-                .add_enabled(self.state.completed_count > 0, egui::Button::new("📄 PDF"))
-                .clicked()
-            {
-                self.export_pdf_sheet();
-            }
-            if self.state.completed_count > 0 {
-                ui.weak(format!("已标记 {} · Ctrl+A", self.marks.len()));
-                if let Some(ids) = self.analysis_scope_ids() {
-                    ui.colored_label(theme::accent(), format!("导出/分析范围：已标记 {} 个", ids.len()));
+            if self.ab_show && both {
+                kit::divider(ui);
+                kit::segmented(ui, &mut self.ab_overlay, &[(false, "并排"), (true, "叠加")]);
+                if self.ab_overlay {
+                    ui.label(egui::RichText::new("B 透明度").small().color(theme::secondary()));
+                    let response = ui.add_sized([110.0, 20.0], egui::Slider::new(&mut self.ab_alpha, 0.0..=1.0).show_value(false))
+                        .on_hover_text(format!("{:.0}%", self.ab_alpha * 100.0));
+                    if response.changed() { self.ab_blend_dirty = true; }
                 }
             }
         });
-        // A/B 帧信息行
-        if self.ab_textures.iter().any(|t| t.is_some()) {
-            ui.horizontal(|ui| {
-                for (slot, name) in [(0, "A"), (1, "B")] {
-                    match self.ab_frames[slot] {
-                        Some(frame) => { ui.monospace(format!("{name}: 帧 {frame}")); }
-                        None => { ui.weak(format!("{name}: 未设")); }
-                    }
-                }
-                if self.ab_show && self.ab_textures[0].is_some() && self.ab_textures[1].is_some() {
-                    if ui.selectable_label(!self.ab_overlay, "并排").clicked() {
-                        self.ab_overlay = false;
-                    }
-                    if ui.selectable_label(self.ab_overlay, "叠加").clicked() {
-                        self.ab_overlay = true;
-                    }
-                }
-            });
-        }
-        if self.ab_show {
-            self.ab_view(ui);
-        }
     }
 
     /// 原版 FrameTrack：2px 横线、最多 13 刻度、播放头；拖动 scrub，
@@ -2854,42 +3101,48 @@ impl App {
         let progress_color = theme::selected();
         let accent_color = theme::accent();
         let baseline = rect.center().y + 1.0;
-        painter.line_segment(
-            [egui::pos2(rect.left() + inset, baseline), egui::pos2(rect.left() + inset + span, baseline)],
-            egui::Stroke::new(2.0, line_color),
-        );
+        let left = rect.left() + inset;
+        let x_in_view = |x: f32| x >= left - 0.5 && x <= left + span + 0.5;
+        // 底轨：圆角细条；选中镜头范围铺一层淡强调色（循环时更浓）。
+        let rail = egui::Rect::from_min_max(egui::pos2(left, baseline - 3.0), egui::pos2(left + span, baseline + 3.0));
+        painter.rect_filled(rail, 3.0, theme::mix(theme::matte(), line_color, 0.8));
+        if let Some(shot) = self.state.shots.iter().find(|s| s.id == self.state.selected_id && !s.pending) {
+            let band = egui::Rect::from_min_max(
+                egui::pos2(position(shot.start as f64).max(left), baseline - 7.0),
+                egui::pos2(position(shot.end as f64).min(left + span), baseline + 7.0));
+            if band.width() > 0.0 {
+                let strength = if self.loop_active { 0.45 } else { 0.25 };
+                painter.rect_filled(band, 3.0, theme::mix(theme::matte(), accent_color, strength));
+            }
+        }
         let head = position(self.ui_frame as f64);
-        if head > rect.left() + inset {
-            painter.line_segment(
-                [egui::pos2(rect.left() + inset, baseline), egui::pos2(head, baseline)],
-                egui::Stroke::new(2.0, progress_color.gamma_multiply(0.6)),
-            );
+        if head > left {
+            painter.rect_filled(
+                egui::Rect::from_min_max(rail.min, egui::pos2(head.min(rail.right()), rail.bottom())),
+                3.0, progress_color.gamma_multiply(0.55));
         }
-        let tick_count = (view_span.floor() as i64 + 1).clamp(2, 13) as usize;
-        for index in 0..tick_count {
-            let fraction = index as f64 / (tick_count - 1).max(1) as f64;
-            let frame = start + fraction * view_span;
-            let x = position(frame);
-            let long = index == 0 || index == tick_count - 1;
-            let color = if self.loop_active && (frame.round() as i64 == 0 || (frame.round() as i64) + 1 == frames as i64) {
-                accent_color
-            } else {
-                line_color
-            };
-            painter.line_segment(
-                [egui::pos2(x, baseline - if long { 5.0 } else { 3.0 }), egui::pos2(x, baseline - 11.0)],
-                egui::Stroke::new(1.0, color),
-            );
+        // 切点：每个镜头起点一根短竖线（太密时抽稀，至少隔 3px）。
+        let mut last_x = f32::NEG_INFINITY;
+        for shot in self.state.shots.iter().skip(1).filter(|s| !s.pending) {
+            let x = position(shot.start as f64);
+            if !x_in_view(x) || x - last_x < 3.0 { continue; }
+            last_x = x;
+            painter.line_segment([egui::pos2(x, baseline - 9.0), egui::pos2(x, baseline + 9.0)],
+                egui::Stroke::new(1.0, theme::mix(line_color, theme::ink(), 0.25)));
+        }
+        if let Some(pending) = self.state.pending_start {
+            // 尚未检测的尾段：警示色底轨。
+            let x = position(pending as f64).max(left);
+            if x < left + span {
+                painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x, baseline - 3.0), rail.max), 3.0,
+                    theme::mix(theme::matte(), theme::warning(), 0.35));
+            }
         }
         painter.line_segment(
-            [egui::pos2(head, baseline - 9.0), egui::pos2(head, baseline + 9.0)],
+            [egui::pos2(head, baseline - 11.0), egui::pos2(head, baseline + 11.0)],
             egui::Stroke::new(2.0, progress_color),
         );
-        painter.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(head - 3.0, baseline - 12.0), egui::vec2(6.0, 3.0)),
-            1.0,
-            progress_color,
-        );
+        painter.circle_filled(egui::pos2(head, baseline - 11.0), 4.5, progress_color);
         if response.dragged() || response.clicked() {
             if let Some(pointer) = response.interact_pointer_pos() {
                 let frame = frame_at(pointer.x);
@@ -2927,9 +3180,13 @@ impl App {
             }
             if let Some(pointer) = response.hover_pos() {
                 let frame = frame_at(pointer.x);
+                painter.line_segment([egui::pos2(pointer.x, baseline - 7.0), egui::pos2(pointer.x, baseline + 7.0)],
+                    egui::Stroke::new(1.0, theme::ink().gamma_multiply(0.5)));
+                let shot = self.state.shots.iter().find(|s| s.start <= frame && frame < s.end)
+                    .map(|s| format!(" · 镜头 #{}", s.number + 1)).unwrap_or_default();
                 response.clone().on_hover_text(format!(
-                    "帧 {frame} · Ctrl+滚轮缩放{}",
-                    if self.track_zoom > 1.0 { " · 滚轮平移" } else { "" }
+                    "帧 {frame}{shot}\n点击或拖动定位 · Ctrl+滚轮缩放{}",
+                    if self.track_zoom > 1.0 { " · 滚轮平移 · 双击复位" } else { "" }
                 ));
             }
         }
@@ -2960,71 +3217,70 @@ impl App {
         });
     }
 
-    /// 对照区想要的高度：图按宽度铺满时的自然高度，最多占 `space` 的六成。
+    /// 对照区初始高度：图按宽度铺满时的自然高度加标题行，最多占 `space` 的六成。
     fn ab_height(&self, width: f32, space: f32) -> f32 {
-        if !self.ab_show {
-            return 0.0;
-        }
         let (Some(a), Some(b)) = (&self.ab_textures[0], &self.ab_textures[1]) else {
-            return 24.0;
+            return 120.0;
         };
         let natural = if self.ab_overlay {
             let size = self.ab_blend.as_ref().unwrap_or(a).size_vec2();
-            width * size.y / size.x + 28.0
+            width * size.y / size.x
         } else {
             [a, b]
                 .iter()
-                .map(|t| (width / 2.0 - 4.0) * t.size_vec2().y / t.size_vec2().x)
+                .map(|t| (width / 2.0 - 6.0) * t.size_vec2().y / t.size_vec2().x)
                 .fold(0.0, f32::max)
         };
-        natural.min((space * 0.6).max(120.0)) + 8.0
+        (natural + 30.0).min((space * 0.6).max(120.0))
     }
 
     fn ab_view(&mut self, ui: &mut egui::Ui) {
-        // 滚动区里的可用高度是无限的，先在外面量好；窗口很矮时画面区有 140px 下限，
-        // 对照图仍可能放不下，留滚动兜底。
-        let max_h = ui.available_height().max(120.0);
+        // 滚动区里的可用高度是无限的，先在外面量好；分隔条拖得很矮时留滚动兜底。
+        let max_h = (ui.available_height() - 24.0).max(80.0);
         egui::ScrollArea::vertical()
             .id_salt("ab_view")
             .auto_shrink([false, true])
             .show(ui, |ui| self.ab_images(ui, max_h));
     }
 
-    fn ab_images(&mut self, ui: &mut egui::Ui, max_h: f32) {
+    fn ab_images(&self, ui: &mut egui::Ui, max_h: f32) {
         let (Some(a), Some(b)) = (&self.ab_textures[0], &self.ab_textures[1]) else {
-            ui.label("先设好 A 和 B 两帧");
+            ui.label(egui::RichText::new("先在下方工具条设好 A 和 B 两帧").color(theme::faint()));
             return;
+        };
+        let caption = |slot: usize, name: &str| {
+            let frame = self.ab_frames[slot].map(|f| format!("帧 {f}")).unwrap_or_default();
+            egui::RichText::new(format!("{name} · {frame}")).small().monospace().color(theme::secondary())
         };
         let avail = ui.available_width();
         if self.ab_overlay {
-            // 叠加：CPU 混合成单图（滑条调节透明度，实时更新）。
-            ui.horizontal(|ui| {
-                ui.weak("B 透明度");
-                let response = ui.add(
-                    egui::Slider::new(&mut self.ab_alpha, 0.0..=1.0).show_value(true),
-                );
-                if response.changed() {
-                    self.ab_blend_dirty = true;
-                }
-            });
+            // 叠加：CPU 混合成单图（透明度在工具条调，实时更新）。
             if let Some(blend) = &self.ab_blend {
+                ui.label(egui::RichText::new(format!("A 叠 B · B 透明度 {:.0}%", self.ab_alpha * 100.0))
+                    .small().color(theme::secondary()));
                 let size = blend.size_vec2();
                 ui.add(
                     egui::Image::new(egui::load::SizedTexture::new(blend.id(), size))
-                        .max_size(egui::vec2(avail, (max_h - 28.0).max(96.0)))
-                        .maintain_aspect_ratio(true),
+                        .max_size(egui::vec2(avail, max_h))
+                        .maintain_aspect_ratio(true)
+                        .corner_radius(4),
                 );
             }
         } else {
-            // 并排：左右各半。
-            ui.horizontal(|ui| {
-                for texture in [a, b] {
-                    let size = texture.size_vec2();
-                    ui.add(
-                        egui::Image::new(egui::load::SizedTexture::new(texture.id(), size))
-                            .max_size(egui::vec2(avail / 2.0 - 4.0, max_h))
-                            .maintain_aspect_ratio(true),
-                    );
+            // 并排：左右各半，各带帧号。
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                for (slot, name, texture) in [(0, "A", a), (1, "B", b)] {
+                    ui.vertical(|ui| {
+                        ui.label(caption(slot, name));
+                        let size = texture.size_vec2();
+                        ui.add(
+                            egui::Image::new(egui::load::SizedTexture::new(texture.id(), size))
+                                .max_size(egui::vec2(avail / 2.0 - 6.0, max_h))
+                                .maintain_aspect_ratio(true)
+                                .corner_radius(4),
+                        );
+                    });
                 }
             });
         }
@@ -3067,6 +3323,20 @@ impl App {
             let _ = tx.send(message);
             wake();
         });
+    }
+
+    /// Save the requested source frame through the same index used for analysis.
+    fn export_evidence_attachment(&mut self, frame: u64) {
+        let Some(video) = self.state.video_path.clone() else { return };
+        let stem = Path::new(&video).file_stem().map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "frame".into());
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG 图片", &["png"])
+            .set_file_name(format!("{stem}-证据帧{frame:06}.png"))
+            .save_file()
+        else { return };
+        self.start_aux_job("study.evidence.capture", json!({
+            "project_id": self.state.project_id, "frame": frame, "path": path.to_string_lossy()}), "导出证据截帧");
     }
 
     fn export_shots_csv(&mut self) {
@@ -3239,10 +3509,65 @@ impl App {
 
     /// 边车结果分给声音面板或研究面板；返回 true 时需要刷新项目状态。
     fn accept_value(&mut self, method: &str, value: Value) -> bool {
+        if method == "study.import_json" || method == "study.import_eaf" {
+            let project = value["project_id"].as_str().unwrap_or("");
+            return project == self.state.project_id;
+        }
+        if method.starts_with("study.") {
+            return self.study.accept(method, value, &self.state.project_id);
+        }
         if method.starts_with("audio.") {
             return self.sound.accept(method, value).unwrap_or(false);
         }
         self.research.accept(method, value)
+    }
+
+    fn handle_study(&mut self, action: study::Action, stem: &str) {
+        match action {
+            study::Action::Rpc(method, params) => self.call(method, params),
+            study::Action::Value(method, params) => self.call_value(method, params),
+            study::Action::Job(method, params, label) => self.start_aux_job(method, params, label),
+            study::Action::Seek(frame) => {
+                self.stop_playback();
+                let frame = frame.min(self.state.frame_count.unwrap_or(1).saturating_sub(1));
+                if let Some(player) = &self.player { player.show(frame); }
+                self.ui_frame = frame;
+                self.commit_cursor(frame);
+                self.refresh_subtitle();
+            }
+            study::Action::Loop(start, end) => {
+                self.begin_loop(start, end);
+            }
+            study::Action::Stop => self.stop_playback(),
+            study::Action::Thumbnail(frame) => self.request_analysis_thumb(stem, frame),
+            study::Action::LoadSubtitles => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("SRT 字幕", &["srt"]).pick_file() { self.load_subtitles(path); }
+            }
+            study::Action::Export => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("研究标注 JSON", &["json"])
+                    .set_file_name("视听标注.json").save_file() {
+                    self.call_quiet_result("study.export", json!({"path": path.to_string_lossy()}));
+                }
+            }
+            study::Action::ImportJson => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("研究标注 JSON", &["json"]).pick_file() {
+                    self.call_value("study.import_json", json!({"path": path.to_string_lossy()}));
+                }
+            }
+            study::Action::ImportEaf => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("ELAN EAF 3.0", &["eaf"]).pick_file() {
+                    self.call_value("study.import_eaf", json!({"path": path.to_string_lossy()}));
+                }
+            }
+            study::Action::ExportFrames(sheet_id) => {
+                if let Some(path) = rfd::FileDialog::new().add_filter("PNG 图片", &["png"])
+                    .set_file_name("曝光连续帧.png").save_file() {
+                    self.start_aux_job("study.difference.run", json!({
+                        "sheet_id": sheet_id, "path": path.to_string_lossy()}), "导出差图与连续帧");
+                }
+            }
+            study::Action::AttachEvidence(frame) => self.export_evidence_attachment(frame),
+        }
     }
 
     fn handle_sound(&mut self, action: sound::Action) {
@@ -3275,12 +3600,18 @@ impl App {
             }
             research::Action::Job { method, params, label } => self.start_aux_job(method, params, label),
             research::Action::Locate(frame) => self.locate_frame(frame),
-            research::Action::Compare { group_by, include_regions } => {
+            research::Action::Compare { group_by, include_regions, inference_unit,
+                                        saved_query_id, alignment, alignment_note } => {
                 let Some(paths) = rfd::FileDialog::new().add_filter("CadensView 项目", &["shotlab"]).pick_files() else { return; };
                 if paths.len() < 2 { self.status = "至少选择两个项目".into(); return; }
                 let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                 self.status = format!("比较 {} 个项目…", paths.len());
-                self.call_value("compare.run", json!({"paths": paths, "group_by": group_by, "exclude_regions": !include_regions}));
+                let mut params = json!({"paths": paths, "group_by": group_by,
+                    "exclude_regions": !include_regions, "inference_unit": inference_unit});
+                if !saved_query_id.is_empty() { params["saved_query_id"] = json!(saved_query_id); }
+                if !alignment.is_empty() { params["alignment"] = json!(alignment); }
+                if !alignment_note.trim().is_empty() { params["alignment_note"] = json!(alignment_note); }
+                self.call_value("compare.run", params);
             }
             research::Action::ExportResearch => {
                 let Some(path) = rfd::FileDialog::new().add_filter("CSV 表格", &["csv"])
@@ -3296,6 +3627,22 @@ impl App {
                     Err(error) => self.status = error,
                 }
             }
+            research::Action::ExportLapianPackage => {
+                let Some(folder) = rfd::FileDialog::new().pick_folder() else { return; };
+                let params = json!({"out_dir": folder.to_string_lossy(), "mode": "sheets"});
+                self.start_aux_job("lapian.package", params, "拉片分析包");
+            }
+            research::Action::ImportLapian => {
+                let Some(path) = rfd::FileDialog::new().add_filter("JSON / 文本", &["json", "txt", "md"])
+                    .pick_file() else { return; };
+                self.status = "导入 AI 拉片结果…".into();
+                self.call_value("lapian.import", json!({"path": path.to_string_lossy()}));
+            }
+            research::Action::ExportLapianSheet => {
+                let Some(path) = rfd::FileDialog::new().add_filter("PNG 图片", &["png"])
+                    .set_file_name("拉片长图.png").save_file() else { return; };
+                self.call_value("export.lapian_sheet", json!({"path": path.to_string_lossy()}));
+            }
             research::Action::RunVlm { force } => {
                 let Ok(mut params) = self.scope_params() else {
                     self.status = "先标记镜头或切换到全片范围".into(); return;
@@ -3306,7 +3653,7 @@ impl App {
                     .unwrap_or_else(|| "已配置的服务商".into());
                 let confirmed = rfd::MessageDialog::new()
                     .set_title("发送关键帧到视觉大模型")
-                    .set_description(format!("将把最多 {count} 个镜头、每个镜头约 3 张关键帧发送到 {target}，可能产生费用。\
+                    .set_description(format!("将把最多 {count} 个镜头、每个镜头最多 6 张关键帧发送到 {target}，可能产生费用。\
 已标注且边界未变的镜头会跳过{}。继续？", if force { "（本次强制重新标注）" } else { "" }))
                     .set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes;
                 if !confirmed { return; }

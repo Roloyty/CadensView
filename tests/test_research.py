@@ -269,7 +269,8 @@ class RepeatsAndCompareTests(unittest.TestCase):
                 METHODS["project.save_as"](session, {"path": str(path)})
                 session.close_current_store()
                 paths.append(str(path))
-            result = METHODS["compare.run"](Session(), {"paths": paths, "csv_path": str(Path(directory) / "c.csv")})
+            result = METHODS["compare.run"](Session(), {"paths": paths, "inference_unit": "shot",
+                                                        "csv_path": str(Path(directory) / "c.csv")})
             self.assertEqual([f["shot_count"] for f in result["films"]], [3, 8])
             pair = result["pairs"][0]
             self.assertGreater(pair["cliffs_delta"]["delta"], 0)  # 第一部镜头更长
@@ -366,7 +367,7 @@ class VlmTests(unittest.TestCase):
 
         server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.shutdown)
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
         config = dict(DEFAULTS, provider="openai_compatible", model="qwen-vl",
                       base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="test-key")
         shot = build_context(self.session.project, self.session.index).records[0]
