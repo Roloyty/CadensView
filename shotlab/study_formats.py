@@ -672,9 +672,19 @@ def optional_asr_adapter(name, payload=None, params=None):
             raise ValueError("外部 ASR 片段须含数值 start_s / end_s") from error
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             raise ValueError("外部 ASR 时间区间无效")
+        # Python's json.loads accepts the NaN/Infinity literals, so a value that came
+        # from a JSON file still has to be checked before it reaches the project.
+        confidence = None
+        if row.get("confidence") is not None:
+            try:
+                confidence = float(row["confidence"])
+            except (TypeError, ValueError) as error:
+                raise ValueError("外部 ASR 片段的 confidence 须为 0-1 的数值") from error
+            if not math.isfinite(confidence):
+                raise ValueError("外部 ASR 片段的 confidence 须为 0-1 的有限数值")
         segments.append(dict(start_s=round(start, 4), end_s=round(end, 4),
                              text=text(row.get("text"), 5000), speaker=text(row.get("speaker"), 200),
-                             confidence=(float(row["confidence"]) if row.get("confidence") is not None else None),
+                             confidence=confidence,
                              label=text(row.get("label"), 100), basis="用户提供；未在本程序内运行模型"))
     return dict(available=True, adapter=name, adapter_installed=installed, segments=segments,
                 status="user_provided", **required,

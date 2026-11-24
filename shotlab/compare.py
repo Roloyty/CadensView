@@ -9,6 +9,7 @@ and usually mark an opening/ending or a recap.
 
 from itertools import combinations
 from pathlib import Path
+import sqlite3
 from statistics import fmean
 
 from shotlab.repeats import shared_sequences
@@ -103,7 +104,14 @@ def compare_projects(paths, exclude_regions=True, group_by=None, inference_unit=
         raise ValueError("推断单位须为 shot / scene / film / episode")
     if len(paths) < 2:
         raise ValueError("至少选择两个项目")
-    films = [load_project(path, exclude_regions) for path in paths]
+    films = []
+    for path in paths:
+        try:
+            films.append(load_project(path, exclude_regions))
+        except (sqlite3.Error, OSError, LookupError, TypeError, ValueError) as error:
+            # Name the file: with several projects selected, a bare "file is not a
+            # database" gives no clue which one to fix.
+            raise ValueError(f"无法读取项目 {path}（{error}）") from error
     if saved_query_id:
         saved = next((q for film in films for q in film["study"].get("saved_queries", [])
                       if q.get("id") == saved_query_id), None)

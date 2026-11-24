@@ -27,6 +27,7 @@ from shotlab.cli import (  # noqa: E402
     _save,
     _session,
 )
+from shotlab.rpc import _json_safe  # noqa: E402
 
 mcp = FastMCP("cadensview", instructions=(
     "CadensView：动画/电影镜头分析。打开 .shotlab 项目或直接分析视频文件，"
@@ -47,7 +48,8 @@ def _shot_params(shot_ids):
 
 
 def _dump(payload) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    # The same guarantee the GUI gets: no NaN/Infinity tokens, no numpy scalars.
+    return json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False)
 
 
 @mcp.tool()

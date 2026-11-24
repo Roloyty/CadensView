@@ -102,12 +102,16 @@ impl Rpc {
         }
         let request = json!({"id": id, "method": method, "params": params});
         let line = serde_json::to_string(&request).map_err(|e| format!("请求序列化失败: {e}"))?;
-        {
+        let written = {
             let mut stdin = self.shared.stdin.lock().unwrap();
             stdin
                 .write_all((line + "\n").as_bytes())
                 .and_then(|_| stdin.flush())
-                .map_err(|e| format!("sidecar 写入失败: {e}"))?;
+        };
+        if let Err(error) = written {
+            // 没写出去就不会有回复：把登记项摘掉，别在表里留一个永远等不到的 id。
+            if let Some(pending) = self.shared.pending.lock().unwrap().as_mut() { pending.remove(&id); }
+            return Err(format!("sidecar 写入失败: {error}"));
         }
         match rx.recv_timeout(Duration::from_secs(3600)) {
             Ok(reply) if reply.ok => Ok(reply.result),

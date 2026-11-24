@@ -88,13 +88,26 @@ def load_config():
     config = dict(DEFAULTS)
     if CONFIG_PATH.exists():
         try:
-            config.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                config.update(saved)
         except (OSError, ValueError):
             pass
     for key in ("provider", "model", "base_url", "api_key", "effort"):
         value = os.environ.get(f"CADENSVIEW_VLM_{key.upper()}")
         if value:
             config[key] = value
+    # The file is plain JSON that users hand-edit: a wrong type or an out-of-range number
+    # must fall back to the default instead of breaking every worker that reads it.
+    for key, low, high in (("concurrency", 1, 8), ("frames", 1, 6), ("image_width", 64, 4096),
+                           ("timeout_s", 1, 3600)):
+        try:
+            config[key] = max(low, min(int(config[key]), high))
+        except (KeyError, TypeError, ValueError):
+            config[key] = DEFAULTS[key]
+    for key in ("provider", "model", "base_url", "effort"):
+        if config.get(key) is not None and not isinstance(config[key], str):
+            config[key] = str(config[key])
     return config
 
 
@@ -233,17 +246,84 @@ class OpenAICompatibleBackend:
         headers = {"Content-Type": "application/json"}
         if self.key:
             headers["Authorization"] = f"Bearer {self.key}"
+        # The original exception types are kept here: retryable() classifies them.
         request = urllib.request.Request(self.url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(request, timeout=self.timeout) as reply:
             payload = json.loads(reply.read().decode("utf-8"))
-        text = payload["choices"][0]["message"]["content"]
-        if isinstance(text, list):
-            text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-        return parse_reply(text), payload.get("model", self.model)
+        text, served = chat_content(payload)
+        return parse_reply(text), served or self.model
 
     def retryable(self, error):
         return (isinstance(error, urllib.error.HTTPError) and error.code in (408, 429, 500, 502, 503, 504)) \
             or isinstance(error, (urllib.error.URLError, TimeoutError))
+
+
+def api_error_message(detail):
+    """The provider's own error text from an OpenAI-compatible error body, else the raw text."""
+    text = (detail or "").strip()
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return text[:300]
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        text = str(error.get("message") or error.get("msg") or error.get("code") or text)
+    elif isinstance(error, str):
+        text = error
+    elif isinstance(payload, dict) and payload.get("message"):
+        text = str(payload["message"])
+    return text[:300]
+
+
+def describe_error(error):
+    """Plain-language text for a transport failure; None when `error` should speak for itself."""
+    if isinstance(error, urllib.error.HTTPError):
+        try:
+            detail = api_error_message(error.read().decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 — the body is simply unavailable
+            detail = ""
+        return f"模型接口返回 HTTP {error.code}：{detail or error.reason}"
+    if isinstance(error, urllib.error.URLError):
+        return f"无法连接模型接口：{error.reason}"
+    if isinstance(error, TimeoutError):
+        return "模型接口响应超时"
+    return None
+
+
+def request_chat(url, payload, headers, timeout):
+    """One OpenAI-compatible chat completion without retry; transport failures become
+    RuntimeErrors that say why (HTTP status plus the provider's message)."""
+    request = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as reply:
+            raw = reply.read().decode("utf-8")
+    except urllib.error.HTTPError as error:  # before URLError: it is a subclass
+        raise RuntimeError(describe_error(error)) from error
+    except Exception as error:  # noqa: BLE001
+        described = describe_error(error)
+        if described is None:
+            raise
+        raise RuntimeError(described) from error
+    try:
+        answer = json.loads(raw)
+    except ValueError as error:
+        raise RuntimeError("模型接口返回的内容不是 JSON") from error
+    if not isinstance(answer, dict):
+        raise RuntimeError("模型接口返回的内容不是 JSON 对象")
+    return answer
+
+
+def chat_content(answer):
+    """(assistant text, served model) of a chat response; the text is '' when the model sent
+    none (refusal, tool call, reasoning-only reply) instead of failing on None."""
+    choices = answer.get("choices") if isinstance(answer, dict) else None
+    first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = first.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    model = answer.get("model") if isinstance(answer, dict) else None
+    return (content if isinstance(content, str) else ""), (model if isinstance(model, str) else "")
 
 
 def backend_for(config):
@@ -261,6 +341,9 @@ def _call(backend, shot, images, attempts=3):
             return backend.annotate(shot, images)
         except Exception as error:  # noqa: BLE001 — 只有可重试错误才重试
             if attempt + 1 == attempts or not backend.retryable(error):
+                described = describe_error(error)
+                if described is not None:
+                    raise RuntimeError(described) from error
                 raise
             time.sleep(2 ** attempt)
 

@@ -16,10 +16,15 @@ class ProjectStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).resolve()
         self.connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=2)
-        if self.connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+        try:
+            if self.connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+                raise ValueError("Unsupported project version; file left unchanged")
+            self.revision = self.connection.execute("SELECT revision FROM project").fetchone()[0]
+        except BaseException:
+            # A file that is not a usable project must not stay open: on Windows the handle
+            # keeps it locked until garbage collection.
             self.connection.close()
-            raise ValueError("Unsupported project version; file left unchanged")
-        self.revision = self.connection.execute("SELECT revision FROM project").fetchone()[0]
+            raise
 
     @classmethod
     def create(cls, path: str | Path, index: FrameIndex, project: Project | None = None, settings: dict | None = None):

@@ -135,6 +135,10 @@ def decode(path, duration_s=None, cancel=None, progress=None, ffmpeg=FFMPEG):
         fingerprint = (np.frombuffer(fingerprint_path.read_bytes(), dtype="<u4").copy()
                        if fingerprint_path.exists() else np.zeros(0, dtype=np.uint32))
     pcm = np.frombuffer(b"".join(chunks), dtype="<f4")
+    if not np.isfinite(pcm).all():
+        # A decoder glitch must not reach the statistics: NaN would propagate into
+        # every loudness/silence number derived from this soundtrack.
+        pcm = np.nan_to_num(pcm, nan=0.0, posinf=0.0, neginf=0.0)
     if not meter or pcm.size == 0:
         raise RuntimeError("ffmpeg 没有产出音频数据")
     loudness = np.array(meter, dtype=np.float64)
@@ -386,10 +390,17 @@ def pack_fingerprint(fingerprint, offset_s, index):
 
 
 def unpack_fingerprint(packed):
+    """The stored fingerprint, None when nothing was stored; ValueError when the stored one is corrupt."""
     if not packed or not packed.get("data"):
         return None
-    raw = zlib.decompress(base64.b64decode(packed["data"]))
-    return np.frombuffer(raw, dtype="<u4").astype(np.uint32)
+    try:
+        raw = zlib.decompress(base64.b64decode(packed["data"]))
+        fingerprint = np.frombuffer(raw, dtype="<u4")
+    except (zlib.error, ValueError, TypeError, KeyError) as error:
+        raise ValueError("项目里保存的音频指纹已损坏") from error
+    if not fingerprint.size:
+        raise ValueError("项目里保存的音频指纹已损坏")
+    return fingerprint.astype(np.uint32)
 
 
 def fingerprint_only(path, ffmpeg=FFMPEG, cancel=None):

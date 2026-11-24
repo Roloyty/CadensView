@@ -9,8 +9,11 @@ the domain rules, undo and storage stay inside the tested core; the GUI is a vie
 """
 
 import json
+import math
+import sqlite3
 import sys
 import threading
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +46,6 @@ def _session_store(path):
     A successful index.build may retire the store on its job thread. Use a
     thread-shareable connection so failed indexing can keep the old store open.
     """
-    import sqlite3
     store = ProjectStore(path)
     try:
         connection = sqlite3.connect(store.path.as_uri() + "?mode=rw", uri=True,
@@ -52,6 +54,59 @@ def _session_store(path):
         store.close()
     store.connection = connection
     return store
+
+
+_WARNED_UNSAFE = set()
+
+
+def _json_safe(value):
+    """Copy of `value` that json.dumps can always encode.
+
+    The GUI parses every stdout line with serde_json, which rejects the bare
+    NaN/Infinity tokens Python writes by default and cannot read integers beyond
+    64 bits; numpy scalars/arrays, sets, bytes and Path objects do not serialize
+    at all. A reply the GUI cannot parse is dropped silently and the GUI then
+    waits (for a job: forever), so such values are converted here instead: every
+    other type keeps its value, non-finite numbers become null.
+    """
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        return value if -(1 << 63) <= value < (1 << 64) else str(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {(k if isinstance(k, str) else str(k)): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return [_json_safe(v) for v in sorted(value, key=repr)]
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Fraction):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if type(value).__module__.partition(".")[0] == "numpy" and hasattr(value, "tolist"):
+        return _json_safe(value.tolist())  # np.int64/np.float32/np.bool_ scalars and arrays
+    return str(value)
+
+
+def _dump(payload):
+    """One protocol line: strict JSON or an error, never a line the GUI would drop."""
+    try:
+        text = json.dumps(payload, ensure_ascii=False)  # fast path: identical to plain json.dumps
+    except (TypeError, ValueError):
+        text = None
+    if text is not None and "NaN" not in text and "Infinity" not in text:
+        return text
+    # "NaN"/"Infinity" inside a string is fine; only the slow pass can tell, and it is exact.
+    kind = "非有限数值（NaN/Infinity）" if text is not None else "不可序列化的值"
+    if kind not in _WARNED_UNSAFE:
+        _WARNED_UNSAFE.add(kind)
+        sys.stderr.write(f"cadensview-rpc: 结果含{kind}，已在协议边界转换\n")
+    return json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False)
 
 
 def _publish_new(staged, target):
@@ -428,7 +483,12 @@ class Session:
         store = _session_store(path)
         try:
             project, index, settings = store.load()
-            index.verify_source()
+            try:
+                index.verify_source()
+            except OSError as error:
+                # 视频被移动/删除是最常见的打开失败：给出路径，而不是裸的 WinError。
+                raise ValueError(f"找不到源视频：{index.path}（项目记录的视频已被移动、删除或无法访问；"
+                                 f"{error.strerror or error}）") from error
         except Exception:
             store.close()
             raise
@@ -1094,21 +1154,35 @@ def _audio_job(session, params, cancel, progress):
 
 
 def _episode_fingerprint(path, cancel=None):
-    """(label, fingerprint, offset_s, shot_hashes, how) of another project, read-only."""
+    """(label, fingerprint, offset_s, shot_hashes, how) of another project, read-only.
+
+    Anything wrong with the file itself is reported as a ValueError that names
+    the file, so the caller degrades to one error row instead of failing the job.
+    """
     from shotlab.audio import fingerprint_only, stream_offset, unpack_fingerprint
-    store = ProjectStore(path)
     try:
-        _, index, settings = store.load()
-    finally:
-        store.close()
-    metadata = settings.get("metadata", {})
+        store = ProjectStore(path)
+        try:
+            _, index, settings = store.load()
+        finally:
+            store.close()
+    except (sqlite3.Error, OSError, LookupError, TypeError, ValueError) as error:
+        raise ValueError(f"无法读取项目 {path}（{error}）") from error
+    metadata = settings.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
     label = metadata.get("title") or Path(path).stem
     if metadata.get("episode"):
         label = f"{label} #{metadata['episode']}"
-    packed = settings.get("audio_fingerprint") or {}
-    hashes = settings.get("shot_hashes", {})
+    packed = settings.get("audio_fingerprint")
+    hashes = settings.get("shot_hashes")
+    packed, hashes = (packed if isinstance(packed, dict) else {}), (hashes if isinstance(hashes, dict) else {})
     if (packed.get("source_size"), packed.get("source_mtime_ns")) == (index.size, index.mtime_ns):
-        return label, unpack_fingerprint(packed), packed.get("offset_s", 0.0), hashes, "stored"
+        try:
+            fingerprint = unpack_fingerprint(packed)
+        except ValueError:
+            fingerprint = None  # 已存指纹损坏：源视频还在就重算，不让一个坏字段永久堵死跨集比对
+        if fingerprint is not None:
+            return label, fingerprint, packed.get("offset_s", 0.0), hashes, "stored"
     if not Path(index.path).is_file():
         raise ValueError(f"{label}: 项目里没有音频指纹，源视频也找不到（{index.path}）")
     offset = stream_offset(index.path, index)
@@ -1120,8 +1194,14 @@ def _episode_fingerprint(path, cancel=None):
 def _own_fingerprint(session, cancel=None):
     from shotlab.audio import fingerprint_only, pack_fingerprint, stream_offset, unpack_fingerprint
     index, packed = session.index, session.audio_fingerprint
+    packed = packed if isinstance(packed, dict) else {}
     if (packed.get("source_size"), packed.get("source_mtime_ns")) == (index.size, index.mtime_ns):
-        return unpack_fingerprint(packed), packed.get("offset_s", 0.0)
+        try:
+            fingerprint = unpack_fingerprint(packed)
+        except ValueError:
+            fingerprint = None  # 同上：重算后由下面的赋值覆盖坏指纹
+        if fingerprint is not None:
+            return fingerprint, packed.get("offset_s", 0.0)
     offset = stream_offset(index.path, index)
     if offset is None:
         raise ValueError("视频没有音轨")
@@ -1138,7 +1218,13 @@ def _audio_match(session, params, cancel=None, progress=None):
     from shotlab.repeats import shared_sequences
     _require_project(session)
     own_path = Path(session.project_path).resolve() if session.project_path else None
-    paths = [p for p in params.get("paths") or [] if Path(p).resolve() != own_path]
+    requested = params.get("paths") or []
+    if not isinstance(requested, list) or any(not isinstance(p, str) or not p.strip() for p in requested):
+        raise ValueError("paths 必须是其他集项目文件路径的列表")
+    try:
+        paths = [p for p in requested if Path(p).resolve() != own_path]
+    except (OSError, ValueError) as error:
+        raise ValueError(f"paths 含无效路径：{error}") from error
     if not paths:
         raise ValueError("请选择至少一个其他集的项目文件")
     own, offset = _own_fingerprint(session, cancel=cancel)
@@ -1272,11 +1358,17 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
             # 先解除忙态再发终态事件：GUI 收到 done 后立刻发起的后续请求不能被拒。
             jobs.pop(job_id, None)
             session.end_busy()
-        if failure is None:
-            write({"event": "job", "job_id": job_id, "topic": name, "phase": "done", "result": result})
-        else:
+        # 终态事件必须在 try 之外发（先解除忙态），但它自己失败时同样要让 GUI 知道任务已结束，
+        # 否则界面会永久停在“任务进行中”。
+        try:
+            if failure is None:
+                write({"event": "job", "job_id": job_id, "topic": name, "phase": "done", "result": result})
+            else:
+                write({"event": "job", "job_id": job_id, "topic": name, "phase": "error",
+                       "message": str(failure), "kind": type(failure).__name__})
+        except Exception as error:
             write({"event": "job", "job_id": job_id, "topic": name, "phase": "error",
-                   "message": str(failure), "kind": type(failure).__name__})
+                   "message": f"任务已结束，但结果无法发送：{error}", "kind": "ProtocolError"})
 
     for line in stdin:
         line = line.strip()
@@ -1285,23 +1377,41 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
         request = {}
         try:
             request = json.loads(line)
+            # 请求形状不对只能回一条错误：边车循环一旦抛异常，整个 GUI 就失去后端。
+            if not isinstance(request, dict):
+                raise ValueError("request must be a JSON object")
             method = request.get("method")
-            if method not in ("job.start", "job.cancel"):
+            if not isinstance(method, str) or not method:
+                raise ValueError("method must be a non-empty string")
+            if method in ("job.start", "job.cancel"):
+                handler = None
+            elif method in METHODS:
                 handler = METHODS[method]
             else:
-                handler = None
-        except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise ValueError(f"unknown method: {method}")
+        except (LookupError, TypeError, ValueError) as error:
             write({"id": request.get("id") if isinstance(request, dict) else None,
                    "ok": False, "error": {"message": f"bad request: {error}"}})
             continue
 
-        params = request.get("params") or {}
+        params = request.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            write({"id": request.get("id"), "ok": False,
+                   "error": {"message": "bad request: params must be an object", "kind": "ValueError"}})
+            continue
 
         if method == "job.start":
             name = params.get("method")
-            if name not in JOB_METHODS:
+            if not isinstance(name, str) or name not in JOB_METHODS:
                 write({"id": request.get("id"), "ok": False,
-                       "error": {"message": f"不支持的任务: {name}", "kind": "ValueError"}})
+                       "error": {"message": f"不支持的任务: {name!r}", "kind": "ValueError"}})
+                continue
+            task_params = params.get("params") or {}
+            if not isinstance(task_params, dict):
+                write({"id": request.get("id"), "ok": False,
+                       "error": {"message": "bad request: 任务参数必须是 JSON 对象", "kind": "ValueError"}})
                 continue
             try:
                 session.start_busy(name)
@@ -1315,7 +1425,7 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
             jobs[job_id] = {"cancel": threading.Event(), "name": name}
             # 先应答再启动：极快任务也不能让 done 事件抢在 job_id 之前到达。
             write({"id": request.get("id"), "ok": True, "result": {"job_id": job_id, "method": name}})
-            threading.Thread(target=run_job, args=(job_id, name, params.get("params") or {}),
+            threading.Thread(target=run_job, args=(job_id, name, task_params),
                              name=f"job-{job_id}", daemon=True).start()
             continue
 
@@ -1344,8 +1454,22 @@ def serve(stdin=sys.stdin, stdout=sys.stdout, session=None):
 
 
 def _write(stdout, payload):
-    stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    stdout.write(_dump(payload) + "\n")
     stdout.flush()
+
+
+def _subtitle_text(path):
+    """SRT bytes as text. UTF-8 first, then BOM-marked UTF-16, then GB18030:
+    Chinese subtitles saved by Windows editors are very often GBK/GB18030."""
+    data = Path(path).read_bytes()
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
 
 
 @method("subtitles.load")
@@ -1405,7 +1529,7 @@ def _subtitles_load(session, params, emit=None):
             pass
         current.clear()
 
-    for line in path.read_text(encoding='utf-8-sig').splitlines():
+    for line in _subtitle_text(path).splitlines():
         line = line.strip()
         if not line:
             flush()

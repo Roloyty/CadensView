@@ -31,7 +31,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from shotlab.rpc import Session  # noqa: E402
+from shotlab.rpc import Session, _json_safe  # noqa: E402
 
 FFMPEG = REPO_ROOT / "tools" / "ffmpeg.exe"
 WEIGHTS = REPO_ROOT / "models" / "transnet-split.onnx"
@@ -43,7 +43,7 @@ class CliError(RuntimeError):
 
 def _out(payload, pretty=False):
     indent = 2 if pretty else None
-    print(json.dumps(payload, ensure_ascii=False, indent=indent))
+    print(json.dumps(_json_safe(payload), ensure_ascii=False, indent=indent))
 
 
 @contextmanager
@@ -276,6 +276,16 @@ def cmd_motion(args):
         return payload
 
 
+def _export_width(args, default):
+    """`--width` means a different thing per export kind, so each keeps its own default
+    (the same values the GUI and the MCP tools use)."""
+    if args.width is None:
+        return default
+    if args.width < 1:
+        raise CliError("--width 须为正整数")
+    return args.width
+
+
 def cmd_export(args):
     methods = {"csv": "export.shots_csv", "sheet": "export.contact_sheet", "pdf": "export.pdf_sheet"}
     if args.kind in methods:
@@ -287,12 +297,12 @@ def cmd_export(args):
             return METHODS[methods[args.kind]](session, params, None)
     if args.kind == "slit":
         with _session(args.project) as session:
-            return session.slit_run({"path": args.out, "width": args.width,
+            return session.slit_run({"path": args.out, "width": _export_width(args, 160),
                                      "columns": args.columns,
                                      **_selection_params(session, args.shots)})
     if args.kind == "stills":
         with _session(args.project) as session:
-            return session.stills_run({"path": args.out, "count": args.count, "width": args.width,
+            return session.stills_run({"path": args.out, "count": args.count, "width": _export_width(args, 480),
                                        **_selection_params(session, args.shots)})
     if args.kind == "motion":
         with _session(args.project) as session:
@@ -302,7 +312,7 @@ def cmd_export(args):
     if args.kind == "lapian":
         with _session(args.project) as session:
             from shotlab.lapian import draw_sheet
-            return draw_sheet(session, {"path": args.out, "width": args.width})
+            return draw_sheet(session, {"path": args.out, "width": _export_width(args, 1600)})
     if args.shots is not None:
         raise CliError("--shots 仅适用于 csv/sheet/pdf/slit/stills/motion 导出")
     if args.kind == "gif":
@@ -586,7 +596,8 @@ def build_parser():
     p.add_argument("--columns", type=int, default=5, help="长图列数")
     p.add_argument("--shot", type=int, default=None, help="镜头编号（gif）")
     p.add_argument("--frame", type=int, default=None, help="帧号（frame）")
-    p.add_argument("--width", type=int, default=160, help="slit 每镜头列数 / stills 宽度")
+    p.add_argument("--width", type=int, default=None,
+                   help="宽度：slit 每镜头列数（默认 160）/ stills 图片宽度（默认 480）/ lapian 长图宽度（默认 1600）")
     p.add_argument("--count", type=int, default=100, help="stills 张数")
     p.set_defaults(fn=cmd_export)
 
@@ -726,7 +737,17 @@ def build_parser():
     return parser
 
 
+def _use_utf8_streams():
+    """JSON output is `ensure_ascii=False`; on a Chinese Windows console or pipe the
+    legacy GBK codec cannot encode emoji or rare kanji and the command would die
+    with UnicodeEncodeError instead of printing a result (or its own error)."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure") and (stream.encoding or "").lower().replace("-", "") not in ("utf8",):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv=None):
+    _use_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

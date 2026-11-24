@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kit::{icon, Tip};
 use model::{BarcodeSample, IndexInfo, PaletteInfo, State, StatsData};
@@ -59,6 +59,8 @@ enum UiMsg {
     AuxJobStarted(u64),
     AuxFailed(String),
     ResearchValue { method: String, value: Value },
+    /// 取消时边车回答“没有这个任务”：它其实已经结束，只是终态事件可能没送到。
+    JobVanished(u64),
 }
 
 /// 右侧面板的两个页签。
@@ -96,6 +98,10 @@ struct App {
     detection: Option<detect::Detection>,
     detection_out: Option<PathBuf>,
     detection_cpu_retried: bool,
+    /// worker 自己报告的最后一条错误；收尾时用它解释退出码。
+    detection_error: Option<String>,
+    /// 取消后被告知“任务不存在”的任务及其发现时刻；稍等仍无终态事件才清本地任务槽。
+    vanished: Option<(u64, Instant)>,
     index_job: Option<u64>,
     index_busy: bool,
     index_recovering: bool,
@@ -194,6 +200,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
         theme::install(&cc.egui_ctx);
+        sweep_stale_indexes();
         let repo_root = find_repo_root();
         let python = rpc::python_path(&repo_root);
         if !python.exists() {
@@ -228,6 +235,8 @@ impl App {
             detection: None,
             detection_out: None,
             detection_cpu_retried: false,
+            detection_error: None,
+            vanished: None,
             index_job: None,
             index_busy: false,
             index_recovering: false,
@@ -326,20 +335,6 @@ impl App {
 
     // -- 异步动作 ------------------------------------------------------------
 
-    /// 结果不是 State 的调用（如 job.cancel）：只关心错误，成功静默。
-    fn call_quiet(&self, method: &str, params: Value) {
-        let method = method.to_string();
-        let rpc = Arc::clone(&self.rpc);
-        let tx = self.msg_tx.clone();
-        let wake = Arc::clone(&self.wake);
-        std::thread::spawn(move || {
-            if let Err(error) = rpc.call(&method, params) {
-                let _ = tx.send(UiMsg::RpcError(error));
-            }
-            wake();
-        });
-    }
-
     fn call(&self, method: &str, params: Value) {
         let method = method.to_string();
         let rpc = Arc::clone(&self.rpc);
@@ -348,11 +343,11 @@ impl App {
         std::thread::spawn(move || {
             match rpc.call(&method, params) {
                 Ok(Value::Null) => {}
-                Ok(result) => {
-                    if let Ok(state) = serde_json::from_value::<State>(result) {
-                        let _ = tx.send(UiMsg::State(state));
-                    }
-                }
+                // 走 call() 的方法都返回项目状态。解析失败不能静默吞掉：界面会停在旧状态而没有任何提示。
+                Ok(result) => match serde_json::from_value::<State>(result) {
+                    Ok(state) => { let _ = tx.send(UiMsg::State(state)); }
+                    Err(error) => { let _ = tx.send(UiMsg::RpcError(format!("项目状态解析失败：{error}"))); }
+                },
                 Err(error) => {
                     let _ = tx.send(UiMsg::RpcError(error));
                 }
@@ -360,6 +355,37 @@ impl App {
             // 结果送达后必须唤醒 UI，否则界面停在旧状态。
             wake();
         });
+    }
+
+    /// 取消一个边车任务。边车若回答“没有这个任务”，说明它其实已经结束：交给消息泵
+    /// 稍作等待，仍没有终态事件就清掉本地任务槽，免得界面永久锁在忙碌状态。
+    fn cancel_job(&self, job_id: u64) {
+        let rpc = Arc::clone(&self.rpc);
+        let tx = self.msg_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        std::thread::spawn(move || {
+            match rpc.call("job.cancel", json!({"job_id": job_id})) {
+                Ok(value) if value.get("cancelled").and_then(Value::as_bool) == Some(true) => {}
+                Ok(_) => { let _ = tx.send(UiMsg::JobVanished(job_id)); }
+                Err(error) => { let _ = tx.send(UiMsg::RpcError(error)); }
+            }
+            wake();
+        });
+    }
+
+    /// 记录在途边车任务的六个槽（与边车的 job_id 对应）。
+    fn job_slots(&mut self) -> [&mut Option<u64>; 6] {
+        [&mut self.index_job, &mut self.scale_job, &mut self.analysis_job,
+         &mut self.motion_job, &mut self.slit_job, &mut self.aux_job]
+    }
+
+    fn forget_job(&mut self, job_id: u64) -> bool {
+        let index_was_running = self.index_job == Some(job_id);
+        let forgotten = forget_in(&mut self.job_slots(), job_id);
+        if index_was_running {
+            self.index_busy = false;
+        }
+        forgotten
     }
 
     fn confirm_discard(&self) -> bool {
@@ -405,14 +431,15 @@ impl App {
     }
 
     fn open_project(&mut self, path: PathBuf) {
-        if self.work_busy() { self.status = "任务进行中，先取消再打开项目".into(); return; }
+        if self.work_busy() { self.status = "任务进行中，先取消再打开项目".to_string(); return; }
         if !self.confirm_discard() { return; }
-        self.reset_project_view();
+        // 这里不清视图：边车打开失败（视频被移走、版本不符…）时会话并没有变，当前视频要原样
+        // 留在界面上。新项目的 State 到达时（project_id 变了）再由消息泵统一清掉并换播放器。
+        self.stop_playback();
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
         self.status = "打开项目…".into();
-        self.player = None;
         std::thread::spawn(move || {
             if let Err(error) = rpc.call("project.open", json!({"path": path.to_string_lossy()})) {
                 let _ = tx.send(UiMsg::RpcError(error));
@@ -451,12 +478,14 @@ impl App {
         } else { ("project.save", json!({})) };
         // 同一线程先提交输入框草稿再存盘，避免 Ctrl+S 与失焦提交乱序。
         let note = if self.note_dirty && !self.note_shot.is_empty() { Some((self.note_shot.clone(), self.note_draft.clone())) } else { None };
+        let cut = cut_draft(&self.state.shots, &self.cut_shot, &self.cut_input);
         let rpc = Arc::clone(&self.rpc);
         let tx = self.msg_tx.clone();
         let wake = Arc::clone(&self.wake);
         self.status = "保存项目…".into();
         std::thread::spawn(move || {
             let result = (|| {
+                if let Some((shot, text)) = &cut { rpc.call("cut.set", json!({"shot_id": shot, "value": text}))?; }
                 if let Some((shot, text)) = &note { rpc.call("edit.set_note", json!({"shot_id": shot, "text": text}))?; }
                 let state = serde_json::from_value::<State>(rpc.call(method, params)?).map_err(|e| e.to_string())?;
                 Ok::<_, String>(state)
@@ -480,6 +509,7 @@ impl App {
         let tx_events = self.msg_tx.clone();
         let wake_events = Arc::clone(&self.wake);
         self.status = "切镜检测启动…".into();
+        self.detection_error = None;
         self.detection_out = Some(out_dir.clone());
         match detect::Detection::spawn(
             &python,
@@ -550,7 +580,13 @@ impl App {
         self.stop_playback();
         self.player = None;
         self.index = None;
-        self.index_json_path = None;
+        // 上一份索引 JSON 已经没有读者了（检测只在启动时读一次，而检测运行期间不允许换片），
+        // 随手删掉，别在 %TEMP% 里越积越多。
+        if let Some(old) = self.index_json_path.take() {
+            if is_index_file(&old) {
+                let _ = std::fs::remove_file(old);
+            }
+        }
         self.texture = None;
         self.pending_image = None;
         self.ui_frame = 0;
@@ -674,6 +710,13 @@ impl App {
                 }
                 UiMsg::IndexReady { index, index_json_path } => {
                     self.index_recovering = false;
+                    // 每次打开或恢复都会写一份新的索引 JSON；上一份已经没有读者（检测只在启动时读一次），
+                    // 留着只会在 %TEMP% 里越积越多。
+                    if let Some(old) = self.index_json_path.take() {
+                        if old != index_json_path && is_index_file(&old) {
+                            let _ = std::fs::remove_file(old);
+                        }
+                    }
                     if let Some(video) = self.state.video_path.clone() {
                         let handle = player::PlayerHandle::spawn(
                             self.ffmpeg.clone(),
@@ -800,6 +843,9 @@ impl App {
                         .and_then(|v| serde_json::from_value::<StatsData>(v).ok());
                     match serde_json::from_value::<model::ColorAnalysis>(value) {
                         Ok(parsed) => {
+                            // “不支持”（HDR、旋转、未声明色彩矩阵…）时没有色带可画：状态栏必须说明原因，
+                            // 否则用户只看到一句“完成”和一个空面板，会反复点“运行色彩分析”。
+                            let status = color_status(&parsed);
                             self.barcode = parsed.video_color_timeline.movie_barcode.clone();
                             self.analysis_data = Some(parsed);
                             if let Some(stats) = stats {
@@ -808,7 +854,7 @@ impl App {
                                 self.stats_error = None;
                                 self.stats_key = key;
                             }
-                            self.status = "色彩分析完成".into();
+                            self.status = status;
                         }
                         Err(error) => self.status = format!("色彩结果解析失败: {error}"),
                     }
@@ -885,7 +931,11 @@ impl App {
                 }
                 UiMsg::RpcError(error) => self.status = format!("⚠ {error}"),
                 UiMsg::DetectionEvent(event) => self.on_detection_event(event),
+                UiMsg::JobVanished(job_id) => self.vanished = Some((job_id, Instant::now())),
                 UiMsg::DetectionFinished { code } => {
+                    // worker 自己报的错误优先；它没来得及报（在 emit 之外崩溃）就用 stderr 尾部。
+                    let stderr = self.detection.as_ref().map(|job| job.stderr_tail()).flatten();
+                    let detail = self.detection_error.take().or(stderr);
                     self.detection = None;
                     if code == 0 {
                         self.status = "检测完成，写入镜头…".into();
@@ -900,12 +950,35 @@ impl App {
                     } else if code == 3 && !self.detection_cpu_retried {
                         // 协议约定：GPU 失败后在纯 CPU 进程重试一次。
                         self.detection_cpu_retried = true;
-                        self.status = "GPU 推理失败，切换 CPU 重试…".into();
+                        self.status = match detail {
+                            Some(text) => format!("GPU 推理失败（{text}），切换 CPU 重试…"),
+                            None => "GPU 推理失败，切换 CPU 重试…".into(),
+                        };
                         self.run_detection(true);
                     } else {
-                        self.status = format!("检测失败（退出码 {code}）");
+                        // 具体原因（模型哈希不符、索引 PTS 不单调…）必须留下来；
+                        // 单独一句“检测失败（退出码 1）”等于没说。
+                        let what = if code == 3 { "GPU 与 CPU 重试均失败" } else { "检测失败" };
+                        self.status = match detail {
+                            Some(text) => format!("⚠ {what}（退出码 {code}）：{text}"),
+                            None => format!("⚠ {what}（退出码 {code}）"),
+                        };
                     }
                 }
+            }
+        }
+        // 取消后边车说“任务不存在”：多半是任务刚好正常结束、终态事件正在路上，先等一会儿；
+        // 迟迟不来才认定事件丢失，清掉本地任务槽（否则只能重启程序）。
+        if let Some((job_id, since)) = self.vanished {
+            if slots_holding(&self.job_slots(), job_id) == 0 {
+                self.vanished = None;
+            } else if since.elapsed() > Duration::from_millis(1500) {
+                self.forget_job(job_id);
+                self.vanished = None;
+                self.status = "⚠ 任务已经结束，但完成事件没有送达；界面已复位，请重新执行该任务".into();
+            }
+            if self.vanished.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
         // 播放器帧消息走独立通道（不在 UiMsg 里）：先收全，再逐个处理避免借用冲突。
@@ -1208,7 +1281,9 @@ impl App {
             "complete" => self.status = "检测收尾…".into(),
             "cancelled" => self.status = "检测已取消".into(),
             "error" => {
+                // 收尾时会被“检测失败（退出码 N）”覆盖，所以先存下来，到那时再一起显示。
                 let message = event.get("message").and_then(Value::as_str).unwrap_or("未知");
+                self.detection_error = Some(message.to_string());
                 self.status = format!("检测错误: {message}");
             }
             _ => {}
@@ -1240,14 +1315,83 @@ fn finish_index(
     std::fs::write(&index_json_path, payload).map_err(|e| e.to_string())?;
     if existing_project.is_none() {
         let state = rpc.call("project.new", json!({}))?;
-        let _ = tx.send(UiMsg::State(serde_json::from_value(state).unwrap_or_default()));
+        let _ = tx.send(UiMsg::State(parse_state(state)?));
     } else {
         let state = rpc.call("project.state", json!({}))?;
-        let _ = tx.send(UiMsg::State(serde_json::from_value(state).unwrap_or_default()));
+        let _ = tx.send(UiMsg::State(parse_state(state)?));
     }
     tx.send(UiMsg::IndexReady { index, index_json_path })
         .map_err(|_| "UI 已退出".to_string())?;
     Ok(())
+}
+
+/// A sidecar reply that must be a project state. An empty default would leave the GUI
+/// showing "no project" after a successful open, with nothing in the status line.
+fn parse_state(value: Value) -> Result<State, String> {
+    serde_json::from_value(value).map_err(|error| format!("项目状态解析失败：{error}"))
+}
+
+/// カット编号输入框里与已存值不同的草稿；保存前要一起提交。
+fn cut_draft(shots: &[model::ShotRow], cut_shot: &str, cut_input: &str) -> Option<(String, String)> {
+    if cut_shot.is_empty() {
+        return None;
+    }
+    let shot = shots.iter().find(|shot| shot.id == cut_shot)?;
+    let value = cut_input.trim();
+    (value != shot.cut_number).then(|| (shot.id.clone(), value.to_string()))
+}
+
+/// 色彩分析结束后的状态栏文字；“不支持”（HDR、旋转、未声明色彩矩阵…）时带上原因。
+fn color_status(analysis: &model::ColorAnalysis) -> String {
+    let timeline = &analysis.video_color_timeline;
+    let shots = &analysis.shot_color_statistics;
+    let reason = if timeline.status == "unsupported" { timeline.reason.as_str() }
+        else if shots.status == "unsupported" { shots.reason.as_str() }
+        else { return "色彩分析完成".to_string(); };
+    if reason.is_empty() { "⚠ 色彩分析不支持此视频".to_string() }
+        else { format!("⚠ 色彩分析不支持此视频：{reason}") }
+}
+
+/// `slots` 里仍指向该任务的槽位数（0 表示它的终态事件已经被处理）。
+fn slots_holding(slots: &[&mut Option<u64>], job_id: u64) -> usize {
+    // filter 给闭包的是 `&&&mut Option<u64>`。
+    slots.iter().filter(|slot| ***slot == Some(job_id)).count()
+}
+
+fn forget_in(slots: &mut [&mut Option<u64>], job_id: u64) -> bool {
+    let mut forgotten = false;
+    for slot in slots.iter_mut() {
+        if **slot == Some(job_id) {
+            **slot = None;
+            forgotten = true;
+        }
+    }
+    forgotten
+}
+
+/// 本程序自己写的索引文件（`%TEMP%/cadensview/index-<毫秒时间戳>.json`）；
+/// 名字必须严格吻合，别的文件即使同目录也不碰。
+fn is_index_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else { return false };
+    name.strip_prefix("index-").and_then(|rest| rest.strip_suffix(".json")).is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// 正常退出时上一份索引已经随手删掉；这里是给崩溃留下的那些收尾的。
+fn sweep_stale_indexes() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir().join("cadensview")) else { return };
+    let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(7 * 24 * 3600)) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_index_file(&path) {
+            continue;
+        }
+        let stale = entry.metadata().and_then(|meta| meta.modified()).map(|time| time < cutoff);
+        if stale.unwrap_or(false) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// 生成唯一的输出目录**路径**（不创建目录）。
@@ -2036,7 +2180,7 @@ impl App {
                     if let Some(cancel) = cancel {
                         if kit::icon_button(ui, icon::X, true, &format!("取消{name}")).clicked() {
                             match cancel {
-                                TaskCancel::Job(job_id) => self.call_quiet("job.cancel", json!({"job_id": job_id})),
+                                TaskCancel::Job(job_id) => self.cancel_job(job_id),
                                 TaskCancel::Detection => if let Some(job) = &self.detection { job.cancel(); },
                             }
                         }
@@ -3762,6 +3906,70 @@ mod tests {
         assert_ne!(first, second);
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
+    }
+
+    fn shot(id: &str, cut_number: &str) -> model::ShotRow {
+        model::ShotRow { id: id.into(), cut_number: cut_number.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn cut_draft_is_committed_only_when_it_differs() {
+        let shots = vec![shot("a", ""), shot("b", "C012")];
+        // 改之前：输入框里刚敲的编号要等失焦才提交，Ctrl+S 存下的文件比界面旧。
+        assert_eq!(cut_draft(&shots, "a", " C007 "), Some(("a".into(), "C007".into())));
+        assert_eq!(cut_draft(&shots, "a", "   "), None, "空输入等于没改");
+        assert_eq!(cut_draft(&shots, "b", "C012"), None, "没改就不提交");
+        assert_eq!(cut_draft(&shots, "b", "C013"), Some(("b".into(), "C013".into())));
+        assert_eq!(cut_draft(&shots, "", "C001"), None);
+        assert_eq!(cut_draft(&shots, "gone", "C001"), None, "镜头已不存在");
+    }
+
+    #[test]
+    fn unsupported_colour_analysis_explains_itself() {
+        let unsupported = serde_json::from_value::<model::ColorAnalysis>(json!({
+            "video_color_timeline": {"status": "unsupported", "reason": "Unknown or unsupported color matrix/range"},
+            "shot_color_statistics": {"status": "unsupported", "reason": "Unknown or unsupported color matrix/range"}
+        })).unwrap();
+        // 改之前：一律显示“色彩分析完成”，色带却是空的。
+        let status = color_status(&unsupported);
+        assert!(status.starts_with('⚠') && status.contains("color matrix/range"), "{status}");
+        let supported = serde_json::from_value::<model::ColorAnalysis>(json!({
+            "video_color_timeline": {"status": "ok"}, "shot_color_statistics": {"status": "ok"}
+        })).unwrap();
+        assert_eq!(color_status(&supported), "色彩分析完成");
+    }
+
+    #[test]
+    fn a_vanished_job_clears_only_its_own_slots() {
+        let (mut index, mut scale, mut analysis, mut motion, mut slit, mut aux) =
+            (Some(4_u64), None, Some(4), Some(9), None, Some(4));
+        {
+            let mut slots = [&mut index, &mut scale, &mut analysis, &mut motion, &mut slit, &mut aux];
+            assert_eq!(slots_holding(&slots, 4), 3);
+            assert_eq!(slots_holding(&slots, 7), 0, "终态事件已处理：没有槽还指着它");
+            assert!(forget_in(&mut slots, 4));
+            assert!(!forget_in(&mut slots, 4));
+        }
+        assert_eq!((index, scale, analysis, motion, slit, aux), (None, None, None, Some(9), None, None));
+    }
+
+    #[test]
+    fn only_our_own_index_files_are_swept() {
+        assert!(is_index_file(Path::new("C:/Temp/cadensview/index-1730000000000.json")));
+        for keep in ["C:/Temp/cadensview/cancel", "C:/Temp/cadensview/playback",
+                     "C:/Temp/cadensview/thumbs/thumb-1.bin", "C:/Temp/cadensview/index.json",
+                     "C:/Temp/cadensview/index-notes.json", "C:/Temp/cadensview/myindex-1.jsonx",
+                     "C:/Temp/cadensview/index-.json", "D:/work/index-notes.json"] {
+            assert!(!is_index_file(Path::new(keep)), "{keep}");
+        }
+    }
+
+    #[test]
+    fn a_reply_that_is_not_a_state_is_reported_not_swallowed() {
+        assert!(parse_state(json!({"project_id": "p", "shots": []})).is_ok());
+        let error = parse_state(json!({"project_id": "p", "shots": [{"id": "a", "start": "twelve"}]}))
+            .unwrap_err();
+        assert!(error.contains("项目状态解析失败"), "{error}");
     }
 }
 

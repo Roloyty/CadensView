@@ -312,6 +312,15 @@ def _write_frames(out_dir, thumbs, labels, codes):
 
 # -- 分析包导出 ----------------------------------------------------------------
 
+def _clear_old_images(out_dir, folder, pattern):
+    """Re-exporting into the same folder must not leave images of an earlier, larger package
+    behind: the model is told to analyse the whole directory and would see stale frames."""
+    target = Path(out_dir) / folder
+    if target.is_dir():
+        for stale in target.glob(pattern):
+            stale.unlink(missing_ok=True)
+
+
 def export_package(session, params, cancel=None, progress=None):
     """导出 AI 拉片分析包到目录；mode=sheets（拼图，省流量）或 frames（每镜头一图）。"""
     _require(session)
@@ -329,6 +338,7 @@ def export_package(session, params, cancel=None, progress=None):
     thumbs = _decode_thumbs(session, sampled, SHEET_TILE_W, cancel, progress)
 
     if mode == "sheets":
+        _clear_old_images(out_dir, "sheets", "sheet-*.jpg")
         names, mapping = _write_sheets(out_dir, thumbs, labels)
         for entry in manifest["shots"]:
             hit = mapping.get(entry["number"] - 1)
@@ -336,6 +346,7 @@ def export_package(session, params, cancel=None, progress=None):
                 entry["image"], entry["tile"] = hit
         image_files = len(names)
     else:
+        _clear_old_images(out_dir, "frames", "shot-*.jpg")
         mapping = _write_frames(out_dir, thumbs, labels, codes)
         for entry in manifest["shots"]:
             hit = mapping.get(entry["number"] - 1)
@@ -366,8 +377,11 @@ def export_package(session, params, cancel=None, progress=None):
 def build_srt(session):
     lines = []
     for index, cue in enumerate(session.subtitle_cues, 1):
+        # A blank line inside a cue ends the cue for every SRT reader; dialogue
+        # events typed in the study layer may contain them.
+        text = "\n".join(line for line in str(cue["text"]).splitlines() if line.strip())
         lines += [str(index), f"{_srt_time(cue['start_us'])} --> {_srt_time(cue['end_us'])}",
-                  cue["text"], ""]
+                  text, ""]
     return "\n".join(lines)
 
 
@@ -397,6 +411,14 @@ def build_prompt(manifest, deep=None):
             "任务：把整部作品按真实剧情变化划分为若干场景（scene），并为每个场景、每条剧情线、"
             "全片结构与观众情绪曲线产出结构化拉片笔记。",
         ]
+    numbers = [shot["number"] for shot in manifest.get("shots", []) if isinstance(shot.get("number"), int)]
+    if numbers and (numbers[0] != 1 or numbers[-1] != identity["shot_count"] or len(numbers) != identity["shot_count"]):
+        # A scoped package (marked or excluded shots) lists a subset: the model must not be
+        # told the range is 1..shot_count, and scene anchors have to stay on listed shots.
+        scope_line = (f"本次只分析 manifest.shots 列出的 {len(numbers)} 个镜头（全片共 {identity['shot_count']} 个；"
+                      "场景的 start_shot/end_shot 只能使用其中出现过的镜头号）")
+    else:
+        scope_line = f"镜头数：{identity['shot_count']}（manifest.shots 的 number 范围 1-{identity['shot_count']}）"
     lines += [
         "",
         "核心纪律：",
@@ -433,7 +455,7 @@ def build_prompt(manifest, deep=None):
         "",
         f"影片名：{identity['title']}",
         f"源视频文件名：{identity['source']}",
-        f"镜头数：{identity['shot_count']}（manifest.shots 的 number 范围 1-{identity['shot_count']}）",
+        scope_line,
         f"片长：{identity['duration_s']} 秒",
         "",
         "只输出一个 JSON（顶层含 filmIdentity / story_lines / scenes / curve_points / macro），"
@@ -498,9 +520,15 @@ def build_return_schema(manifest):
 def extract_json(text):
     """从模型回复里括号配平地抠出第一个可解析 JSON 对象（容忍围栏与前后杂文）。"""
     start = text.find("{")
+    # Every failed start rescans to the end, so a malformed reply is O(n²) otherwise and
+    # would freeze the sidecar's request loop for minutes.
+    budget = 20_000_000
     while start != -1:
         depth, in_string, escape = 0, False, False
         for position in range(start, len(text)):
+            budget -= 1
+            if budget < 0:
+                raise ValueError("回复里找不到完整的 JSON 对象（内容过长或已损坏），请重新获取模型输出")
             char = text[position]
             if in_string:
                 if escape:
@@ -643,7 +671,7 @@ def normalize_analysis(session, payload, params=None):
         lines = [dict(id=i, title=t, description=d) for i, t, d in DEFAULT_STORY_LINES]
     line_ids = {line["id"] for line in lines}
 
-    scenes, unknown_types = [], 0
+    scenes, unknown_types, used_ids = [], 0, set()
     scene_items, junk_scenes = _dict_items(_first(payload, "scenes", "segments"))
     if junk_scenes:
         warnings.append(f"scenes 跳过 {junk_scenes} 个非对象项")
@@ -662,7 +690,7 @@ def normalize_analysis(session, payload, params=None):
         shared = [str(s) for s in item.get("shared_lines", []) or [] if str(s) in line_ids]
         scenes.append({
             # 确定性 id：同一分析的重复导入幂等（write_notes 的替换标记依赖它）
-            "id": str(item.get("id") or _scene_identity(start, end, item.get("title", ""))),
+            "id": _scene_id(item, start, end, used_ids),
             "start_shot": start, "end_shot": end,
             "start_s": round(starts[start - 1], 3),
             "end_s": round(_shot_seconds_row(session, rows[end - 1])[1], 3),
@@ -713,7 +741,8 @@ def normalize_analysis(session, payload, params=None):
     macro = {key: str(macro_raw.get(key, "") or "")[:2000]
              for key in ("overall_structure", "narrative_strategy", "rhythm_pattern",
                          "information_strategy", "core_intent")}
-    macro["writing_lessons"] = [str(x)[:500] for x in macro_raw.get("writing_lessons", []) or []][:20]
+    lessons = macro_raw.get("writing_lessons", []) or []
+    macro["writing_lessons"] = [str(x)[:500] for x in ([lessons] if isinstance(lessons, str) else lessons)][:20]
 
     narrative = dict(empty(), identity=identity, story_lines=lines, scenes=scenes,
                      curve_points=curve, macro=macro)
@@ -728,6 +757,19 @@ def normalize_analysis(session, payload, params=None):
 def _scene_identity(start, end, title):
     import hashlib
     return hashlib.sha1(f"{start}-{end}-{title}".encode("utf-8")).hexdigest()[:12]
+
+
+def _scene_id(item, start, end, used):
+    """Deterministic scene id. A model-supplied id is kept only when it is unique and
+    single-line: the id becomes a note marker in write_notes and deep_import replaces
+    scenes by id, so a duplicated id would merge or overwrite another scene."""
+    given = "".join(ch for ch in str(item.get("id") or "") if not ch.isspace())[:64]
+    base = given or _scene_identity(start, end, item.get("title", ""))
+    identity, serial = base, 2
+    while identity in used:
+        identity, serial = f"{base}-{serial}", serial + 1
+    used.add(identity)
+    return identity
 
 
 def _confidence(value):
@@ -833,6 +875,7 @@ def export_deep(session, params, cancel=None, progress=None):
         raise ValueError("场景范围内没有已完成镜头（切点可能已大改，请重跑全片分析）")
     out_dir = Path(params["out_dir"])
     (out_dir / "frames").mkdir(parents=True, exist_ok=True)
+    _clear_old_images(out_dir, "frames", "shot-*.jpg")
 
     sub_manifest = build_manifest(session, {"shot_ids": [row["id"] for row in rows]})
     labels = {row["number"]: _shot_label(row, session) for row in rows}
@@ -917,9 +960,8 @@ def run_direct(session, params, cancel=None, progress=None):
     _require(session)
     import base64
     import os
-    import urllib.request
 
-    from shotlab.vlm import load_config
+    from shotlab.vlm import chat_content, load_config, request_chat
     config = load_config()
     base_url = str(params.get("base_url") or config.get("base_url") or "").rstrip("/")
     model = str(params.get("model") or config.get("model") or "")
@@ -949,22 +991,27 @@ def run_direct(session, params, cancel=None, progress=None):
                       "image_url": {"url": "data:image/jpeg;base64,"
                                          + base64.b64encode(buffer.getvalue()).decode()}})
 
-    request = urllib.request.Request(
+    try:
+        timeout = int(params.get("timeout_s", 600))
+    except (TypeError, ValueError) as error:
+        raise ValueError("timeout_s 须为正整数秒") from error
+    if timeout <= 0:
+        raise ValueError("timeout_s 须为正整数秒")
+    answer = request_chat(
         base_url + "/chat/completions",
-        data=json.dumps({"model": model,
-                         "messages": [{"role": "user", "content": parts}]}).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
-    with urllib.request.urlopen(request, timeout=int(params.get("timeout_s", 600))) as response:
-        answer = json.loads(response.read().decode("utf-8"))
-    content = answer.get("choices", [{}])[0].get("message", {}).get("content", "")
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        {"model": model, "messages": [{"role": "user", "content": parts}]},
+        {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, timeout)
+    content, served = chat_content(answer)
     if not content.strip():
-        raise ValueError("模型返回空内容")
-    result = {"model": answer.get("model", model), "raw_chars": len(content)}
+        # An empty reply (refusal, content filter, reasoning-only model) must not be imported.
+        raise ValueError("模型返回空内容（没有 choices 或 content），请重试或更换模型")
+    result = {"model": served or model, "raw_chars": len(content)}
     if params.get("no_import"):
         return dict(result, raw=content)
-    imported = import_analysis(session, {"text": content, "model": answer.get("model", model)})
+    # The import has to see the same shot scope the model was given, or time-anchored
+    # scenes would be mapped onto the wrong shots.
+    scope = {key: params[key] for key in ("shot_ids", "exclude_regions") if key in params}
+    imported = import_analysis(session, {"text": content, "model": served or model, **scope})
     return dict(result, imported=imported["imported"], preview=imported["preview"])
 
 
@@ -1115,8 +1162,11 @@ def _narrative_of_project(path):
     if metadata.get("episode"):
         label = f"{label} #{metadata['episode']}"
     narrative = settings.get("narrative") or {}
-    scenes = [s for s in narrative.get("scenes", []) if isinstance(s, dict)
-              and isinstance(s.get("start_shot"), int) and isinstance(s.get("end_shot"), int)]
+    if not isinstance(narrative, dict):
+        narrative = {}
+    raw_scenes = narrative.get("scenes") or []
+    scenes = [s for s in (raw_scenes if isinstance(raw_scenes, list) else [])
+              if isinstance(s, dict) and isinstance(s.get("start_shot"), int) and isinstance(s.get("end_shot"), int)]
     return label, project.completed_count, narrative, scenes
 
 
@@ -1141,11 +1191,17 @@ def compare_narratives(paths):
         lengths = [max(s["end_shot"] - s["start_shot"] + 1, 1) for s in scenes]
         types = {}
         for scene in scenes:
-            types[scene.get("type") or "未分类"] = types.get(scene.get("type") or "未分类", 0) + 1
-        points = [p for p in narrative.get("curve_points", [])
-                  if isinstance(p, dict) and isinstance(p.get("time"), (int, float))]
-        intensities = [p["intensity"] for p in points if isinstance(p.get("intensity"), (int, float))]
-        valences = [p["valence"] for p in points if isinstance(p.get("valence"), (int, float))]
+            kind = scene["type"] if isinstance(scene.get("type"), str) else ""
+            types[kind or "未分类"] = types.get(kind or "未分类", 0) + 1
+        # 另一个项目的叙事层可能被手工改过：Python 的 json.loads 收得下 NaN/Infinity 字面量，
+        # 只有有限数值才进入均值。
+        raw_points = narrative.get("curve_points") or []
+        points = [p for p in (raw_points if isinstance(raw_points, list) else [])
+                  if isinstance(p, dict) and _finite(p.get("time"))]
+        intensities = [p["intensity"] for p in points if _finite(p.get("intensity"))]
+        valences = [p["valence"] for p in points if _finite(p.get("valence"))]
+        macro = narrative.get("macro")
+        structure = macro.get("overall_structure", "") if isinstance(macro, dict) else ""
         films.append({
             "path": str(Path(path).resolve()), "label": label,
             "has_narrative": bool(scenes or narrative.get("updated_at")),
@@ -1158,7 +1214,7 @@ def compare_narratives(paths):
             "lows": sum(1 for p in points if p.get("rhythm_role") == "low"),
             "mean_intensity": round(sum(intensities) / len(intensities), 1) if intensities else None,
             "mean_valence": round(sum(valences) / len(valences), 1) if valences else None,
-            "macro_structure": (narrative.get("macro") or {}).get("overall_structure", ""),
+            "macro_structure": structure if isinstance(structure, str) else str(structure),
         })
     return {"films": films,
             "notes": ["场景场长按镜头数计（叙事层锚定单位）；曲线统计来自导入时的 emotion curve",
@@ -1173,6 +1229,11 @@ def _median(values):
     if len(ordered) % 2:
         return ordered[mid]
     return round((ordered[mid - 1] + ordered[mid]) / 2, 2)
+
+
+def _finite(value):
+    """True for a real, finite number; bools and the NaN/Infinity of hand-edited JSON are not."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def narrative_compare(session, params, emit=None):
